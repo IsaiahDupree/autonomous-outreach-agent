@@ -31,7 +31,9 @@ const UPWORK_KEYWORDS = [
 // Default filters for Upwork search
 const UPWORK_FILTERS = {
   sort: "recency" as const,
-  budgetMin: 500,                                  // fixed-price $500+ minimum
+  postedWithin: "24" as const,                      // only jobs from last 24 hours
+  budgetMin: 500,                                   // fixed-price $500+ minimum
+  hourlyRateMin: 35,                                // hourly $35/hr+ minimum
   paymentVerified: true,                            // verified clients only
   experienceLevel: ["2", "3"] as ("2" | "3")[],     // intermediate + expert
   proposalRange: "0-4" as const,                    // low competition (< 5 proposals)

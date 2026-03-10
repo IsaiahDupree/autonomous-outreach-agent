@@ -124,28 +124,36 @@ export async function runProposalCycle(
     return;
   }
 
-  // Score each job with AI
+  // Score each job: Stage 1 (deterministic pre-filter) → Stage 2 (AI scoring)
   const scoredJobs: UpworkJob[] = [];
+  let preFiltered = 0;
   for (const job of jobs) {
     logger.info(`[Upwork] Scoring: "${job.title.slice(0, 60)}..."`);
     const result = await scoreJob({
       title: job.title,
       description: job.description,
       budget: job.budget,
+      posted: job.posted,
     });
     job.score = result.score;
     job.reasoning = result.reasoning;
     job.bidRange = result.bidRange;
     job.tags = result.tags;
 
-    logger.info(`[Upwork]   Score: ${result.score}/10 — ${result.reasoning}`);
+    if (result.excluded) {
+      preFiltered++;
+      logger.info(`[Upwork]   ✗ Excluded: ${result.excluded}`);
+      continue;
+    }
+
+    logger.info(`[Upwork]   Score: ${result.score}/10 (pre: ${result.preScore}/100) — ${result.reasoning}`);
 
     if (result.score >= scoreThreshold) {
       scoredJobs.push(job);
     }
   }
 
-  logger.info(`[Upwork] ${scoredJobs.length}/${jobs.length} jobs passed threshold (>=${scoreThreshold})`);
+  logger.info(`[Upwork] ${scoredJobs.length}/${jobs.length} qualified (${preFiltered} pre-filtered, threshold >=${scoreThreshold})`);
 
   if (scoredJobs.length === 0) {
     await tg.notify(`📋 *Upwork scan complete*\n${jobs.length} jobs found, 0 above threshold (${scoreThreshold}/10)`);

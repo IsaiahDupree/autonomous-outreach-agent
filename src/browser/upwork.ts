@@ -23,6 +23,9 @@ export interface SearchFilters {
   // Sorting
   sort?: "recency" | "relevance";
 
+  // Posted within: only jobs from last N hours
+  postedWithin?: "1" | "3" | "24" | "72" | "168";  // hours: 1h, 3h, 24h, 3d, 7d
+
   // Experience level: 1=entry, 2=intermediate, 3=expert (can combine)
   experienceLevel?: ("1" | "2" | "3")[];
 
@@ -76,6 +79,15 @@ function buildSearchUrl(keyword: string, filters: SearchFilters = {}): string {
   const params = new URLSearchParams();
   params.set("q", keyword);
   params.set("sort", filters.sort || "recency");
+
+  // Posted within (hours)
+  if (filters.postedWithin) params.set("per_page", filters.postedWithin);
+  // Upwork uses "posted" param: 1=last 24h, but the actual URL param is "t" for time
+  // The most reliable way is using the recency sort + the "posted" param
+  if (filters.postedWithin) {
+    // Upwork URL param: "1" = last 24h, etc. — maps to "hours" query param
+    params.set("hours", filters.postedWithin);
+  }
 
   // Experience level (can set multiple)
   if (filters.experienceLevel?.length) {
