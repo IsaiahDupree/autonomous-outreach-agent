@@ -1,15 +1,19 @@
 /**
- * src/client/Upwork.ts — Upwork platform client (mirrors Riona's Instagram.ts)
- * Talks to Safari automation service at SAFARI_UPWORK_PORT
+ * src/client/Upwork.ts — Upwork platform client
+ * Dual-mode: tries Safari service first, falls back to Puppeteer.
+ * Includes AI-powered job scoring + configurable filters.
  */
 import logger from "../config/logger";
-import { SAFARI_UPWORK_PORT } from "../secret";
+import { SAFARI_UPWORK_PORT, BROWSER_MODE } from "../secret";
 import * as cloud from "../services/cloud";
 import * as obsidian from "../services/obsidian";
 import * as tg from "../services/telegram";
 import { generateCoverLetter } from "../Agent";
+import { scoreJob } from "../Agent/scorer";
+import * as upworkBrowser from "../browser/upwork";
+import type { SearchFilters } from "../browser/upwork";
 
-const BASE = `http://localhost:${SAFARI_UPWORK_PORT}`;
+const SAFARI_BASE = `http://localhost:${SAFARI_UPWORK_PORT}`;
 
 export interface UpworkJob {
   id: string;
@@ -20,31 +24,51 @@ export interface UpworkJob {
   score?: number;
   bid?: number;
   coverLetter?: string;
+  reasoning?: string;
+  bidRange?: string;
+  tags?: string[];
+  posted?: string;
+  proposals?: string;
+  clientSpend?: string;
+  skills?: string[];
 }
 
-let _initialized = false;
+let safariUp: boolean | null = null;
 
-export async function init(): Promise<void> {
-  const up = await cloud.checkService(SAFARI_UPWORK_PORT);
-  if (!up) {
-    logger.warn(`[Upwork] Safari service at :${SAFARI_UPWORK_PORT} is DOWN`);
-  } else {
+async function checkSafari(): Promise<boolean> {
+  if (BROWSER_MODE === "puppeteer") return false;
+  if (safariUp !== null) return safariUp;
+  safariUp = await cloud.checkService(SAFARI_UPWORK_PORT);
+  if (safariUp) {
     logger.info(`[Upwork] Safari service UP at :${SAFARI_UPWORK_PORT}`);
+  } else {
+    logger.info(`[Upwork] Safari service DOWN — ${BROWSER_MODE === "safari" ? "will skip" : "using Puppeteer"}`);
   }
-  _initialized = true;
+  return safariUp;
 }
 
-export async function scanJobs(keywords: string[], limit = 20): Promise<UpworkJob[]> {
-  if (!_initialized) await init();
+export async function scanJobs(
+  keywords: string[],
+  filters: SearchFilters = {},
+  limit = 20
+): Promise<UpworkJob[]> {
   try {
-    const res = await fetch(`${BASE}/api/scan`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keywords, limit }),
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!res.ok) throw new Error(`Scan failed: ${res.status}`);
-    return res.json() as Promise<UpworkJob[]>;
+    if (await checkSafari()) {
+      const res = await fetch(`${SAFARI_BASE}/api/scan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keywords, limit }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res.ok) throw new Error(`Scan failed: ${res.status}`);
+      return res.json() as Promise<UpworkJob[]>;
+    }
+    if (BROWSER_MODE === "safari") return [];
+
+    // Puppeteer: search each keyword individually with filters
+    logger.info(`[Upwork] Searching ${keywords.length} keywords with filters: ${JSON.stringify(filters)}`);
+    const scraped = await upworkBrowser.scanJobs(keywords, filters, limit);
+    return scraped.map((j) => ({ ...j, score: j.score || 0 }));
   } catch (e) {
     logger.error(`[Upwork] scanJobs error: ${(e as Error).message}`);
     return [];
@@ -62,13 +86,19 @@ export async function buildProposal(job: UpworkJob): Promise<UpworkJob> {
 
 export async function submitProposal(job: UpworkJob): Promise<boolean> {
   try {
-    const res = await fetch(`${BASE}/api/submit`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId: job.id, coverLetter: job.coverLetter, bid: job.bid }),
-      signal: AbortSignal.timeout(30000),
+    if (await checkSafari()) {
+      const res = await fetch(`${SAFARI_BASE}/api/submit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId: job.id, coverLetter: job.coverLetter, bid: job.bid }),
+        signal: AbortSignal.timeout(30000),
+      });
+      return res.ok;
+    }
+    if (BROWSER_MODE === "safari") return false;
+    return await upworkBrowser.submitProposal(job.url, job.coverLetter || "", {
+      milestones: job.bid ? [{ description: "Full project delivery", amount: job.bid }] : undefined,
     });
-    return res.ok;
   } catch (e) {
     logger.error(`[Upwork] submitProposal error: ${(e as Error).message}`);
     return false;
@@ -76,15 +106,61 @@ export async function submitProposal(job: UpworkJob): Promise<boolean> {
 }
 
 /**
- * Full cycle: scan → score → build cover letter → Telegram approval → submit
+ * Full cycle: search → AI score → build cover letter → Telegram approval → submit
  */
-export async function runProposalCycle(keywords: string[], threshold = 7): Promise<void> {
-  logger.info("[Upwork] Starting proposal cycle");
+export async function runProposalCycle(
+  keywords: string[],
+  filters: SearchFilters = {},
+  scoreThreshold = 6
+): Promise<void> {
+  logger.info(`[Upwork] Starting proposal cycle (${keywords.length} keywords, threshold=${scoreThreshold})`);
 
-  const jobs = await scanJobs(keywords);
-  logger.info(`[Upwork] Found ${jobs.length} jobs`);
+  const jobs = await scanJobs(keywords, filters);
+  logger.info(`[Upwork] Found ${jobs.length} raw jobs`);
 
-  for (const job of jobs.filter((j) => (j.score || 0) >= threshold)) {
+  if (jobs.length === 0) {
+    logger.info("[Upwork] No jobs found — cycle complete");
+    await tg.notify("📋 *Upwork scan complete* — 0 jobs found");
+    return;
+  }
+
+  // Score each job with AI
+  const scoredJobs: UpworkJob[] = [];
+  for (const job of jobs) {
+    logger.info(`[Upwork] Scoring: "${job.title.slice(0, 60)}..."`);
+    const result = await scoreJob({
+      title: job.title,
+      description: job.description,
+      budget: job.budget,
+    });
+    job.score = result.score;
+    job.reasoning = result.reasoning;
+    job.bidRange = result.bidRange;
+    job.tags = result.tags;
+
+    logger.info(`[Upwork]   Score: ${result.score}/10 — ${result.reasoning}`);
+
+    if (result.score >= scoreThreshold) {
+      scoredJobs.push(job);
+    }
+  }
+
+  logger.info(`[Upwork] ${scoredJobs.length}/${jobs.length} jobs passed threshold (>=${scoreThreshold})`);
+
+  if (scoredJobs.length === 0) {
+    await tg.notify(`📋 *Upwork scan complete*\n${jobs.length} jobs found, 0 above threshold (${scoreThreshold}/10)`);
+    return;
+  }
+
+  // Send summary to Telegram
+  const summary = scoredJobs
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .map((j, i) => `${i + 1}. *${j.title.slice(0, 50)}* — ${j.score}/10\n   ${j.reasoning || ""}`)
+    .join("\n\n");
+  await tg.notify(`📋 *Upwork scan: ${scoredJobs.length} qualified jobs*\n\n${summary}`);
+
+  // Process each qualified job
+  for (const job of scoredJobs) {
     const proposal = await buildProposal(job);
     await cloud.saveProposal({
       jobId: proposal.id, title: proposal.title, url: proposal.url,
@@ -93,10 +169,19 @@ export async function runProposalCycle(keywords: string[], threshold = 7): Promi
     });
     obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "queued");
 
+    // Format preview for Telegram
+    const preview = [
+      `📌 *${proposal.title}*`,
+      `💰 Budget: ${proposal.budget || "N/A"} | Suggested bid: ${proposal.bidRange || "TBD"}`,
+      `🎯 Score: ${proposal.score}/10 — ${proposal.reasoning || ""}`,
+      proposal.tags?.length ? `🏷 Skills: ${proposal.tags.join(", ")}` : "",
+      `\n📝 *Cover Letter:*\n${proposal.coverLetter || "(none)"}`,
+    ].filter(Boolean).join("\n");
+
     await tg.sendForApproval({
       id: proposal.id, type: "proposal",
       title: `Upwork: ${proposal.title}`,
-      preview: proposal.coverLetter || "(no cover letter)",
+      preview,
     });
 
     const { approved } = await tg.waitForApproval(proposal.id, "upwork");
@@ -106,7 +191,7 @@ export async function runProposalCycle(keywords: string[], threshold = 7): Promi
       const status = ok ? "submitted" : "error";
       await cloud.updateProposalStatus(proposal.id, status);
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, status);
-      await tg.notify(ok ? `🚀 Upwork proposal submitted: ${proposal.title}` : `❌ Submission failed: ${proposal.title}`);
+      await tg.notify(ok ? `🚀 Proposal submitted: ${proposal.title}` : `❌ Submission failed: ${proposal.title}`);
     } else {
       await cloud.updateProposalStatus(proposal.id, "skipped");
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "skipped");

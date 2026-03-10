@@ -51,7 +51,7 @@ export async function getPendingProposals(): Promise<Record<string, unknown>[]> 
     `${SUPABASE_URL}/rest/v1/upwork_proposals?status=eq.queued&order=created_at.asc`,
     { headers: supabaseHeaders() }
   );
-  return res.ok ? res.json() : [];
+  return res.ok ? (await res.json()) as Record<string, unknown>[] : [];
 }
 
 export async function saveProspect(prospect: {

@@ -6,13 +6,21 @@
   "scripts": {
     "start": "npx tsc && node build/index.js",
     "dev": "ts-node src/index.ts",
-    "build": "tsc",
+    "build": "tsc && cp -r src/Agent/characters build/Agent/",
     "upwork": "ts-node src/index.ts --module upwork",
     "chrome": "ts-node src/index.ts --module chrome",
     "status": "ts-node src/index.ts --status",
-    "once": "ts-node src/index.ts --once"
+    "once": "ts-node src/index.ts --once",
+    "login:upwork": "ts-node src/index.ts --login --module=upwork",
+    "login:linkedin": "ts-node src/index.ts --login --module=linkedin"
   },
-  "keywords": ["automation", "upwork", "linkedin", "claude-ai", "outreach"],
+  "keywords": [
+    "automation",
+    "upwork",
+    "linkedin",
+    "claude-ai",
+    "outreach"
+  ],
   "author": "IsaiahDupree",
   "license": "ISC",
   "dependencies": {
@@ -23,6 +31,10 @@
     "express": "^4.21.2",
     "helmet": "^8.0.0",
     "node-cron": "^3.0.3",
+    "puppeteer": "^23.11.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-recaptcha": "^3.6.8",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "winston": "^3.17.0",
     "winston-daily-rotate-file": "^5.0.0"
   },

@@ -1,9 +1,19 @@
 node_modules/
 build/
 .env
+.env.*
 *.log
 *.pid
 queue.json
 notified-proposals.json
 src/Agent/characters/*.json
 !src/Agent/characters/sample.character.json
+
+# Debug screenshots
+debug-*.png
+
+# Logs
+logs/
+
+# Browser session data
+saved-cookies.json
