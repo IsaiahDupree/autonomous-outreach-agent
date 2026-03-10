@@ -1,0 +1,19 @@
+/**
+ * src/secret/index.ts — typed secrets (mirrors Riona pattern)
+ * All values fall back to empty string — never throw at startup
+ */
+import dotenv from "dotenv";
+dotenv.config();
+
+export const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+export const SUPABASE_URL = process.env.SUPABASE_URL || "https://ivhfuhxorppptyuofbgq.supabase.co";
+export const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || "";
+export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+export const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+export const CRMLITE_URL = process.env.CRMLITE_URL || "";
+export const CRMLITE_API_KEY = process.env.CRMLITE_API_KEY || "";
+export const OBSIDIAN_VAULT = process.env.OBSIDIAN_VAULT_PATH || "";
+export const SAFARI_UPWORK_PORT = parseInt(process.env.SAFARI_UPWORK_PORT || "3104");
+export const SAFARI_LINKEDIN_PORT = parseInt(process.env.SAFARI_LINKEDIN_PORT || "3105");
+export const CHROME_CDP_PORT = parseInt(process.env.CHROME_CDP_PORT || "9222");
+export const PORT = parseInt(process.env.PORT || "3500");
