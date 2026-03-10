@@ -124,10 +124,24 @@ export async function runProposalCycle(
     return;
   }
 
-  // Score each job: Stage 1 (deterministic pre-filter) → Stage 2 (AI scoring)
+  // Dedup: skip jobs already in Supabase
+  const newJobs: UpworkJob[] = [];
+  let dupeCount = 0;
+  for (const job of jobs) {
+    if (await cloud.proposalExists(job.id)) {
+      dupeCount++;
+      continue;
+    }
+    newJobs.push(job);
+  }
+  if (dupeCount > 0) {
+    logger.info(`[Upwork] Skipped ${dupeCount} duplicate jobs already in Supabase`);
+  }
+
+  // Score each new job: Stage 1 (deterministic pre-filter) → Stage 2 (AI scoring)
   const scoredJobs: UpworkJob[] = [];
   let preFiltered = 0;
-  for (const job of jobs) {
+  for (const job of newJobs) {
     logger.info(`[Upwork] Scoring: "${job.title.slice(0, 60)}..."`);
     const result = await scoreJob({
       title: job.title,
@@ -143,43 +157,64 @@ export async function runProposalCycle(
     if (result.excluded) {
       preFiltered++;
       logger.info(`[Upwork]   ✗ Excluded: ${result.excluded}`);
+      // Save excluded jobs to Supabase for tracking
+      await cloud.saveProposal({
+        jobId: job.id, title: job.title, url: job.url,
+        description: job.description, budget: job.budget,
+        score: 0, status: "excluded",
+        reasoning: result.excluded,
+      }).catch(() => {});
       continue;
     }
 
     logger.info(`[Upwork]   Score: ${result.score}/10 (pre: ${result.preScore}/100) — ${result.reasoning}`);
+
+    // Save scored job to Supabase (even if below threshold)
+    const status = result.score >= scoreThreshold ? "queued" : "below_threshold";
+    await cloud.saveProposal({
+      jobId: job.id, title: job.title, url: job.url,
+      description: job.description, budget: job.budget,
+      score: result.score, preScore: result.preScore,
+      status,
+      reasoning: result.reasoning,
+      tags: result.tags,
+    }).catch((e) => logger.warn(`[Upwork] Failed to save to Supabase: ${(e as Error).message}`));
 
     if (result.score >= scoreThreshold) {
       scoredJobs.push(job);
     }
   }
 
-  logger.info(`[Upwork] ${scoredJobs.length}/${jobs.length} qualified (${preFiltered} pre-filtered, threshold >=${scoreThreshold})`);
+  logger.info(`[Upwork] ${scoredJobs.length}/${newJobs.length} qualified (${preFiltered} pre-filtered, ${dupeCount} dupes, threshold >=${scoreThreshold})`);
 
   if (scoredJobs.length === 0) {
-    await tg.notify(`📋 *Upwork scan complete*\n${jobs.length} jobs found, 0 above threshold (${scoreThreshold}/10)`);
+    await tg.notify(`📋 *Upwork scan complete*\n${jobs.length} scraped, ${newJobs.length} new, 0 above threshold (${scoreThreshold}/10)`);
     return;
   }
 
   // Send summary to Telegram
-  const summary = scoredJobs
-    .sort((a, b) => (b.score || 0) - (a.score || 0))
-    .map((j, i) => `${i + 1}. *${j.title.slice(0, 50)}* — ${j.score}/10\n   ${j.reasoning || ""}`)
+  const sorted = scoredJobs.sort((a, b) => (b.score || 0) - (a.score || 0));
+  const summary = sorted
+    .map((j, i) => `${i + 1}. *${j.title.slice(0, 50)}* — ${j.score}/10\n   💰 ${j.budget || "N/A"} | ${j.bidRange || "TBD"}\n   ${j.reasoning || ""}\n   🔗 ${j.url}`)
     .join("\n\n");
   await tg.notify(`📋 *Upwork scan: ${scoredJobs.length} qualified jobs*\n\n${summary}`);
 
   // Process each qualified job
   for (const job of scoredJobs) {
     const proposal = await buildProposal(job);
+    // Update with cover letter
     await cloud.saveProposal({
       jobId: proposal.id, title: proposal.title, url: proposal.url,
+      description: proposal.description, budget: proposal.budget,
       score: proposal.score || 0, bid: proposal.bid || 0,
-      coverLetter: proposal.coverLetter || "", status: "queued",
+      coverLetter: proposal.coverLetter || "", status: "pending",
     });
-    obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "queued");
+    obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "pending");
 
     // Format preview for Telegram
     const preview = [
       `📌 *${proposal.title}*`,
+      `🔗 ${proposal.url}`,
       `💰 Budget: ${proposal.budget || "N/A"} | Suggested bid: ${proposal.bidRange || "TBD"}`,
       `🎯 Score: ${proposal.score}/10 — ${proposal.reasoning || ""}`,
       proposal.tags?.length ? `🏷 Skills: ${proposal.tags.join(", ")}` : "",

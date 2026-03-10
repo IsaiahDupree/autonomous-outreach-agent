@@ -97,9 +97,13 @@ async function startServer() {
     logger.info(`Health: http://localhost:${PORT}/api/health`);
   });
 
+  // Run initial Upwork scan on startup
+  logger.info("[startup] Running initial Upwork scan...");
+  await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[startup] upwork error", e));
+
   // Cron schedules
-  // Upwork scan every 2 hours
-  cron.schedule("0 */2 * * *", async () => {
+  // Upwork scan every 3 hours
+  cron.schedule("0 */3 * * *", async () => {
     logger.info("[cron] Upwork scan");
     await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[cron] upwork error", e));
   });
@@ -110,7 +114,7 @@ async function startServer() {
     await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
   });
 
-  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE} | Upwork: every 2h | Chrome: every 30min`);
+  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE} | Upwork: every 3h | Chrome: every 30min`);
   logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
 
   const graceful = async () => {

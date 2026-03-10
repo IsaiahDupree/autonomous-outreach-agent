@@ -13,13 +13,19 @@ const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 // ── Hard exclude keywords — instant drop if title or description matches ──
 const HARD_EXCLUDES = [
   "wordpress", "shopify", "data entry", "logo design", "graphic design",
-  "video editing", "gis", "esri", "figma", "webflow", "java developer",
+  "video editing", "esri", "figma", "webflow", "java developer",
   "mobile app developer", ".net developer", "php developer",
   "senior devops", "devops engineer", "web developer",
   "senior backend", "senior frontend", "senior fullstack",
   "ios developer", "android developer", "react developer", "angular developer",
   "unity developer", "game developer", "blockchain developer",
-  "salesforce", "sap", "oracle", "tableau", "power bi",
+  "salesforce", "oracle", "tableau", "power bi",
+];
+
+// Short keywords that need word-boundary matching (avoid false positives like "strategist" → "gis")
+const HARD_EXCLUDES_REGEX = [
+  /\bgis\b/i,
+  /\bsap\b/i,
 ];
 
 // ── ICP strong keywords — must match at least 1 or score → 0 ──
@@ -81,6 +87,16 @@ export function preScoreJob(job: {
       return {
         score: 0, excluded: true,
         excludeReason: `Hard exclude: "${kw}"`,
+        strongHits: [], weakHits: [],
+        budgetBonus: 0, recencyBonus: 0,
+      };
+    }
+  }
+  for (const re of HARD_EXCLUDES_REGEX) {
+    if (re.test(text)) {
+      return {
+        score: 0, excluded: true,
+        excludeReason: `Hard exclude: ${re.source}`,
         strongHits: [], weakHits: [],
         budgetBonus: 0, recencyBonus: 0,
       };

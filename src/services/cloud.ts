@@ -21,21 +21,58 @@ export async function logAction(agentId: string, action: string, status: string,
   } catch { /* fire and forget */ }
 }
 
+/**
+ * Save or upsert a proposal to Supabase (matches full table schema).
+ * Uses job_id as the conflict key for upserts.
+ */
 export async function saveProposal(proposal: {
-  jobId: string; title: string; url: string;
-  score: number; bid: number; coverLetter: string; status?: string;
+  jobId: string;
+  title: string;
+  url: string;
+  description?: string;
+  budget?: string;
+  score: number;
+  preScore?: number;
+  bid?: number;
+  coverLetter?: string;
+  status?: string;
+  reasoning?: string;
+  tags?: string[];
+  excluded?: string;
+  milestonesJson?: string;
+  connectsCost?: number;
+  offerType?: string;
 }): Promise<boolean> {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/upwork_proposals`, {
-    method: "POST",
-    headers: { ...supabaseHeaders(), Prefer: "return=representation,resolution=merge-duplicates" },
-    body: JSON.stringify({
-      job_id: proposal.jobId, job_title: proposal.title, job_url: proposal.url,
-      feasibility_score: proposal.score, bid_amount: proposal.bid,
-      cover_letter: proposal.coverLetter, status: proposal.status || "queued",
-      created_at: new Date().toISOString(),
-    }),
-  });
-  return res.ok;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/upwork_proposals`, {
+      method: "POST",
+      headers: { ...supabaseHeaders(), Prefer: "return=representation,resolution=merge-duplicates" },
+      body: JSON.stringify({
+        job_id: proposal.jobId,
+        job_title: proposal.title,
+        job_url: proposal.url,
+        job_description: proposal.description || null,
+        budget: proposal.budget || null,
+        score: proposal.score,
+        proposal_text: proposal.coverLetter || null,
+        status: proposal.status || "queued",
+        offer_type: proposal.offerType || null,
+        submitted_bid_amount: proposal.bid || null,
+        submitted_connects_cost: proposal.connectsCost || null,
+        milestones_json: proposal.milestonesJson || null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      logger.warn(`[Cloud] saveProposal failed (${res.status}): ${err.slice(0, 200)}`);
+    }
+    return res.ok;
+  } catch (e) {
+    logger.error(`[Cloud] saveProposal error: ${(e as Error).message}`);
+    return false;
+  }
 }
 
 export async function updateProposalStatus(jobId: string, status: string, extra: Record<string, unknown> = {}): Promise<void> {
@@ -52,6 +89,23 @@ export async function getPendingProposals(): Promise<Record<string, unknown>[]> 
     { headers: supabaseHeaders() }
   );
   return res.ok ? (await res.json()) as Record<string, unknown>[] : [];
+}
+
+/**
+ * Check if a job_id already exists in proposals (avoid re-processing).
+ */
+export async function proposalExists(jobId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}&select=id&limit=1`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return false;
+    const data = await res.json() as unknown[];
+    return data.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 export async function saveProspect(prospect: {
