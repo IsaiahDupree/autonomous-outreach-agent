@@ -10,6 +10,16 @@
     "revenueRange": "$500K-$5M ARR",
     "painPoints": ["manual execution work", "no time to build automations", "need more leads"]
   },
+  "portfolio": {
+    "url": "https://isaiah-portfolio.com",
+    "label": "See similar work I've delivered",
+    "templates": {
+      "ai-automation": "I recently built a similar AI automation pipeline — here's a quick look at my relevant work: {url}",
+      "mobile-app": "I've shipped production mobile apps with this exact stack — portfolio & case studies: {url}",
+      "web-scraping": "I've built robust scrapers handling millions of records — see examples: {url}",
+      "default": "You can see relevant examples of my work here: {url}"
+    }
+  },
   "upwork": {
     "openingHook": "I noticed your project needs [specific_need] — I've built exactly this for [similar_company_type].",
     "proposalStyle": "short, specific, outcome-focused",

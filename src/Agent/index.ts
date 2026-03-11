@@ -15,6 +15,11 @@ export interface CharacterConfig {
   persona: string;
   tone: string;
   icp: Record<string, unknown>;
+  portfolio?: {
+    url: string;
+    label?: string;
+    templates?: Record<string, string>;
+  };
   upwork?: Record<string, unknown>;
   approvalRequired: boolean;
 }
@@ -33,6 +38,33 @@ export async function initAgent(characterFile = "sample.character.json"): Promis
 
 export function getCharacter(): CharacterConfig | null {
   return characterConfig;
+}
+
+/**
+ * Get a portfolio line to prepend to a cover letter.
+ * Picks the best template based on job tags, or uses default.
+ */
+export function getPortfolioLine(tags?: string[]): string {
+  const portfolio = characterConfig?.portfolio;
+  if (!portfolio?.url) return "";
+  const templates = portfolio.templates || {};
+  const url = portfolio.url;
+
+  // Try to match a template based on job tags
+  if (tags?.length) {
+    const tagStr = tags.join(" ").toLowerCase();
+    for (const [key, tmpl] of Object.entries(templates)) {
+      if (key === "default") continue;
+      // Match template key against tags (e.g. "ai-automation" matches "ai automation")
+      const keyWords = key.replace(/-/g, " ");
+      if (tagStr.includes(keyWords) || keyWords.split(" ").some(w => tagStr.includes(w))) {
+        return tmpl.replace("{url}", url);
+      }
+    }
+  }
+
+  // Fall back to default template
+  return (templates.default || `${portfolio.label || "See my relevant work"}: ${url}`).replace("{url}", url);
 }
 
 /**

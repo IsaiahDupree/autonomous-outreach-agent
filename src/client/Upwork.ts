@@ -8,7 +8,7 @@ import { SAFARI_UPWORK_PORT, BROWSER_MODE } from "../secret";
 import * as cloud from "../services/cloud";
 import * as obsidian from "../services/obsidian";
 import * as tg from "../services/telegram";
-import { generateCoverLetter } from "../Agent";
+import { generateCoverLetter, getPortfolioLine } from "../Agent";
 import { scoreJob } from "../Agent/scorer";
 import * as upworkBrowser from "../browser/upwork";
 import type { SearchFilters } from "../browser/upwork";
@@ -225,17 +225,35 @@ export async function runProposalCycle(
       id: proposal.id, type: "proposal",
       title: `Upwork: ${proposal.title}`,
       preview,
+      jobUrl: proposal.url,
     });
 
-    const { approved } = await tg.waitForApproval(proposal.id, "upwork");
+    const { action } = await tg.waitForApproval(proposal.id, "upwork");
 
-    if (approved) {
+    if (action === "send" || action === "send_with_portfolio") {
+      // Prepend portfolio link if requested
+      if (action === "send_with_portfolio") {
+        const portfolioLine = getPortfolioLine(proposal.tags);
+        if (portfolioLine) {
+          proposal.coverLetter = `${portfolioLine}\n\n${proposal.coverLetter || ""}`;
+          // Update Supabase with the portfolio-enhanced cover letter
+          await cloud.saveProposal({
+            jobId: proposal.id, title: proposal.title, url: proposal.url,
+            description: proposal.description, budget: proposal.budget,
+            score: proposal.score || 0, bid: proposal.bid || 0,
+            coverLetter: proposal.coverLetter, status: "pending",
+          });
+          await tg.notify(`📋 Portfolio link added to proposal: ${proposal.title}`);
+        }
+      }
+
       const ok = await submitProposal(proposal);
       const status = ok ? "submitted" : "error";
       await cloud.updateProposalStatus(proposal.id, status);
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, status);
       await tg.notify(ok ? `🚀 Proposal submitted: ${proposal.title}` : `❌ Submission failed: ${proposal.title}`);
     } else {
+      // skip or timeout
       await cloud.updateProposalStatus(proposal.id, "skipped");
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "skipped");
     }

@@ -166,9 +166,9 @@ export async function runDiscoveryCycle(keywords: string[], icpThreshold = 6): P
         platform: "linkedin",
       });
 
-      const { approved } = await tg.waitForApproval(p.id, "chrome");
+      const { action } = await tg.waitForApproval(p.id, "chrome");
 
-      if (approved) {
+      if (action === "send" || action === "send_with_portfolio") {
         const ok = await sendLinkedInDM(p.username, opening, p.url);
         obsidian.logProspect(p, ok ? "dm_sent" : "dm_failed");
         await tg.notify(ok ? `🚀 LinkedIn DM sent to @${p.username}` : `❌ DM failed: @${p.username}`);
