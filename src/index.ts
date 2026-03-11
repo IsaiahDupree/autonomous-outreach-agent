@@ -26,6 +26,10 @@ const UPWORK_KEYWORDS = [
   "marketing automation",
   "AI chatbot development",
   "data pipeline",
+  "mobile app development",
+  "react native app",
+  "flutter app",
+  "full stack app",
 ];
 
 // Default filters for Upwork search

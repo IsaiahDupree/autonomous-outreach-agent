@@ -14,10 +14,9 @@ const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const HARD_EXCLUDES = [
   "wordpress", "shopify", "data entry", "logo design", "graphic design",
   "video editing", "esri", "figma", "webflow", "java developer",
-  "mobile app developer", ".net developer", "php developer",
-  "senior devops", "devops engineer", "web developer",
-  "senior backend", "senior frontend", "senior fullstack",
-  "ios developer", "android developer", "react developer", "angular developer",
+  ".net developer", "php developer",
+  "senior devops", "devops engineer",
+  "angular developer",
   "unity developer", "game developer", "blockchain developer",
   "salesforce", "oracle", "tableau", "power bi",
 ];
@@ -35,6 +34,8 @@ const ICP_STRONG_KEYWORDS = [
   "api integration", "crm integration", "marketing automation",
   "llm", "gpt", "chatbot", "ai agent", "ai workflow",
   "python automation", "web scraping", "data pipeline",
+  "mobile app", "react native", "flutter", "full stack",
+  "ios app", "android app", "cross platform",
 ];
 
 // ── ICP weak keywords — supporting signals ──
