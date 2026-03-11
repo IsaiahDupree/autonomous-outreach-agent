@@ -49,4 +49,31 @@ router.post("/chrome/discover", async (_req: Request, res: Response) => {
   res.json({ ok: true, message: "Chrome discovery queued" });
 });
 
+// Close rate metrics
+router.get("/metrics", async (_req: Request, res: Response) => {
+  try {
+    const { getCloseRateMetrics } = await import("../client/Upwork");
+    const metrics = await getCloseRateMetrics();
+    res.json(metrics);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// Record proposal outcome (won/rejected/no_response/interviewed)
+router.post("/upwork/outcome", async (req: Request, res: Response) => {
+  const { jobId, outcome } = req.body as { jobId?: string; outcome?: string };
+  if (!jobId || !outcome || !["won", "rejected", "no_response", "interviewed"].includes(outcome)) {
+    res.status(400).json({ error: "Required: jobId, outcome (won|rejected|no_response|interviewed)" });
+    return;
+  }
+  try {
+    await cloud.recordOutcome(jobId, outcome as "won" | "rejected" | "no_response" | "interviewed");
+    logger.info(`[api] Recorded outcome: ${jobId} → ${outcome}`);
+    res.json({ ok: true, jobId, outcome });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 export default router;

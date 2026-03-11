@@ -642,6 +642,66 @@ export async function scanJobs(
 }
 
 /**
+ * Scrape Best Matches / Featured feed page.
+ * This is the curated feed Upwork shows at /nx/find-work/best-matches
+ */
+export async function scrapeBestMatches(limit = 20): Promise<ScrapedJob[]> {
+  let page: Page | null = null;
+  try {
+    page = await newPage();
+    await page.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
+    const cfPassed = await waitForCloudflare(page, 90000);
+
+    const b = await launch();
+    const allPages = await b.pages();
+    page = allPages.find(p => p.url().includes("upwork")) || allPages[0];
+
+    if (!cfPassed) {
+      logger.warn("[Browser/Upwork] Cloudflare blocked on homepage");
+    }
+
+    await ensureLoggedIn(page);
+
+    // Navigate to Best Matches feed
+    const b2 = await launch();
+    const pages2 = await b2.pages();
+    page = pages2.find(p => p.url().includes("upwork")) || pages2[0];
+
+    await page.goto("https://www.upwork.com/nx/find-work/best-matches", { waitUntil: "networkidle2", timeout: 45000 });
+    await humanDelay(3000, 5000);
+
+    // Handle CF on feed page
+    const feedTitle = await page.title();
+    if (feedTitle.includes("Just a moment") || feedTitle.includes("Checking")) {
+      logger.info("[Browser/Upwork] Cloudflare on best-matches page — solving...");
+      await waitForCloudflare(page, 90000);
+      const bCf = await launch();
+      const cfPages = await bCf.pages();
+      page = cfPages.find(p => p.url().includes("upwork")) || cfPages[0];
+      await page.goto("https://www.upwork.com/nx/find-work/best-matches", { waitUntil: "networkidle2", timeout: 45000 });
+      await humanDelay(3000, 5000);
+    }
+
+    await page.waitForSelector('article.job-tile, article[data-ev-job-uid], a[href*="/jobs/"]', { timeout: 15000 }).catch(() => {
+      logger.warn("[Browser/Upwork] No job elements on best-matches page");
+    });
+    await humanDelay(1000, 2000);
+
+    const pageTitle = await page.title();
+    logger.info(`[Browser/Upwork] Best Matches page: "${pageTitle}"`);
+
+    const jobs = await scrapeCurrentPage(page, limit);
+    logger.info(`[Browser/Upwork] Found ${jobs.length} best-match jobs`);
+    return jobs;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] scrapeBestMatches error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
+}
+
+/**
  * Profile data scraped from Upwork.
  */
 export interface UpworkProfile {

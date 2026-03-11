@@ -133,6 +133,47 @@ export async function saveProspect(prospect: {
   }
 }
 
+/**
+ * Get proposal metrics for close rate tracking.
+ * Counts proposals by status: submitted, won, rejected, no_response.
+ */
+export async function getProposalMetrics(): Promise<{
+  submitted: number;
+  won: number;
+  rejected: number;
+  noResponse: number;
+  avgScore: number;
+}> {
+  try {
+    // Get all proposals that were submitted or beyond
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(submitted,won,rejected,no_response,interviewed)&select=status,score`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return { submitted: 0, won: 0, rejected: 0, noResponse: 0, avgScore: 0 };
+
+    const data = await res.json() as Array<{ status: string; score: number }>;
+    const submitted = data.length;
+    const won = data.filter(d => d.status === "won").length;
+    const rejected = data.filter(d => d.status === "rejected").length;
+    const noResponse = data.filter(d => d.status === "no_response").length;
+    const totalScore = data.reduce((sum, d) => sum + (d.score || 0), 0);
+    const avgScore = submitted > 0 ? Math.round((totalScore / submitted) * 10) / 10 : 0;
+
+    return { submitted, won, rejected, noResponse, avgScore };
+  } catch (e) {
+    logger.error(`[Cloud] getProposalMetrics error: ${(e as Error).message}`);
+    return { submitted: 0, won: 0, rejected: 0, noResponse: 0, avgScore: 0 };
+  }
+}
+
+/**
+ * Mark a proposal outcome (won/rejected/no_response) for close rate tracking.
+ */
+export async function recordOutcome(jobId: string, outcome: "won" | "rejected" | "no_response" | "interviewed"): Promise<void> {
+  await updateProposalStatus(jobId, outcome, { outcome_at: new Date().toISOString() });
+}
+
 export async function checkService(port: number): Promise<boolean> {
   try {
     const res = await fetch(`http://localhost:${port}/health`, { signal: AbortSignal.timeout(2000) });

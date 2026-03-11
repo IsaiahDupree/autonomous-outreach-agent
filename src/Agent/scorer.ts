@@ -27,10 +27,15 @@ const HARD_EXCLUDES_REGEX = [
   /\bsap\b/i,
 ];
 
+// ── Competitive blacklist — too much competition, drop these ──
+const COMPETITIVE_BLACKLIST = [
+  "n8n", "zapier", "make.com", "make automation",
+];
+
 // ── ICP strong keywords — must match at least 1 or score → 0 ──
 const ICP_STRONG_KEYWORDS = [
   "ai automation", "workflow automation", "browser automation",
-  "claude", "openai", "anthropic", "n8n", "zapier", "make.com",
+  "claude", "openai", "anthropic",
   "api integration", "crm integration", "marketing automation",
   "llm", "gpt", "chatbot", "ai agent", "ai workflow",
   "python automation", "web scraping", "data pipeline",
@@ -79,6 +84,7 @@ export function preScoreJob(job: {
   description: string;
   budget?: string;
   posted?: string;
+  proposals?: string;
 }): PreScoreResult {
   const text = `${job.title} ${job.description}`.toLowerCase();
 
@@ -98,6 +104,43 @@ export function preScoreJob(job: {
       return {
         score: 0, excluded: true,
         excludeReason: `Hard exclude: ${re.source}`,
+        strongHits: [], weakHits: [],
+        budgetBonus: 0, recencyBonus: 0,
+      };
+    }
+  }
+
+  // ── Competitive blacklist — too saturated, skip ──
+  for (const kw of COMPETITIVE_BLACKLIST) {
+    if (text.includes(kw)) {
+      return {
+        score: 0, excluded: true,
+        excludeReason: `Competitive blacklist: "${kw}" (too much competition)`,
+        strongHits: [], weakHits: [],
+        budgetBonus: 0, recencyBonus: 0,
+      };
+    }
+  }
+
+  // ── Proposal count ceiling — skip jobs with 20+ proposals ──
+  if (job.proposals) {
+    const proposalText = job.proposals.toLowerCase();
+    // Parse "15 to 20 proposals", "20 to 50", "50+", "20+ proposals"
+    const rangeMatch = proposalText.match(/(\d+)\s*to\s*(\d+)/);
+    const plusMatch = proposalText.match(/(\d+)\+/);
+    const singleMatch = proposalText.match(/(\d+)\s*proposal/);
+    let proposalCount = 0;
+    if (rangeMatch) {
+      proposalCount = parseInt(rangeMatch[1]); // use lower bound
+    } else if (plusMatch) {
+      proposalCount = parseInt(plusMatch[1]);
+    } else if (singleMatch) {
+      proposalCount = parseInt(singleMatch[1]);
+    }
+    if (proposalCount >= 20) {
+      return {
+        score: 0, excluded: true,
+        excludeReason: `Too many proposals: ${job.proposals} (max 20)`,
         strongHits: [], weakHits: [],
         budgetBonus: 0, recencyBonus: 0,
       };
@@ -216,6 +259,7 @@ export async function scoreJob(job: {
   description: string;
   budget?: string;
   posted?: string;
+  proposals?: string;
 }): Promise<ScoredJob> {
   // Stage 1: deterministic pre-filter
   const pre = preScoreJob(job);

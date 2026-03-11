@@ -1,6 +1,7 @@
 /**
- * src/index.ts — Entry point (mirrors Riona's index.ts exactly)
+ * src/index.ts — Entry point
  * Starts Express server + initializes AI agent + runs cron cycles
+ * Upwork: keyword search (3h) + Best Matches feed (3h offset) + daily metrics
  */
 import dotenv from "dotenv";
 dotenv.config();
@@ -10,7 +11,7 @@ import { shutdown } from "./services";
 import { notify } from "./services/telegram";
 import app from "./app";
 import { initAgent } from "./Agent/index";
-import { runProposalCycle } from "./client/Upwork";
+import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics } from "./client/Upwork";
 import { runDiscoveryCycle } from "./client/Chrome";
 import { PORT, BROWSER_MODE } from "./secret";
 import { engine } from "./browser";
@@ -21,7 +22,6 @@ const UPWORK_KEYWORDS = [
   "AI automation",
   "Claude API",
   "Python automation",
-  "n8n workflow",
   "web scraping bot",
   "marketing automation",
   "AI chatbot development",
@@ -42,16 +42,40 @@ const UPWORK_FILTERS = {
   experienceLevel: ["2", "3"] as ("2" | "3")[],     // intermediate + expert
   proposalRange: "0-4" as const,                    // low competition (< 5 proposals)
   clientHires: "1-9" as const,                      // clients with hiring history
-  // projectLength: "months" as const,              // 1-3 month projects
-  // clientLocation: "United States",               // US clients only
-  // connectPrice: "0-2",                           // cheap to apply
-  // perPage: 50,                                   // max results per page
 };
 
 // Score threshold: 0-10, jobs below this are skipped
 const UPWORK_SCORE_THRESHOLD = 5;
 
 const CHROME_KEYWORDS = ["saas founder", "ai automation", "b2b startup", "software founder"];
+
+/**
+ * Send daily close rate metrics to Telegram.
+ */
+async function sendMetricsReport(): Promise<void> {
+  try {
+    const m = await getCloseRateMetrics();
+    if (m.submitted === 0) {
+      await notify("📊 *Daily Metrics*\nNo proposals submitted yet.");
+      return;
+    }
+    const report = [
+      "📊 *Daily Close Rate Report*",
+      "",
+      `📤 Submitted: ${m.submitted}`,
+      `🏆 Won: ${m.won}`,
+      `❌ Rejected: ${m.rejected}`,
+      `🔇 No Response: ${m.noResponse}`,
+      `📈 Pending: ${m.submitted - m.won - m.rejected - m.noResponse}`,
+      "",
+      `*Close Rate: ${m.closeRate}%*`,
+      `Avg Score of Submitted: ${m.avgScore}/10`,
+    ].join("\n");
+    await notify(report);
+  } catch (e) {
+    logger.error(`[Metrics] Report error: ${(e as Error).message}`);
+  }
+}
 
 async function startServer() {
   // Init AI agent with character
@@ -75,7 +99,6 @@ async function startServer() {
     logger.info(`[Login] Opening ${target} — log in manually, then press Ctrl+C to save session`);
     const page = await newPage();
     await page.goto(target, { waitUntil: "networkidle2", timeout: 30000 });
-    // Keep the browser open until user presses Ctrl+C
     await new Promise<void>((resolve) => {
       process.on("SIGINT", () => { resolve(); });
       process.on("SIGTERM", () => { resolve(); });
@@ -89,7 +112,9 @@ async function startServer() {
   if (once) {
     // Single run mode
     if (!moduleFilter || moduleFilter === "upwork") await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
+    if (moduleFilter === "best-matches") await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
     if (!moduleFilter || moduleFilter === "chrome") await runDiscoveryCycle(CHROME_KEYWORDS);
+    if (moduleFilter === "metrics") await sendMetricsReport();
     await engine.close();
     process.exit(0);
     return;
@@ -101,15 +126,23 @@ async function startServer() {
     logger.info(`Health: http://localhost:${PORT}/api/health`);
   });
 
-  // Run initial Upwork scan on startup
+  // Run initial scans on startup
   logger.info("[startup] Running initial Upwork scan...");
   await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[startup] upwork error", e));
+  logger.info("[startup] Running initial Best Matches scan...");
+  await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[startup] best-matches error", e));
 
   // Cron schedules
-  // Upwork scan every 3 hours
+  // Upwork keyword search every 3 hours (top of hour)
   cron.schedule("0 */3 * * *", async () => {
-    logger.info("[cron] Upwork scan");
+    logger.info("[cron] Upwork keyword search");
     await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[cron] upwork error", e));
+  });
+
+  // Best Matches feed every 3 hours (offset by 90 min so they alternate)
+  cron.schedule("30 1,4,7,10,13,16,19,22 * * *", async () => {
+    logger.info("[cron] Best Matches scan");
+    await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[cron] best-matches error", e));
   });
 
   // Chrome discovery every 30 minutes
@@ -118,7 +151,13 @@ async function startServer() {
     await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
   });
 
-  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE} | Upwork: every 3h | Chrome: every 30min`);
+  // Daily metrics report at 9 AM
+  cron.schedule("0 9 * * *", async () => {
+    logger.info("[cron] Daily metrics report");
+    await sendMetricsReport().catch((e) => logger.error("[cron] metrics error", e));
+  });
+
+  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 3h | Best Matches: every 3h (offset)\nChrome: every 30min | Metrics: daily 9 AM`);
   logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
 
   const graceful = async () => {

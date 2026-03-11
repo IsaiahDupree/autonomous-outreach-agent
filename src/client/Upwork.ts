@@ -2,6 +2,7 @@
  * src/client/Upwork.ts — Upwork platform client
  * Dual-mode: tries Safari service first, falls back to Puppeteer.
  * Includes AI-powered job scoring + configurable filters.
+ * Supports both keyword search and Best Matches feed scanning.
  */
 import logger from "../config/logger";
 import { SAFARI_UPWORK_PORT, BROWSER_MODE } from "../secret";
@@ -31,6 +32,7 @@ export interface UpworkJob {
   proposals?: string;
   clientSpend?: string;
   skills?: string[];
+  source?: "search" | "best_matches";
 }
 
 let safariUp: boolean | null = null;
@@ -68,9 +70,24 @@ export async function scanJobs(
     // Puppeteer: search each keyword individually with filters
     logger.info(`[Upwork] Searching ${keywords.length} keywords with filters: ${JSON.stringify(filters)}`);
     const scraped = await upworkBrowser.scanJobs(keywords, filters, limit);
-    return scraped.map((j) => ({ ...j, score: j.score || 0 }));
+    return scraped.map((j) => ({ ...j, score: j.score || 0, source: "search" as const }));
   } catch (e) {
     logger.error(`[Upwork] scanJobs error: ${(e as Error).message}`);
+    return [];
+  }
+}
+
+/**
+ * Scrape Best Matches / Featured feed — Upwork's curated recommendations.
+ */
+export async function scanBestMatches(limit = 20): Promise<UpworkJob[]> {
+  try {
+    if (BROWSER_MODE === "safari") return [];
+    logger.info("[Upwork] Scanning Best Matches feed...");
+    const scraped = await upworkBrowser.scrapeBestMatches(limit);
+    return scraped.map((j) => ({ ...j, score: j.score || 0, source: "best_matches" as const }));
+  } catch (e) {
+    logger.error(`[Upwork] scanBestMatches error: ${(e as Error).message}`);
     return [];
   }
 }
@@ -106,21 +123,16 @@ export async function submitProposal(job: UpworkJob): Promise<boolean> {
 }
 
 /**
- * Full cycle: search → AI score → build cover letter → Telegram approval → submit
+ * Shared scoring + dedup + approval flow for any job list.
+ * Used by both keyword search and Best Matches.
  */
-export async function runProposalCycle(
-  keywords: string[],
-  filters: SearchFilters = {},
-  scoreThreshold = 6
+async function processJobs(
+  jobs: UpworkJob[],
+  scoreThreshold: number,
+  label: string,
 ): Promise<void> {
-  logger.info(`[Upwork] Starting proposal cycle (${keywords.length} keywords, threshold=${scoreThreshold})`);
-
-  const jobs = await scanJobs(keywords, filters);
-  logger.info(`[Upwork] Found ${jobs.length} raw jobs`);
-
   if (jobs.length === 0) {
-    logger.info("[Upwork] No jobs found — cycle complete");
-    await tg.notify("📋 *Upwork scan complete* — 0 jobs found");
+    logger.info(`[Upwork] ${label}: No jobs found`);
     return;
   }
 
@@ -135,10 +147,10 @@ export async function runProposalCycle(
     newJobs.push(job);
   }
   if (dupeCount > 0) {
-    logger.info(`[Upwork] Skipped ${dupeCount} duplicate jobs already in Supabase`);
+    logger.info(`[Upwork] ${label}: Skipped ${dupeCount} duplicates`);
   }
 
-  // Score each new job: Stage 1 (deterministic pre-filter) → Stage 2 (AI scoring)
+  // Score each new job
   const scoredJobs: UpworkJob[] = [];
   let preFiltered = 0;
   for (const job of newJobs) {
@@ -148,6 +160,7 @@ export async function runProposalCycle(
       description: job.description,
       budget: job.budget,
       posted: job.posted,
+      proposals: job.proposals,
     });
     job.score = result.score;
     job.reasoning = result.reasoning;
@@ -157,7 +170,6 @@ export async function runProposalCycle(
     if (result.excluded) {
       preFiltered++;
       logger.info(`[Upwork]   ✗ Excluded: ${result.excluded}`);
-      // Save excluded jobs to Supabase for tracking
       await cloud.saveProposal({
         jobId: job.id, title: job.title, url: job.url,
         description: job.description, budget: job.budget,
@@ -169,7 +181,6 @@ export async function runProposalCycle(
 
     logger.info(`[Upwork]   Score: ${result.score}/10 (pre: ${result.preScore}/100) — ${result.reasoning}`);
 
-    // Save scored job to Supabase (even if below threshold)
     const status = result.score >= scoreThreshold ? "queued" : "below_threshold";
     await cloud.saveProposal({
       jobId: job.id, title: job.title, url: job.url,
@@ -178,31 +189,30 @@ export async function runProposalCycle(
       status,
       reasoning: result.reasoning,
       tags: result.tags,
-    }).catch((e) => logger.warn(`[Upwork] Failed to save to Supabase: ${(e as Error).message}`));
+    }).catch((e) => logger.warn(`[Upwork] Failed to save: ${(e as Error).message}`));
 
     if (result.score >= scoreThreshold) {
       scoredJobs.push(job);
     }
   }
 
-  logger.info(`[Upwork] ${scoredJobs.length}/${newJobs.length} qualified (${preFiltered} pre-filtered, ${dupeCount} dupes, threshold >=${scoreThreshold})`);
+  logger.info(`[Upwork] ${label}: ${scoredJobs.length}/${newJobs.length} qualified (${preFiltered} pre-filtered, ${dupeCount} dupes, threshold >=${scoreThreshold})`);
 
   if (scoredJobs.length === 0) {
-    await tg.notify(`📋 *Upwork scan complete*\n${jobs.length} scraped, ${newJobs.length} new, 0 above threshold (${scoreThreshold}/10)`);
+    await tg.notify(`📋 *${label} complete*\n${jobs.length} scraped, ${newJobs.length} new, 0 above threshold (${scoreThreshold}/10)`);
     return;
   }
 
   // Send summary to Telegram
   const sorted = scoredJobs.sort((a, b) => (b.score || 0) - (a.score || 0));
   const summary = sorted
-    .map((j, i) => `${i + 1}. *${j.title.slice(0, 50)}* — ${j.score}/10\n   💰 ${j.budget || "N/A"} | ${j.bidRange || "TBD"}\n   ${j.reasoning || ""}\n   🔗 ${j.url}`)
+    .map((j, i) => `${i + 1}. *${j.title.slice(0, 50)}* — ${j.score}/10\n   💰 ${j.budget || "N/A"} | ${j.bidRange || "TBD"}\n   📊 ${j.proposals || "? proposals"}\n   ${j.reasoning || ""}\n   🔗 ${j.url}`)
     .join("\n\n");
-  await tg.notify(`📋 *Upwork scan: ${scoredJobs.length} qualified jobs*\n\n${summary}`);
+  await tg.notify(`📋 *${label}: ${scoredJobs.length} qualified jobs*\n\n${summary}`);
 
   // Process each qualified job
   for (const job of scoredJobs) {
     const proposal = await buildProposal(job);
-    // Update with cover letter
     await cloud.saveProposal({
       jobId: proposal.id, title: proposal.title, url: proposal.url,
       description: proposal.description, budget: proposal.budget,
@@ -211,13 +221,14 @@ export async function runProposalCycle(
     });
     obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "pending");
 
-    // Format preview for Telegram
     const preview = [
       `📌 *${proposal.title}*`,
       `🔗 ${proposal.url}`,
       `💰 Budget: ${proposal.budget || "N/A"} | Suggested bid: ${proposal.bidRange || "TBD"}`,
+      `📊 Proposals: ${proposal.proposals || "unknown"}`,
       `🎯 Score: ${proposal.score}/10 — ${proposal.reasoning || ""}`,
       proposal.tags?.length ? `🏷 Skills: ${proposal.tags.join(", ")}` : "",
+      proposal.source === "best_matches" ? "⭐ Source: Best Matches" : "",
       `\n📝 *Cover Letter:*\n${proposal.coverLetter || "(none)"}`,
     ].filter(Boolean).join("\n");
 
@@ -231,12 +242,10 @@ export async function runProposalCycle(
     const { action } = await tg.waitForApproval(proposal.id, "upwork");
 
     if (action === "send" || action === "send_with_portfolio") {
-      // Prepend portfolio link if requested
       if (action === "send_with_portfolio") {
         const portfolioLine = getPortfolioLine(proposal.tags);
         if (portfolioLine) {
           proposal.coverLetter = `${portfolioLine}\n\n${proposal.coverLetter || ""}`;
-          // Update Supabase with the portfolio-enhanced cover letter
           await cloud.saveProposal({
             jobId: proposal.id, title: proposal.title, url: proposal.url,
             description: proposal.description, budget: proposal.budget,
@@ -253,11 +262,56 @@ export async function runProposalCycle(
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, status);
       await tg.notify(ok ? `🚀 Proposal submitted: ${proposal.title}` : `❌ Submission failed: ${proposal.title}`);
     } else {
-      // skip or timeout
       await cloud.updateProposalStatus(proposal.id, "skipped");
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "skipped");
     }
   }
+}
 
+/**
+ * Full cycle: keyword search → AI score → approval → submit
+ */
+export async function runProposalCycle(
+  keywords: string[],
+  filters: SearchFilters = {},
+  scoreThreshold = 6
+): Promise<void> {
+  logger.info(`[Upwork] Starting proposal cycle (${keywords.length} keywords, threshold=${scoreThreshold})`);
+  const jobs = await scanJobs(keywords, filters);
+  logger.info(`[Upwork] Found ${jobs.length} raw jobs from search`);
+  await processJobs(jobs, scoreThreshold, "Upwork search");
   logger.info("[Upwork] Proposal cycle complete");
+}
+
+/**
+ * Best Matches cycle: scrape featured feed → AI score → approval → submit
+ * Filters for AI-relevant jobs with < 20 proposals.
+ */
+export async function runBestMatchesCycle(
+  scoreThreshold = 5
+): Promise<void> {
+  logger.info("[Upwork] Starting Best Matches cycle");
+  const jobs = await scanBestMatches(30);
+  logger.info(`[Upwork] Found ${jobs.length} best-match jobs`);
+  await processJobs(jobs, scoreThreshold, "Best Matches");
+  logger.info("[Upwork] Best Matches cycle complete");
+}
+
+/**
+ * Get close rate metrics from Supabase.
+ * Tracks: submitted → won/rejected/no_response
+ */
+export async function getCloseRateMetrics(): Promise<{
+  submitted: number;
+  won: number;
+  rejected: number;
+  noResponse: number;
+  closeRate: number;
+  avgScore: number;
+}> {
+  const metrics = await cloud.getProposalMetrics();
+  const closeRate = metrics.submitted > 0
+    ? Math.round((metrics.won / metrics.submitted) * 100)
+    : 0;
+  return { ...metrics, closeRate };
 }
