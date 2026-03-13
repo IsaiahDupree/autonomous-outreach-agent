@@ -117,6 +117,7 @@ export async function launch(opts: BrowserOptions = {}): Promise<Browser> {
       browser = await (puppeteer as any).connect({
         browserURL: `http://127.0.0.1:${cdpPort}`,
         defaultViewport: null,
+        protocolTimeout: 300_000, // 5 min — Upwork pages can be slow
       });
 
       browser!.on("disconnected", () => {
@@ -321,17 +322,22 @@ export async function waitForCloudflare(page: Page, maxWaitMs = 60000): Promise<
   browser!.disconnect();
   browser = null;
 
-  // Wait a moment for CDP to fully detach
-  await new Promise((r) => setTimeout(r, 2000));
+  // Wait longer for CDP to fully detach — gives Chrome time to "forget" automation
+  await new Promise((r) => setTimeout(r, 3000 + Math.random() * 2000));
 
   // Now click with native OS mouse — Chrome is running as a completely normal browser
   logger.info("[Browser] Clicking Turnstile with native mouse (CDP disconnected)...");
   const { nativeClickExported } = await import("./mouse");
-  nativeClickExported(clickScreenX, clickScreenY);
 
-  // Wait for Cloudflare verification (15-25 seconds to be safe)
-  logger.info("[Browser] Waiting for Cloudflare to verify (CDP disconnected)...");
-  await new Promise((r) => setTimeout(r, 20000));
+  // Add slight random jitter to the click coordinates each time
+  const jitterX = Math.round(clickScreenX + (Math.random() * 6 - 3));
+  const jitterY = Math.round(clickScreenY + (Math.random() * 6 - 3));
+  nativeClickExported(jitterX, jitterY);
+
+  // Wait for Cloudflare verification — randomize to avoid pattern detection
+  const verifyWaitMs = 20000 + Math.random() * 10000; // 20-30s
+  logger.info(`[Browser] Waiting ${Math.round(verifyWaitMs / 1000)}s for Cloudflare to verify (CDP disconnected)...`);
+  await new Promise((r) => setTimeout(r, verifyWaitMs));
 
   // RECONNECT CDP
   logger.info("[Browser] Reconnecting to Chrome via CDP...");
@@ -341,6 +347,7 @@ export async function waitForCloudflare(page: Page, maxWaitMs = 60000): Promise<
       browser = await (puppeteer as any).connect({
         browserURL: `http://127.0.0.1:${activeCdpPort}`,
         defaultViewport: null,
+        protocolTimeout: 300_000,
       });
       reconnected = true;
       break;

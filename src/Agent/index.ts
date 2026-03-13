@@ -89,6 +89,9 @@ Rules:
 - State a clear outcome/deliverable
 - End with a soft CTA (not pushy)
 - NO generic phrases like "I am writing to apply"
+- NO markdown formatting whatsoever — no bold, no bullets, no headers, no asterisks
+- Write in plain text only, like a normal person typing a message
+- Use short paragraphs separated by blank lines
 - Return ONLY the cover letter text, no preamble`;
 
   const msg = await client.messages.create({
@@ -97,7 +100,38 @@ Rules:
     messages: [{ role: "user", content: prompt }],
   });
 
-  return (msg.content[0] as { text: string }).text;
+  const block = msg.content?.[0];
+  if (!block || !("text" in block)) throw new Error("Empty Claude response");
+  return block.text;
+}
+
+/**
+ * Generate a specific answer to an Upwork screening question
+ */
+export async function answerScreeningQuestion(
+  question: string,
+  job: { title: string; description: string },
+): Promise<string> {
+  const persona = characterConfig?.persona || "a professional AI automation consultant";
+  const msg = await client.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 200,
+    messages: [{
+      role: "user",
+      content: `You are ${persona} answering an Upwork screening question.
+
+Job: ${job.title}
+Description: ${job.description.slice(0, 300)}
+Question: ${question}
+
+Write a concise, specific answer (2-4 sentences). Reference your relevant experience.
+NO markdown. Plain text only. Sound like a real person, not a template.
+Return ONLY the answer text.`,
+    }],
+  });
+  const block = msg.content?.[0];
+  if (!block || !("text" in block)) throw new Error("Empty Claude response");
+  return block.text;
 }
 
 /**
@@ -122,7 +156,9 @@ Profile: "${text.slice(0, 300)}"`,
     }],
   });
 
-  const score = parseInt((msg.content[0] as { text: string }).text.trim());
+  const block = msg.content?.[0];
+  if (!block || !("text" in block)) throw new Error("Empty Claude response");
+  const score = parseInt(block.text.trim());
   return isNaN(score) ? 0 : Math.min(10, Math.max(0, score));
 }
 
@@ -146,5 +182,7 @@ Reply with ONLY the opening sentence.`,
     }],
   });
 
-  return (msg.content[0] as { text: string }).text.trim();
+  const block = msg.content?.[0];
+  if (!block || !("text" in block)) throw new Error("Empty Claude response");
+  return block.text.trim();
 }

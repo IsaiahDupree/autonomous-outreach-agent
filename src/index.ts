@@ -17,31 +17,41 @@ import { PORT, BROWSER_MODE } from "./secret";
 import { engine } from "./browser";
 import cron from "node-cron";
 
-// Upwork search keywords — each is searched individually
+// Upwork search keywords — 10 niches × 2-3 variations each
 const UPWORK_KEYWORDS = [
-  "AI automation",
-  "Claude API",
-  "Python automation",
-  "web scraping bot",
-  "marketing automation",
-  "AI chatbot development",
-  "data pipeline",
-  "mobile app development",
-  "react native app",
-  "flutter app",
-  "full stack app",
+  // Niche 1: AI/LLM automation
+  "AI automation", "LLM integration", "AI workflow",
+  // Niche 2: Claude/OpenAI/GPT
+  "Claude API", "OpenAI API", "GPT integration",
+  // Niche 3: Python automation/scripting
+  "Python automation", "Python script", "Python developer automation",
+  // Niche 4: Web scraping & data extraction
+  "web scraping", "data extraction", "web crawler",
+  // Niche 5: Chatbot / AI agent
+  "AI chatbot", "AI agent", "chatbot development",
+  // Niche 6: Marketing automation / CRM
+  "marketing automation", "CRM automation", "email automation",
+  // Niche 7: Workflow / no-code automation
+  "n8n automation", "zapier automation", "workflow automation", "make.com",
+  // Niche 8: Data pipeline / ETL
+  "data pipeline", "ETL pipeline", "data integration",
+  // Niche 9: Mobile app development
+  "mobile app development", "react native app", "flutter app", "cross platform app",
+  // Niche 10: Full stack / SaaS / MVP
+  "full stack app", "SaaS MVP", "full stack developer", "MVP development",
 ];
 
-// Default filters for Upwork search
+// Default filters — loosened to maximize job volume
+// (pre-filter in scorer.ts handles quality control)
 const UPWORK_FILTERS = {
   sort: "recency" as const,
-  postedWithin: "24" as const,                      // only jobs from last 24 hours
-  budgetMin: 500,                                   // fixed-price $500+ minimum
-  hourlyRateMin: 35,                                // hourly $35/hr+ minimum
-  paymentVerified: true,                            // verified clients only
-  experienceLevel: ["2", "3"] as ("2" | "3")[],     // intermediate + expert
-  proposalRange: "0-4" as const,                    // low competition (< 5 proposals)
-  clientHires: "1-9" as const,                      // clients with hiring history
+  postedWithin: "24" as const,                      // last 24 hours
+  budgetMin: 200,                                   // lowered from $500 to catch more
+  hourlyRateMin: 25,                                // lowered from $35
+  paymentVerified: true,                            // keep: verified clients only
+  experienceLevel: ["2", "3"] as ("2" | "3")[],     // keep: intermediate + expert
+  // REMOVED: proposalRange — was "0-4", killing ~70% of jobs at search level
+  // REMOVED: clientHires — was "1-9", excluding new clients with big budgets
 };
 
 // Score threshold: 0-10, jobs below this are skipped

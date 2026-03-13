@@ -13,6 +13,8 @@ import { generateCoverLetter, getPortfolioLine } from "../Agent";
 import { scoreJob } from "../Agent/scorer";
 import * as upworkBrowser from "../browser/upwork";
 import type { SearchFilters } from "../browser/upwork";
+import { AUTO_SEND, AUTO_SEND_MIN_SCORE } from "../secret";
+import { getConnectsRemaining } from "../browser/upwork";
 
 const SAFARI_BASE = `http://localhost:${SAFARI_UPWORK_PORT}`;
 
@@ -101,9 +103,28 @@ export async function buildProposal(job: UpworkJob): Promise<UpworkJob> {
   return { ...job, coverLetter };
 }
 
-export async function submitProposal(job: UpworkJob): Promise<boolean> {
+export async function submitProposal(job: UpworkJob, opts?: { dryRun?: boolean }): Promise<boolean> {
   try {
-    if (await checkSafari()) {
+    // Regenerate cover letter if empty (e.g. queued jobs from before the fix)
+    if (!job.coverLetter || job.coverLetter.trim().length === 0) {
+      logger.info(`[Upwork] Cover letter empty for "${(job.title || "").slice(0, 50)}" — regenerating...`);
+      const rebuilt = await buildProposal(job);
+      job.coverLetter = rebuilt.coverLetter;
+      if (job.coverLetter && job.coverLetter.trim().length > 0) {
+        // Save regenerated cover letter back to Supabase
+        await cloud.saveProposal({
+          jobId: job.id, title: job.title, url: job.url,
+          description: job.description, budget: job.budget,
+          score: job.score || 0, bid: job.bid || 0,
+          coverLetter: job.coverLetter,
+        });
+        logger.info(`[Upwork] Regenerated cover letter: ${job.coverLetter.length} chars`);
+      } else {
+        logger.error(`[Upwork] Cover letter regeneration failed — still empty`);
+        return false;
+      }
+    }
+    if (!opts?.dryRun && await checkSafari()) {
       const res = await fetch(`${SAFARI_BASE}/api/submit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -112,9 +133,13 @@ export async function submitProposal(job: UpworkJob): Promise<boolean> {
       });
       return res.ok;
     }
-    if (BROWSER_MODE === "safari") return false;
+    if (!opts?.dryRun && BROWSER_MODE === "safari") return false;
     return await upworkBrowser.submitProposal(job.url, job.coverLetter || "", {
+      dryRun: opts?.dryRun,
       milestones: job.bid ? [{ description: "Full project delivery", amount: job.bid }] : undefined,
+      clientBudget: job.budget,
+      jobTitle: job.title,
+      jobDescription: job.description,
     });
   } catch (e) {
     logger.error(`[Upwork] submitProposal error: ${(e as Error).message}`);
@@ -182,6 +207,18 @@ async function processJobs(
     logger.info(`[Upwork]   Score: ${result.score}/10 (pre: ${result.preScore}/100) — ${result.reasoning}`);
 
     const status = result.score >= scoreThreshold ? "queued" : "below_threshold";
+
+    // Generate cover letter at queue time so it's ready for instant submission
+    if (result.score >= scoreThreshold) {
+      try {
+        const built = await buildProposal(job);
+        job.coverLetter = built.coverLetter;
+        logger.info(`[Upwork] Pre-generated cover letter: ${(job.coverLetter || "").length} chars`);
+      } catch (e) {
+        logger.warn(`[Upwork] Cover letter pre-gen failed: ${(e as Error).message}`);
+      }
+    }
+
     await cloud.saveProposal({
       jobId: job.id, title: job.title, url: job.url,
       description: job.description, budget: job.budget,
@@ -189,6 +226,7 @@ async function processJobs(
       status,
       reasoning: result.reasoning,
       tags: result.tags,
+      coverLetter: job.coverLetter,
     }).catch((e) => logger.warn(`[Upwork] Failed to save: ${(e as Error).message}`));
 
     if (result.score >= scoreThreshold) {
@@ -212,12 +250,30 @@ async function processJobs(
 
   // Process each qualified job
   for (const job of scoredJobs) {
+    // Check connects budget before submitting
+    const connects = getConnectsRemaining();
+    if (connects !== null && connects < 16) {
+      logger.warn(`[Upwork] Low connects: ${connects} remaining — pausing auto-submissions`);
+      await tg.notify(`⚠️ Low connects: ${connects} remaining. Pausing auto-submissions.`);
+      break;
+    }
+
     const proposal = await buildProposal(job);
+
+    // Always add portfolio line in auto-send mode
+    const autoSendEligible = AUTO_SEND && (proposal.score || 0) >= AUTO_SEND_MIN_SCORE;
+    if (autoSendEligible) {
+      const portfolioLine = getPortfolioLine(proposal.tags);
+      if (portfolioLine) {
+        proposal.coverLetter = `${portfolioLine}\n\n${proposal.coverLetter || ""}`;
+      }
+    }
+
     await cloud.saveProposal({
       jobId: proposal.id, title: proposal.title, url: proposal.url,
       description: proposal.description, budget: proposal.budget,
       score: proposal.score || 0, bid: proposal.bid || 0,
-      coverLetter: proposal.coverLetter || "", status: "pending",
+      coverLetter: proposal.coverLetter || "", status: autoSendEligible ? "auto_sending" : "pending",
     });
     obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "pending");
 
@@ -232,38 +288,51 @@ async function processJobs(
       `\n📝 *Cover Letter:*\n${proposal.coverLetter || "(none)"}`,
     ].filter(Boolean).join("\n");
 
-    await tg.sendForApproval({
-      id: proposal.id, type: "proposal",
-      title: `Upwork: ${proposal.title}`,
-      preview,
-      jobUrl: proposal.url,
-    });
-
-    const { action } = await tg.waitForApproval(proposal.id, "upwork");
-
-    if (action === "send" || action === "send_with_portfolio") {
-      if (action === "send_with_portfolio") {
-        const portfolioLine = getPortfolioLine(proposal.tags);
-        if (portfolioLine) {
-          proposal.coverLetter = `${portfolioLine}\n\n${proposal.coverLetter || ""}`;
-          await cloud.saveProposal({
-            jobId: proposal.id, title: proposal.title, url: proposal.url,
-            description: proposal.description, budget: proposal.budget,
-            score: proposal.score || 0, bid: proposal.bid || 0,
-            coverLetter: proposal.coverLetter, status: "pending",
-          });
-          await tg.notify(`📋 Portfolio link added to proposal: ${proposal.title}`);
-        }
-      }
+    if (autoSendEligible) {
+      // ── AUTO-SEND: no human approval needed ──
+      logger.info(`[Upwork] AUTO-SEND: score ${proposal.score}/10 >= ${AUTO_SEND_MIN_SCORE} — submitting "${proposal.title.slice(0, 50)}"`);
+      await tg.notify(`🤖 *Auto-sending proposal* (score ${proposal.score}/10)\n\n${preview}`);
 
       const ok = await submitProposal(proposal);
       const status = ok ? "submitted" : "error";
       await cloud.updateProposalStatus(proposal.id, status);
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, status);
-      await tg.notify(ok ? `🚀 Proposal submitted: ${proposal.title}` : `❌ Submission failed: ${proposal.title}`);
+      await tg.notify(ok ? `🚀 Auto-submitted: ${proposal.title}` : `❌ Auto-submit failed: ${proposal.title}`);
     } else {
-      await cloud.updateProposalStatus(proposal.id, "skipped");
-      obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "skipped");
+      // ── MANUAL APPROVAL: send to Telegram and wait ──
+      await tg.sendForApproval({
+        id: proposal.id, type: "proposal",
+        title: `Upwork: ${proposal.title}`,
+        preview,
+        jobUrl: proposal.url,
+      });
+
+      const { action } = await tg.waitForApproval(proposal.id, "upwork");
+
+      if (action === "send" || action === "send_with_portfolio") {
+        if (action === "send_with_portfolio") {
+          const portfolioLine = getPortfolioLine(proposal.tags);
+          if (portfolioLine) {
+            proposal.coverLetter = `${portfolioLine}\n\n${proposal.coverLetter || ""}`;
+            await cloud.saveProposal({
+              jobId: proposal.id, title: proposal.title, url: proposal.url,
+              description: proposal.description, budget: proposal.budget,
+              score: proposal.score || 0, bid: proposal.bid || 0,
+              coverLetter: proposal.coverLetter, status: "pending",
+            });
+            await tg.notify(`📋 Portfolio link added to proposal: ${proposal.title}`);
+          }
+        }
+
+        const ok = await submitProposal(proposal);
+        const status = ok ? "submitted" : "error";
+        await cloud.updateProposalStatus(proposal.id, status);
+        obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, status);
+        await tg.notify(ok ? `🚀 Proposal submitted: ${proposal.title}` : `❌ Submission failed: ${proposal.title}`);
+      } else {
+        await cloud.updateProposalStatus(proposal.id, "skipped");
+        obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "skipped");
+      }
     }
   }
 }
@@ -277,7 +346,7 @@ export async function runProposalCycle(
   scoreThreshold = 6
 ): Promise<void> {
   logger.info(`[Upwork] Starting proposal cycle (${keywords.length} keywords, threshold=${scoreThreshold})`);
-  const jobs = await scanJobs(keywords, filters);
+  const jobs = await scanJobs(keywords, filters, 50);
   logger.info(`[Upwork] Found ${jobs.length} raw jobs from search`);
   await processJobs(jobs, scoreThreshold, "Upwork search");
   logger.info("[Upwork] Proposal cycle complete");
@@ -291,7 +360,7 @@ export async function runBestMatchesCycle(
   scoreThreshold = 5
 ): Promise<void> {
   logger.info("[Upwork] Starting Best Matches cycle");
-  const jobs = await scanBestMatches(30);
+  const jobs = await scanBestMatches(50);
   logger.info(`[Upwork] Found ${jobs.length} best-match jobs`);
   await processJobs(jobs, scoreThreshold, "Best Matches");
   logger.info("[Upwork] Best Matches cycle complete");

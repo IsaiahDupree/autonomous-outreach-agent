@@ -11,6 +11,18 @@ src/Agent/characters/*.json
 
 # Debug screenshots
 debug-*.png
+form-*.png
+
+# One-off debug/test scripts
+debug-*.js
+analyze-*.js
+check-*.js
+query-*.js
+fix-*.js
+test-*.js
+test-*.ts
+retry-*.ts
+apply-migration.js
 
 # Logs
 logs/

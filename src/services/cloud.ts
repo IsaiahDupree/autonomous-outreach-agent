@@ -4,6 +4,21 @@
 import { SUPABASE_URL, SUPABASE_KEY, CRMLITE_URL, CRMLITE_API_KEY } from "../secret";
 import logger from "../config/logger";
 
+/** Retry-enabled fetch with timeout — 2 retries, 1s backoff */
+async function safeFetch(url: string, opts: RequestInit = {}, retries = 2, timeoutMs = 10000): Promise<Response> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
+      return res;
+    } catch (e) {
+      if (attempt === retries) throw e;
+      logger.warn(`[Cloud] Fetch attempt ${attempt + 1} failed: ${(e as Error).message} — retrying in 1s...`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  throw new Error("safeFetch: unreachable");
+}
+
 const supabaseHeaders = () => ({
   apikey: SUPABASE_KEY,
   Authorization: `Bearer ${SUPABASE_KEY}`,
@@ -13,7 +28,7 @@ const supabaseHeaders = () => ({
 
 export async function logAction(agentId: string, action: string, status: string, detail: Record<string, unknown> = {}): Promise<void> {
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/actp_agent_audit_log`, {
+    await safeFetch(`${SUPABASE_URL}/rest/v1/actp_agent_audit_log`, {
       method: "POST",
       headers: supabaseHeaders(),
       body: JSON.stringify({ agent_id: agentId, action_type: action, status, result: detail, started_at: new Date().toISOString() }),
@@ -44,26 +59,36 @@ export async function saveProposal(proposal: {
   offerType?: string;
 }): Promise<boolean> {
   try {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/upwork_proposals`, {
+    const body: Record<string, unknown> = {
+      job_id: proposal.jobId,
+      job_title: proposal.title,
+      job_url: proposal.url,
+      job_description: proposal.description || null,
+      budget: proposal.budget || null,
+      score: proposal.score,
+      proposal_text: proposal.coverLetter || null,
+      status: proposal.status || "queued",
+      offer_type: proposal.offerType || null,
+      submitted_bid_amount: proposal.bid || null,
+      submitted_connects_cost: proposal.connectsCost || null,
+      milestones_json: proposal.milestonesJson || null,
+      updated_at: new Date().toISOString(),
+    };
+
+    // Try upsert first, fall back to PATCH if 409
+    let res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals`, {
       method: "POST",
       headers: { ...supabaseHeaders(), Prefer: "return=representation,resolution=merge-duplicates" },
-      body: JSON.stringify({
-        job_id: proposal.jobId,
-        job_title: proposal.title,
-        job_url: proposal.url,
-        job_description: proposal.description || null,
-        budget: proposal.budget || null,
-        score: proposal.score,
-        proposal_text: proposal.coverLetter || null,
-        status: proposal.status || "queued",
-        offer_type: proposal.offerType || null,
-        submitted_bid_amount: proposal.bid || null,
-        submitted_connects_cost: proposal.connectsCost || null,
-        milestones_json: proposal.milestonesJson || null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }),
+      body: JSON.stringify(body),
     });
+    if (res.status === 409) {
+      // Row exists — update via PATCH instead
+      const { job_id: _id, ...updateBody } = body;
+      res = await safeFetch(
+        `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(proposal.jobId)}`,
+        { method: "PATCH", headers: supabaseHeaders(), body: JSON.stringify(updateBody) },
+      );
+    }
     if (!res.ok) {
       const err = await res.text().catch(() => "");
       logger.warn(`[Cloud] saveProposal failed (${res.status}): ${err.slice(0, 200)}`);
@@ -76,7 +101,7 @@ export async function saveProposal(proposal: {
 }
 
 export async function updateProposalStatus(jobId: string, status: string, extra: Record<string, unknown> = {}): Promise<void> {
-  await fetch(`${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}`, {
+  await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}`, {
     method: "PATCH",
     headers: supabaseHeaders(),
     body: JSON.stringify({ status, updated_at: new Date().toISOString(), ...extra }),
@@ -84,11 +109,39 @@ export async function updateProposalStatus(jobId: string, status: string, extra:
 }
 
 export async function getPendingProposals(): Promise<Record<string, unknown>[]> {
-  const res = await fetch(
+  const res = await safeFetch(
     `${SUPABASE_URL}/rest/v1/upwork_proposals?status=eq.queued&order=created_at.asc`,
     { headers: supabaseHeaders() }
   );
   return res.ok ? (await res.json()) as Record<string, unknown>[] : [];
+}
+
+export async function getProposalsByFilter(filter: {
+  status?: string | string[];
+  minScore?: number;
+  jobId?: string;
+  limit?: number;
+}): Promise<Record<string, unknown>[]> {
+  const params = new URLSearchParams();
+  params.set("order", "score.desc");
+  if (filter.limit) params.set("limit", String(filter.limit));
+  if (filter.jobId) params.set("job_id", `eq.${filter.jobId}`);
+  if (filter.status) {
+    const s = Array.isArray(filter.status) ? filter.status : [filter.status];
+    params.set("status", s.length === 1 ? `eq.${s[0]}` : `in.(${s.join(",")})`);
+  }
+  if (filter.minScore) params.set("score", `gte.${filter.minScore}`);
+  const res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals?${params}`, { headers: supabaseHeaders() });
+  return res.ok ? (await res.json()) as Record<string, unknown>[] : [];
+}
+
+export async function getStatusCounts(): Promise<Record<string, number>> {
+  const res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals?select=status`, { headers: supabaseHeaders() });
+  if (!res.ok) return {};
+  const rows = (await res.json()) as Array<{ status: string }>;
+  const counts: Record<string, number> = {};
+  rows.forEach(r => { counts[r.status] = (counts[r.status] || 0) + 1; });
+  return counts;
 }
 
 /**
@@ -96,7 +149,7 @@ export async function getPendingProposals(): Promise<Record<string, unknown>[]> 
  */
 export async function proposalExists(jobId: string): Promise<boolean> {
   try {
-    const res = await fetch(
+    const res = await safeFetch(
       `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}&select=id&limit=1`,
       { headers: supabaseHeaders() }
     );
@@ -112,7 +165,7 @@ export async function saveProspect(prospect: {
   platform: string; username: string; displayName?: string;
   bio?: string; followers?: number; icpScore?: number; url?: string;
 }): Promise<void> {
-  await fetch(`${SUPABASE_URL}/rest/v1/crm_contacts`, {
+  await safeFetch(`${SUPABASE_URL}/rest/v1/crm_contacts`, {
     method: "POST",
     headers: { ...supabaseHeaders(), Prefer: "resolution=ignore-duplicates" },
     body: JSON.stringify({
@@ -122,14 +175,14 @@ export async function saveProspect(prospect: {
       pipeline_stage: "new", source: "chrome_agent",
       profile_url: prospect.url, created_at: new Date().toISOString(),
     }),
-  }).catch(() => {});
+  }).catch((e) => logger.warn(`[Cloud] saveProspect error: ${(e as Error).message}`));
 
   if (CRMLITE_URL && CRMLITE_API_KEY) {
-    await fetch(`${CRMLITE_URL}/api/contacts`, {
+    await safeFetch(`${CRMLITE_URL}/api/contacts`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": CRMLITE_API_KEY },
       body: JSON.stringify({ platform: prospect.platform, username: prospect.username, display_name: prospect.displayName, icp_score: prospect.icpScore }),
-    }).catch(() => {});
+    }).catch((e) => logger.warn(`[Cloud] saveProspect error: ${(e as Error).message}`));
   }
 }
 
@@ -146,7 +199,7 @@ export async function getProposalMetrics(): Promise<{
 }> {
   try {
     // Get all proposals that were submitted or beyond
-    const res = await fetch(
+    const res = await safeFetch(
       `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(submitted,won,rejected,no_response,interviewed)&select=status,score`,
       { headers: supabaseHeaders() }
     );
@@ -171,7 +224,11 @@ export async function getProposalMetrics(): Promise<{
  * Mark a proposal outcome (won/rejected/no_response) for close rate tracking.
  */
 export async function recordOutcome(jobId: string, outcome: "won" | "rejected" | "no_response" | "interviewed"): Promise<void> {
-  await updateProposalStatus(jobId, outcome, { outcome_at: new Date().toISOString() });
+  try {
+    await updateProposalStatus(jobId, outcome, { outcome_at: new Date().toISOString() });
+  } catch (e) {
+    logger.error(`[Cloud] recordOutcome error for ${jobId}: ${(e as Error).message}`);
+  }
 }
 
 export async function checkService(port: number): Promise<boolean> {

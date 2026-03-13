@@ -28,6 +28,7 @@ function toHtml(text: string): string {
 async function send(body: Record<string, unknown>): Promise<boolean> {
   try {
     const res = await fetch(`${API}/sendMessage`, {
+      signal: AbortSignal.timeout(10000),
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -38,10 +39,12 @@ async function send(body: Record<string, unknown>): Promise<boolean> {
       // Retry without formatting
       if (body.parse_mode) {
         const plain = (body.text as string).replace(/<[^>]+>/g, "");
+        const { parse_mode: _, ...rest } = body;
         const retry = await fetch(`${API}/sendMessage`, {
+          signal: AbortSignal.timeout(10000),
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, text: plain, parse_mode: undefined }),
+          body: JSON.stringify({ ...rest, text: plain }),
         });
         return retry.ok;
       }
@@ -105,7 +108,9 @@ export async function waitForApproval(id: string, prefix: string): Promise<{ act
   while (Date.now() < deadline) {
     await sleep(5000);
     try {
-      const res = await fetch(`${API}/getUpdates?offset=${lastUpdateId + 1}&timeout=4&allowed_updates=callback_query`);
+      const res = await fetch(`${API}/getUpdates?offset=${lastUpdateId + 1}&timeout=4&allowed_updates=callback_query`, {
+        signal: AbortSignal.timeout(10000),
+      });
       const data = await res.json() as { result: Array<{ update_id: number; callback_query?: { id: string; data: string } }> };
 
       for (const update of data?.result || []) {
@@ -115,6 +120,7 @@ export async function waitForApproval(id: string, prefix: string): Promise<{ act
 
         // Acknowledge the button press
         await fetch(`${API}/answerCallbackQuery`, {
+          signal: AbortSignal.timeout(10000),
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ callback_query_id: cb.id }),
@@ -128,16 +134,13 @@ export async function waitForApproval(id: string, prefix: string): Promise<{ act
         // Legacy support for old approve button format
         if (cb.data === `${prefix}_approve:${id}`) return { action: "send" };
       }
-    } catch { /* keep polling */ }
+    } catch (e) {
+      logger.warn(`[Telegram] poll error: ${(e as Error).message}`);
+    }
   }
 
   await notify(`⏰ Auto-skipped after 4h timeout | ID: ${id}`);
   return { action: "timeout" };
-}
-
-export async function shutdown(server: import("http").Server): Promise<void> {
-  logger.info("[telegram] Shutting down notification service");
-  server.close();
 }
 
 function sleep(ms: number): Promise<void> {

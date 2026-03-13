@@ -27,20 +27,35 @@ const HARD_EXCLUDES_REGEX = [
   /\bsap\b/i,
 ];
 
-// ── Competitive blacklist — too much competition, drop these ──
-const COMPETITIVE_BLACKLIST = [
-  "n8n", "zapier", "make.com", "make automation",
+// ── Competitive blacklist — removed most items, these are actually our market ──
+// Only blacklist truly oversaturated commodity work
+const COMPETITIVE_BLACKLIST: string[] = [
+  // Intentionally empty — n8n, zapier, make.com are core skills, not competition
 ];
 
 // ── ICP strong keywords — must match at least 1 or score → 0 ──
 const ICP_STRONG_KEYWORDS = [
+  // AI / LLM
   "ai automation", "workflow automation", "browser automation",
-  "claude", "openai", "anthropic",
-  "api integration", "crm integration", "marketing automation",
+  "claude", "openai", "anthropic", "gemini",
   "llm", "gpt", "chatbot", "ai agent", "ai workflow",
-  "python automation", "web scraping", "data pipeline",
+  "machine learning", "nlp", "natural language",
+  // Automation tools
+  "n8n", "zapier", "make.com", "make automation",
+  "api integration", "crm integration", "marketing automation",
+  "email automation", "lead generation", "lead gen",
+  "hubspot", "gohighlevel", "highlevel", "salesforce integration",
+  // Development
+  "python automation", "python script", "python developer",
+  "web scraping", "data scraping", "data extraction", "web crawler",
+  "data pipeline", "etl", "data integration",
   "mobile app", "react native", "flutter", "full stack",
   "ios app", "android app", "cross platform",
+  "saas", "mvp", "prototype", "web app",
+  // Ops / infra
+  "automation engineer", "automation specialist", "automation expert",
+  "bot development", "process automation", "rpa",
+  "webhook", "api development", "backend developer",
 ];
 
 // ── ICP weak keywords — supporting signals ──
@@ -50,11 +65,18 @@ const ICP_WEAK_KEYWORDS = [
   "lead gen", "outreach", "email", "sms", "notification",
   "schedule", "cron", "trigger", "monitor", "alert",
   "saas", "startup", "mvp", "prototype", "tool",
+  "dashboard", "analytics", "report", "workflow",
+  "backend", "frontend", "fullstack", "microservice",
+  "database", "postgres", "mongodb", "supabase", "firebase",
+  "node.js", "typescript", "react", "next.js", "express",
+  "django", "fastapi", "flask",
+  "docker", "aws", "cloud", "deploy",
+  "stripe", "payment", "billing",
 ];
 
-// ── Budget floors ──
-const BUDGET_FLOOR_HOURLY = 29;   // below $29/hr → drop
-const BUDGET_FLOOR_FIXED = 500;   // below $500 fixed → drop
+// ── Budget floors ── (URL filters already enforce minimums, these catch edge cases)
+const BUDGET_FLOOR_HOURLY = 20;   // below $20/hr → drop
+const BUDGET_FLOOR_FIXED = 200;   // below $200 fixed → drop
 
 export interface ScoredJob {
   score: number;        // 0-10 overall fit (final combined)
@@ -137,10 +159,10 @@ export function preScoreJob(job: {
     } else if (singleMatch) {
       proposalCount = parseInt(singleMatch[1]);
     }
-    if (proposalCount >= 20) {
+    if (proposalCount >= 50) {
       return {
         score: 0, excluded: true,
-        excludeReason: `Too many proposals: ${job.proposals} (max 20)`,
+        excludeReason: `Too many proposals: ${job.proposals} (max 50)`,
         strongHits: [], weakHits: [],
         budgetBonus: 0, recencyBonus: 0,
       };
@@ -295,20 +317,27 @@ Budget: ${job.budget || "not specified"}
 Description: ${job.description.slice(0, 600)}
 
 Your ICP: ${JSON.stringify(icp)}
-Your skills: Claude API, Python, n8n, AI automation, marketing automation, web scraping, data pipelines
+Your skills: Claude API, Python, n8n, AI automation, marketing automation, web scraping, data pipelines, React Native, full stack
 
 Reply in EXACTLY this JSON format (no markdown):
 {"score":7,"bidRange":"$500-$800","reasoning":"Good fit - needs Python automation for lead gen","tags":["python","automation"]}
 
-Score criteria:
-- 8-10: Perfect fit, you can deliver exactly what they need
-- 6-7: Good fit, relevant skills overlap
-- 4-5: Partial fit, some skills match
-- 0-3: Poor fit, outside your expertise`,
+IMPORTANT: Use the full 1-10 range. Do NOT cluster everything at 5-6.
+- 9-10: Dream job. Core skill match (AI automation, scraping, n8n, Claude API), good budget ($1K+), ideal client
+- 7-8: Strong fit. Most skills align, reasonable budget, clear deliverable you can nail
+- 5-6: Decent fit. Some skill overlap but not your sweet spot, or budget is low
+- 3-4: Weak fit. Tangential skills, wrong domain, or poor budget
+- 1-2: No fit. Completely outside expertise
+
+Example: An "n8n + Claude API automation" job at $2K with a verified client = 9/10
+Example: A "Python web scraper for lead gen" at $800 = 8/10
+Example: A "React Native bug fix" at $250 = 2/10`,
       }],
     });
 
-    let text = (msg.content[0] as { text: string }).text.trim();
+    const block = msg.content?.[0];
+    if (!block || !("text" in block)) throw new Error("Empty Claude response");
+    let text = block.text.trim();
     text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error("No JSON found in response");

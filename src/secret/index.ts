@@ -27,3 +27,8 @@ export const PORT = parseInt(process.env.PORT || "3500");
 // Browser mode: "safari" = external service only, "puppeteer" = built-in only, "auto" = try safari, fall back to puppeteer
 export const BROWSER_MODE = (process.env.BROWSER_MODE || "auto") as "safari" | "puppeteer" | "auto";
 export const BROWSER_HEADLESS = process.env.BROWSER_HEADLESS !== "false";
+
+// Auto-send: skip Telegram approval and submit proposals automatically
+// AUTO_SEND=true enables, AUTO_SEND_MIN_SCORE sets minimum score (default 7)
+export const AUTO_SEND = process.env.AUTO_SEND === "true";
+export const AUTO_SEND_MIN_SCORE = parseInt(process.env.AUTO_SEND_MIN_SCORE || "7");
