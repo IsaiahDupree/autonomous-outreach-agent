@@ -40,6 +40,13 @@ export interface ScrapedJob {
   posted?: string;
   skills?: string[];
   score?: number;
+  // Freelancer Plus insights (scraped from job cards/detail pages)
+  clientHireRate?: number;      // e.g. 45 means 45%
+  clientHires?: number;         // total hires
+  competitiveBidRange?: { low?: number; avg?: number; high?: number };
+  interviewing?: number;
+  invitesSent?: number;
+  unansweredInvites?: number;
 }
 
 export interface SearchFilters {
@@ -411,6 +418,35 @@ async function scrapeCurrentPage(page: Page, limit: number): Promise<ScrapedJob[
       const spendMatch = allText.match(/\$[\d,.]+[KkMm]?\+?\s*(?:spent|total)/i);
       clientSpend = spendMatch ? spendMatch[0] : '';
 
+      // Freelancer Plus: Client hire rate from job cards
+      const hireRateMatch = allText.match(/(\d+)%\s*hire\s*rate/i) || allText.match(/hire\s*rate[:\s]*(\d+)%/i);
+      const clientHireRate = hireRateMatch ? parseInt(hireRateMatch[1]) : undefined;
+
+      // Freelancer Plus: Client total hires
+      const hiresMatch = allText.match(/(\d+)\s*hires?/i);
+      const clientHires = hiresMatch ? parseInt(hiresMatch[1]) : undefined;
+
+      // Freelancer Plus: Bid range on card
+      let bidLow: number | undefined, bidAvg: number | undefined, bidHigh: number | undefined;
+      const bidRangeMatch = allText.match(/(?:Low|Min)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:Avg|Average)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:High|Max)[:\s]*\$([\d,.]+)/i);
+      if (bidRangeMatch) {
+        bidLow = parseFloat(bidRangeMatch[1].replace(/,/g, ''));
+        bidAvg = parseFloat(bidRangeMatch[2].replace(/,/g, ''));
+        bidHigh = parseFloat(bidRangeMatch[3].replace(/,/g, ''));
+      }
+
+      // Freelancer Plus: Interviewing count
+      const interviewMatch = allText.match(/Interviewing[:\s]*(\d+)/i);
+      const interviewing = interviewMatch ? parseInt(interviewMatch[1]) : undefined;
+
+      // Freelancer Plus: Invites sent
+      const invitesMatch = allText.match(/Invites?\s*sent[:\s]*(\d+)/i);
+      const invitesSent = invitesMatch ? parseInt(invitesMatch[1]) : undefined;
+
+      // Freelancer Plus: Unanswered invites
+      const unansweredMatch = allText.match(/Unanswered\s*invites?[:\s]*(\d+)/i);
+      const unansweredInvites = unansweredMatch ? parseInt(unansweredMatch[1]) : undefined;
+
       // Skill tags
       const skillTags: string[] = [];
       const skillEls = article.querySelectorAll('a[data-test="skill"], span.up-skill-badge, .air3-token, [class*="skill"]');
@@ -431,6 +467,12 @@ async function scrapeCurrentPage(page: Page, limit: number): Promise<ScrapedJob[
         proposals: proposals || undefined,
         clientSpend: clientSpend || undefined,
         skills: skillTags.length > 0 ? skillTags : undefined,
+        clientHireRate,
+        clientHires,
+        competitiveBidRange: (bidLow || bidAvg || bidHigh) ? { low: bidLow, avg: bidAvg, high: bidHigh } : undefined,
+        interviewing,
+        invitesSent,
+        unansweredInvites,
       });
     }
 
@@ -1144,6 +1186,16 @@ export interface JobDetails {
     activeJobs?: string;
     paymentVerified?: boolean;
     memberSince?: string;
+    hireRate?: number;          // Freelancer Plus: client hire rate %
+  };
+  // Freelancer Plus competitive insights
+  plusInsights?: {
+    bidRange?: { low?: number; avg?: number; high?: number };
+    avgBid?: number;
+    interviewing?: number;
+    invitesSent?: number;
+    unansweredInvites?: number;
+    competitorBids?: number[];
   };
   posted?: string;
   attachments?: string[];
@@ -1242,6 +1294,42 @@ export async function getJobDetails(jobUrl: string): Promise<JobDetails | null> 
       const locationMatch = text.match(/Location\s*\n?\s*([A-Z][a-zA-Z\s,]+)/);
       const memberMatch = text.match(/Member since\s*\n?\s*(\w+ \d{1,2},?\s*\d{4})/i);
 
+      // Client hire rate (Freelancer Plus) — "X% hire rate" or "Hire rate: X%"
+      const hireRateMatch = text.match(/(\d+)%\s*hire\s*rate/i) || text.match(/hire\s*rate[:\s]*(\d+)%/i);
+      const hireRate = hireRateMatch ? parseInt(hireRateMatch[1]) : undefined;
+
+      // ── Freelancer Plus competitive insights ──
+      // Bid range: "Bid range: $X - $Y" or "Low $X  Avg $Y  High $Z"
+      let bidLow: number | undefined, bidAvg: number | undefined, bidHigh: number | undefined;
+      const bidRangeFullMatch = text.match(/(?:Low|Min)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:Avg|Average|Mid)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:High|Max)[:\s]*\$([\d,.]+)/i);
+      if (bidRangeFullMatch) {
+        bidLow = parseFloat(bidRangeFullMatch[1].replace(/,/g, ""));
+        bidAvg = parseFloat(bidRangeFullMatch[2].replace(/,/g, ""));
+        bidHigh = parseFloat(bidRangeFullMatch[3].replace(/,/g, ""));
+      } else {
+        const bidRangeSimple = text.match(/Bid range[:\s]*\$([\d,.]+)\s*[-–]\s*\$([\d,.]+)/i);
+        if (bidRangeSimple) {
+          bidLow = parseFloat(bidRangeSimple[1].replace(/,/g, ""));
+          bidHigh = parseFloat(bidRangeSimple[2].replace(/,/g, ""));
+          bidAvg = (bidLow + bidHigh) / 2;
+        }
+      }
+      // Avg bid standalone
+      const avgBidMatch = text.match(/(?:Avg|Average)\s*(?:bid|hourly\s*rate)[:\s]*\$([\d,.]+)/i);
+      const avgBid = avgBidMatch ? parseFloat(avgBidMatch[1].replace(/,/g, "")) : bidAvg;
+
+      // Interviewing count
+      const interviewingMatch = text.match(/Interviewing[:\s]*(\d+)/i);
+      const interviewing = interviewingMatch ? parseInt(interviewingMatch[1]) : undefined;
+
+      // Invites sent
+      const invitesSentMatch = text.match(/Invites?\s*sent[:\s]*(\d+)/i);
+      const invitesSent = invitesSentMatch ? parseInt(invitesSentMatch[1]) : undefined;
+
+      // Unanswered invites
+      const unansweredMatch = text.match(/Unanswered\s*invites?[:\s]*(\d+)/i);
+      const unansweredInvites = unansweredMatch ? parseInt(unansweredMatch[1]) : undefined;
+
       // Posted time
       const postedMatch = text.match(/Posted\s+(\w+ ago|\d+ \w+ ago|yesterday|today)/i);
 
@@ -1254,6 +1342,16 @@ export async function getJobDetails(jobUrl: string): Promise<JobDetails | null> 
           if (q.endsWith("?") && q.length > 10) questions.push(q);
         });
       }
+
+      // Build Plus insights object (only if we found any data)
+      const hasPlusData = bidLow || avgBid || interviewing || invitesSent || unansweredInvites;
+      const plusInsights = hasPlusData ? {
+        bidRange: (bidLow || bidHigh) ? { low: bidLow, avg: bidAvg, high: bidHigh } : undefined,
+        avgBid,
+        interviewing,
+        invitesSent,
+        unansweredInvites,
+      } : undefined;
 
       return {
         id,
@@ -1275,13 +1373,17 @@ export async function getJobDetails(jobUrl: string): Promise<JobDetails | null> 
           hires: hiresMatch ? hiresMatch[1] : undefined,
           paymentVerified,
           memberSince: memberMatch ? memberMatch[1] : undefined,
+          hireRate,
         },
+        plusInsights,
         posted: postedMatch ? postedMatch[1] : undefined,
         questions,
       };
     }, jobUrl);
 
-    logger.info(`[Browser/Upwork] Job details: "${details.title}" | ${details.budget} | ${details.proposals} proposals | ${details.connectsRequired || "?"} connects`);
+    const plusInfo = details.plusInsights ? ` | Plus: bid $${details.plusInsights.avgBid || "?"}, ${details.plusInsights.interviewing || 0} interviewing` : "";
+    const hireInfo = details.clientInfo.hireRate ? ` | Hire rate: ${details.clientInfo.hireRate}%` : "";
+    logger.info(`[Browser/Upwork] Job details: "${details.title}" | ${details.budget} | ${details.proposals} proposals | ${details.connectsRequired || "?"} connects${hireInfo}${plusInfo}`);
     return details;
   } catch (e) {
     logger.error(`[Browser/Upwork] getJobDetails error: ${(e as Error).message}`);

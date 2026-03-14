@@ -127,6 +127,49 @@ describe("preScoreJob — proposal count ceiling", () => {
   });
 });
 
+// ── Client Hire Rate Filter ──
+
+describe("preScoreJob — client hire rate filter", () => {
+  it("excludes clients with very low hire rate (< 15%) and 3+ hires", () => {
+    const r = preScoreJob({
+      title: "AI automation project",
+      description: "Build an ai automation workflow",
+      clientHireRate: 5,
+      clientHires: 10,
+    });
+    expect(r.excluded).toBe(true);
+    expect(r.excludeReason).toContain("Low client hire rate");
+  });
+
+  it("allows clients with hire rate >= 15%", () => {
+    const r = preScoreJob({
+      title: "AI automation project",
+      description: "Build an ai automation workflow",
+      clientHireRate: 25,
+      clientHires: 8,
+    });
+    expect(r.excluded).toBe(false);
+  });
+
+  it("allows new clients with low hire rate (< 3 hires)", () => {
+    const r = preScoreJob({
+      title: "AI automation project",
+      description: "Build an ai automation workflow",
+      clientHireRate: 0,
+      clientHires: 1,
+    });
+    expect(r.excluded).toBe(false);
+  });
+
+  it("allows jobs without hire rate data", () => {
+    const r = preScoreJob({
+      title: "AI automation project",
+      description: "Build an ai automation workflow",
+    });
+    expect(r.excluded).toBe(false);
+  });
+});
+
 // ── ICP Keyword Matching ──
 
 describe("preScoreJob — ICP keyword matching", () => {

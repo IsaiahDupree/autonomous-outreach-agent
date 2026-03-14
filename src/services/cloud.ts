@@ -57,6 +57,13 @@ export async function saveProposal(proposal: {
   milestonesJson?: string;
   connectsCost?: number;
   offerType?: string;
+  // Freelancer Plus insights
+  clientHireRate?: number;
+  clientHires?: number;
+  competitiveBidRange?: { low?: number; avg?: number; high?: number };
+  interviewing?: number;
+  invitesSent?: number;
+  unansweredInvites?: number;
 }): Promise<boolean> {
   try {
     const body: Record<string, unknown> = {
@@ -73,6 +80,15 @@ export async function saveProposal(proposal: {
       submitted_connects_cost: proposal.connectsCost || null,
       milestones_json: proposal.milestonesJson || null,
       updated_at: new Date().toISOString(),
+      // Freelancer Plus insights (nullable — only present if Plus is active)
+      client_hire_rate: proposal.clientHireRate ?? null,
+      client_hires: proposal.clientHires ?? null,
+      competitive_bid_low: proposal.competitiveBidRange?.low ?? null,
+      competitive_bid_avg: proposal.competitiveBidRange?.avg ?? null,
+      competitive_bid_high: proposal.competitiveBidRange?.high ?? null,
+      interviewing: proposal.interviewing ?? null,
+      invites_sent: proposal.invitesSent ?? null,
+      unanswered_invites: proposal.unansweredInvites ?? null,
     };
 
     // Try upsert first, fall back to PATCH if 409

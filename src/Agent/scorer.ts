@@ -106,12 +106,17 @@ export interface PreScoreResult {
  * Stage 1: Deterministic pre-scoring (0-100 points, no API calls).
  * Returns score=0 with excluded=true if the job should be instantly dropped.
  */
+// Minimum client hire rate — skip clients who rarely hire (tire-kickers)
+const MIN_CLIENT_HIRE_RATE = 15; // percent
+
 export function preScoreJob(job: {
   title: string;
   description: string;
   budget?: string;
   posted?: string;
   proposals?: string;
+  clientHireRate?: number;
+  clientHires?: number;
 }): PreScoreResult {
   const text = `${job.title} ${job.description}`.toLowerCase();
 
@@ -205,6 +210,21 @@ export function preScoreJob(job: {
     }
   }
 
+  // ── Client hire rate filter (Freelancer Plus data) ──
+  // Skip clients with very low hire rates (tire-kickers who post but never hire)
+  // Only filter if we have hire rate data AND they have enough hires to be meaningful
+  if (job.clientHireRate !== undefined && job.clientHireRate < MIN_CLIENT_HIRE_RATE) {
+    // Allow new clients (< 3 hires) — they may just be getting started
+    if (job.clientHires === undefined || job.clientHires >= 3) {
+      return {
+        score: 0, excluded: true,
+        excludeReason: `Low client hire rate: ${job.clientHireRate}% (min ${MIN_CLIENT_HIRE_RATE}%, ${job.clientHires || "?"} hires)`,
+        strongHits: [], weakHits: [],
+        budgetBonus: 0, recencyBonus: 0,
+      };
+    }
+  }
+
   // ── ICP strong keyword matching (required — must have at least 1) ──
   const strongHits: string[] = [];
   for (const kw of ICP_STRONG_KEYWORDS) {
@@ -287,6 +307,8 @@ export async function scoreJob(job: {
   budget?: string;
   posted?: string;
   proposals?: string;
+  clientHireRate?: number;
+  clientHires?: number;
 }): Promise<ScoredJob> {
   // Stage 1: deterministic pre-filter
   const pre = preScoreJob(job);

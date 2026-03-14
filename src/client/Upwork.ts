@@ -35,6 +35,13 @@ export interface UpworkJob {
   clientSpend?: string;
   skills?: string[];
   source?: "search" | "best_matches";
+  // Freelancer Plus insights
+  clientHireRate?: number;
+  clientHires?: number;
+  competitiveBidRange?: { low?: number; avg?: number; high?: number };
+  interviewing?: number;
+  invitesSent?: number;
+  unansweredInvites?: number;
 }
 
 let safariUp: boolean | null = null;
@@ -186,6 +193,8 @@ async function processJobs(
       budget: job.budget,
       posted: job.posted,
       proposals: job.proposals,
+      clientHireRate: job.clientHireRate,
+      clientHires: job.clientHires,
     });
     job.score = result.score;
     job.reasoning = result.reasoning;
@@ -227,6 +236,13 @@ async function processJobs(
       reasoning: result.reasoning,
       tags: result.tags,
       coverLetter: job.coverLetter,
+      // Freelancer Plus insights
+      clientHireRate: job.clientHireRate,
+      clientHires: job.clientHires,
+      competitiveBidRange: job.competitiveBidRange,
+      interviewing: job.interviewing,
+      invitesSent: job.invitesSent,
+      unansweredInvites: job.unansweredInvites,
     }).catch((e) => logger.warn(`[Upwork] Failed to save: ${(e as Error).message}`));
 
     if (result.score >= scoreThreshold) {
@@ -277,6 +293,14 @@ async function processJobs(
     });
     obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "pending");
 
+    // Build Plus insights line if available
+    const plusParts: string[] = [];
+    if (proposal.clientHireRate !== undefined) plusParts.push(`Hire: ${proposal.clientHireRate}%`);
+    if (proposal.competitiveBidRange?.avg) plusParts.push(`Avg bid: $${proposal.competitiveBidRange.avg}`);
+    if (proposal.interviewing) plusParts.push(`Interviewing: ${proposal.interviewing}`);
+    if (proposal.invitesSent) plusParts.push(`Invites: ${proposal.invitesSent}`);
+    const plusLine = plusParts.length > 0 ? `🔍 ${plusParts.join(" | ")}` : "";
+
     const preview = [
       `📌 *${proposal.title}*`,
       `🔗 ${proposal.url}`,
@@ -284,6 +308,7 @@ async function processJobs(
       `📊 Proposals: ${proposal.proposals || "unknown"}`,
       `🎯 Score: ${proposal.score}/10 — ${proposal.reasoning || ""}`,
       proposal.tags?.length ? `🏷 Skills: ${proposal.tags.join(", ")}` : "",
+      plusLine,
       proposal.source === "best_matches" ? "⭐ Source: Best Matches" : "",
       `\n📝 *Cover Letter:*\n${proposal.coverLetter || "(none)"}`,
     ].filter(Boolean).join("\n");
