@@ -255,6 +255,20 @@ router.post("/upwork/submit", async (req: Request, res: Response) => {
   }
 });
 
+// ── Auto-submit: submit top queued jobs to meet daily minimum ──
+// POST /api/upwork/auto-submit { target?: 2 }
+router.post("/upwork/auto-submit", async (req: Request, res: Response) => {
+  const { target = 2 } = req.body as { target?: number };
+  try {
+    const { submitTopQueued } = await import("../client/Upwork");
+    logger.info(`[api] Auto-submit triggered (target: ${target}/day)`);
+    res.json({ ok: true, message: `Auto-submit started (target: ${target}/day)` });
+    submitTopQueued(target).catch((e) => logger.error(`[api] Auto-submit error: ${(e as Error).message}`));
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 // ── Batch submit: retry all queued/error jobs above a score threshold ──
 // POST /api/upwork/submit-batch { minScore?: 7, statuses?: ["queued","error"] }
 router.post("/upwork/submit-batch", async (req: Request, res: Response) => {

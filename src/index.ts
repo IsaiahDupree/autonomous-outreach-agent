@@ -11,7 +11,7 @@ import { shutdown } from "./services";
 import { notify } from "./services/telegram";
 import app from "./app";
 import { initAgent } from "./Agent/index";
-import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics } from "./client/Upwork";
+import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics, submitTopQueued } from "./client/Upwork";
 import { runDiscoveryCycle } from "./client/Chrome";
 import { PORT, BROWSER_MODE } from "./secret";
 import { engine } from "./browser";
@@ -165,13 +165,21 @@ async function startServer() {
     await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
   });
 
+  // Auto-submit top queued proposals every 12 hours to meet daily minimum (2/day)
+  // Runs at 8 AM and 8 PM UTC — picks highest-scoring queued jobs
+  const DAILY_SUBMIT_TARGET = 2;
+  cron.schedule("0 8,20 * * *", async () => {
+    logger.info("[cron] Auto-submit top queued (daily minimum)");
+    await submitTopQueued(DAILY_SUBMIT_TARGET).catch((e) => logger.error("[cron] auto-submit error", e));
+  });
+
   // Daily metrics report at 9 AM
   cron.schedule("0 9 * * *", async () => {
     logger.info("[cron] Daily metrics report");
     await sendMetricsReport().catch((e) => logger.error("[cron] metrics error", e));
   });
 
-  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 3h | Best Matches: every 3h (offset)\nChrome: every 30min | Metrics: daily 9 AM`);
+  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 3h | Best Matches: every 3h (offset)\nAuto-submit: ${DAILY_SUBMIT_TARGET}/day (8 AM + 8 PM UTC)\nChrome: every 30min | Metrics: daily 9 AM`);
   logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
 
   const graceful = async () => {

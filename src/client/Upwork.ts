@@ -410,6 +410,96 @@ export async function runBestMatchesCycle(
 }
 
 /**
+ * Auto-submit top queued proposals to meet daily minimum.
+ * Called on a schedule (e.g. every 12h) to ensure at least N submissions per day.
+ * Picks the highest-scoring queued jobs and submits them.
+ */
+export async function submitTopQueued(count = 1): Promise<{ submitted: number; failed: number }> {
+  let submitted = 0;
+  let failed = 0;
+
+  // Check how many we already submitted today
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const allSubmitted = await cloud.getProposalsByFilter({ status: "submitted", limit: 50 });
+  const todaySubmitted = allSubmitted.filter((r) => {
+    const at = r.submitted_at || r.updated_at || r.created_at;
+    return at && new Date(at as string) >= todayStart;
+  });
+
+  const remaining = count - todaySubmitted.length;
+  if (remaining <= 0) {
+    logger.info(`[Upwork] Auto-submit: already ${todaySubmitted.length} submitted today (target: ${count}/day) — skipping`);
+    return { submitted: 0, failed: 0 };
+  }
+
+  logger.info(`[Upwork] Auto-submit: ${todaySubmitted.length} submitted today, need ${remaining} more`);
+
+  // Get top queued jobs by score
+  const queued = await cloud.getProposalsByFilter({ status: ["queued", "pending"], minScore: 5, limit: remaining + 2 });
+  if (queued.length === 0) {
+    logger.info("[Upwork] Auto-submit: no queued jobs to submit");
+    await tg.notify("📭 Auto-submit: no queued jobs available. Need more scan results.");
+    return { submitted: 0, failed: 0 };
+  }
+
+  // Sort by score descending, take top N
+  const topJobs = queued
+    .sort((a, b) => ((b.score as number) || 0) - ((a.score as number) || 0))
+    .slice(0, remaining);
+
+  for (const row of topJobs) {
+    const connects = getConnectsRemaining();
+    if (connects !== null && connects < 16) {
+      logger.warn(`[Upwork] Auto-submit: only ${connects} connects — stopping`);
+      await tg.notify(`⚠️ Auto-submit paused: ${connects} connects remaining`);
+      break;
+    }
+
+    const job: UpworkJob = {
+      id: row.job_id as string,
+      title: (row.job_title as string) || "Untitled",
+      description: (row.job_description as string) || (row.job_title as string) || "",
+      url: row.job_url as string,
+      budget: row.budget as string | undefined,
+      score: row.score as number | undefined,
+      bid: row.submitted_bid_amount as number | undefined,
+      coverLetter: row.proposal_text as string | undefined,
+      tags: row.tags as string[] | undefined,
+    };
+
+    logger.info(`[Upwork] Auto-submit: [${job.score}/10] "${job.title.slice(0, 50)}"`);
+    await tg.notify(`🤖 *Auto-submitting* (daily quota)\n[${job.score}/10] ${job.title.slice(0, 50)}\n💰 ${job.budget || "N/A"}\n🔗 ${job.url}`);
+
+    try {
+      await cloud.updateProposalStatus(job.id, "auto_sending");
+      const ok = await submitProposal(job);
+      await cloud.updateProposalStatus(job.id, ok ? "submitted" : "error");
+      if (ok) {
+        submitted++;
+        logger.info(`[Upwork] Auto-submit: SUCCESS — ${job.title.slice(0, 50)}`);
+        await tg.notify(`🚀 Auto-submitted: ${job.title.slice(0, 50)}`);
+      } else {
+        failed++;
+        logger.warn(`[Upwork] Auto-submit: FAILED — ${job.title.slice(0, 50)}`);
+        await tg.notify(`❌ Auto-submit failed: ${job.title.slice(0, 50)}`);
+      }
+      // Pause between submissions to look human
+      await new Promise((r) => setTimeout(r, 3000 + Math.random() * 5000));
+    } catch (e) {
+      failed++;
+      logger.error(`[Upwork] Auto-submit error: ${(e as Error).message}`);
+      await cloud.updateProposalStatus(job.id, "error").catch(() => {});
+    }
+  }
+
+  const summary = `📊 Auto-submit complete: ${submitted} sent, ${failed} failed (${todaySubmitted.length + submitted} total today)`;
+  logger.info(`[Upwork] ${summary}`);
+  await tg.notify(summary);
+  return { submitted, failed };
+}
+
+/**
  * Get close rate metrics from Supabase.
  * Tracks: submitted → won/rejected/no_response
  */
