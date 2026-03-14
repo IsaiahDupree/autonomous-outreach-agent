@@ -310,4 +310,39 @@ router.post("/upwork/submit-batch", async (req: Request, res: Response) => {
   }
 });
 
+// ── YouTube Content Ideas: analyze Upwork trends → generate tutorial ideas ──
+router.get("/youtube/ideas", async (_req: Request, res: Response) => {
+  try {
+    const { analyzeNiches } = await import("../services/youtube-ideas");
+    const niches = await analyzeNiches();
+    res.json({
+      niches: niches.length,
+      data: niches.map(n => ({
+        category: n.label,
+        jobCount: n.jobCount,
+        avgBudget: n.avgBudget,
+        maxBudget: n.maxBudget,
+        budgetRange: n.budgetRange,
+        avgScore: n.avgScore,
+        topJobs: n.exampleJobs.slice(0, 3),
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// POST /api/youtube/generate — Run full pipeline: analyze → Claude generates ideas → save to Supabase
+router.post("/youtube/generate", async (_req: Request, res: Response) => {
+  try {
+    const { runContentIdeaPipeline } = await import("../services/youtube-ideas");
+    logger.info("[api] YouTube content idea pipeline triggered");
+    const result = await runContentIdeaPipeline();
+    res.json(result);
+  } catch (e) {
+    logger.error(`[api] YouTube pipeline error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 export default router;
