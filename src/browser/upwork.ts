@@ -1307,29 +1307,48 @@ export async function submitProposal(
     jobDescription?: string;       // for AI-powered screening question answers
   }
 ): Promise<boolean> {
-  _browserBusy = true;
   let page: Page | null = null;
+  let dedicatedTab = false; // track if we opened a new tab
 
   try {
     // Set busy flag so scan loop pauses
+    _browserBusy = true;
     setBrowserBusy(true);
-    // Use the shared Upwork page (handles auth + CF)
-    page = await getActiveUpworkPage();
+
+    // Open a DEDICATED new tab for submission to avoid conflicts with scan's page.
+    // This prevents CDP frame detachment when the scan navigates concurrently.
+    const b = await launch();
+
+    // Copy cookies from existing Upwork page (if any) so the new tab is authenticated
+    const existingPages = await b.pages();
+    const upworkPage = existingPages.find(p => p.url().includes("upwork.com") && !p.url().includes("about:blank"));
+    let cookies: any[] = [];
+    if (upworkPage) {
+      cookies = await upworkPage.cookies().catch(() => []);
+    }
+
+    page = await b.newPage();
+    dedicatedTab = true;
+
+    // Set realistic headers (same as engine.newPage)
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    });
+
+    // Restore cookies to the new tab
+    if (cookies.length > 0) {
+      await page.setCookie(...cookies);
+    } else if (hasSavedCookies()) {
+      await restoreCookies(page);
+    }
 
     // Auto-dismiss any browser dialogs (alert/confirm/prompt)
     page.on("dialog", async (dialog) => {
       logger.info(`[Browser/Upwork] Dialog dismissed: ${dialog.type()} — "${dialog.message().slice(0, 100)}"`);
       await dialog.dismiss().catch(() => {});
     });
-
-    // Close extra tabs to reduce Chrome load (Upwork pages are very JS-heavy)
-    const b = await launch();
-    const allPages = await b.pages();
-    for (const p of allPages) {
-      if (p !== page && !p.url().includes("proposals")) {
-        await p.close().catch(() => {});
-      }
-    }
 
     // Navigate to job
     logger.info(`[Browser/Upwork] Navigating to job for proposal: ${jobUrl.slice(0, 80)}`);
@@ -1502,7 +1521,7 @@ export async function submitProposal(
         return n >= 100 && n <= 50000;
       });
 
-      if (jobType === "fixed") {
+      if (jobType === "fixed" || jobType === "unknown") {
         // Find the bid/amount input — look for inputs with $ placeholder or in amount context
         const bidFilled = await page.evaluate((budget: string | undefined) => {
           const inputs = document.querySelectorAll('input');
@@ -2264,12 +2283,14 @@ export async function submitProposal(
 
     // ── Submit ─────────────────────────────────────────
     let submitted = false;
-    // Primary: find the green "Send for X Connects" button
+    // Primary: find the green submit button — matches "Send for X Connects" or "Submit proposal"
     submitted = await page.evaluate(() => {
       const btns = document.querySelectorAll("button");
       for (const b of Array.from(btns)) {
         const t = b.textContent?.trim().toLowerCase() || "";
-        if (t.includes("send for") && t.includes("connects") && !b.disabled) {
+        if (((t.includes("send for") && t.includes("connects"))
+            || t === "submit proposal"
+            || t === "submit a proposal") && !b.disabled) {
           b.click();
           return true;
         }
@@ -2466,6 +2487,11 @@ export async function submitProposal(
     }
     return false;
   } finally {
+    // Close the dedicated submission tab to free resources
+    if (dedicatedTab && page) {
+      await page.close().catch(() => {});
+      logger.info("[Browser/Upwork] Closed dedicated submission tab");
+    }
     setBrowserBusy(false);
   }
 }
