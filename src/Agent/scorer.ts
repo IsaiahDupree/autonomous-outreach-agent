@@ -327,6 +327,10 @@ export async function scoreJob(job: {
   proposals?: string;
   clientHireRate?: number;
   clientHires?: number;
+  competitiveBidRange?: { low?: number; avg?: number; high?: number };
+  interviewing?: number;
+  invitesSent?: number;
+  paymentVerified?: boolean;
 }): Promise<ScoredJob> {
   // Stage 1: deterministic pre-filter
   const pre = preScoreJob(job);
@@ -360,6 +364,11 @@ export async function scoreJob(job: {
 Title: ${job.title}
 Budget: ${job.budget || "not specified"}
 Description: ${job.description.slice(0, 600)}
+${job.clientHireRate !== undefined ? `Client hire rate: ${job.clientHireRate}% (${job.clientHires ?? "?"} hires)` : ""}
+${job.competitiveBidRange?.avg ? `Competitive bids: Low $${job.competitiveBidRange.low || "?"} / Avg $${job.competitiveBidRange.avg} / High $${job.competitiveBidRange.high || "?"}` : ""}
+${job.interviewing ? `Currently interviewing: ${job.interviewing} candidates` : ""}
+${job.invitesSent ? `Invites sent: ${job.invitesSent}` : ""}
+${job.paymentVerified !== undefined ? `Payment verified: ${job.paymentVerified ? "Yes" : "No"}` : ""}
 
 Your ICP: ${JSON.stringify(icp)}
 Your skills: Claude API, Python, n8n, AI automation, marketing automation, web scraping, data pipelines, React Native, full stack
@@ -368,11 +377,13 @@ Reply in EXACTLY this JSON format (no markdown):
 {"score":7,"bidRange":"$500-$800","reasoning":"Good fit - needs Python automation for lead gen","tags":["python","automation"]}
 
 IMPORTANT: Use the full 1-10 range. Do NOT cluster everything at 5-6.
-- 9-10: Dream job. Core skill match (AI automation, scraping, n8n, Claude API), good budget ($1K+), ideal client
+- 9-10: Dream job. Core skill match (AI automation, scraping, n8n, Claude API), good budget ($1K+), ideal client, low competition
 - 7-8: Strong fit. Most skills align, reasonable budget, clear deliverable you can nail
 - 5-6: Decent fit. Some skill overlap but not your sweet spot, or budget is low
 - 3-4: Weak fit. Tangential skills, wrong domain, or poor budget
 - 1-2: No fit. Completely outside expertise
+
+Factor in competitive data: fewer candidates interviewing = better chance. High hire rate client = more likely to hire. If avg bid exists, suggest a bid near/below avg to be competitive.
 
 Example: An "n8n + Claude API automation" job at $2K with a verified client = 9/10
 Example: A "Python web scraper for lead gen" at $800 = 8/10

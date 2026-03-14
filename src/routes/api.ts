@@ -375,6 +375,19 @@ router.post("/youtube/generate", async (_req: Request, res: Response) => {
 
 // ── Analytics: comprehensive Upwork data analysis ──
 
+// GET /api/analytics/plus — Freelancer Plus competitive insights (must be before /analytics)
+router.get("/analytics/plus", async (_req: Request, res: Response) => {
+  try {
+    const { runFullAnalytics } = await import("../services/analytics");
+    logger.info("[api] Plus insights analytics triggered");
+    const analytics = await runFullAnalytics();
+    res.json(analytics.plusInsights);
+  } catch (e) {
+    logger.error(`[api] Plus insights error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 // GET /api/analytics — Full analytics dashboard (pricing, close rates, timing, text mining, pipeline health)
 router.get("/analytics", async (_req: Request, res: Response) => {
   try {

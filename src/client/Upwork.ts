@@ -42,6 +42,9 @@ export interface UpworkJob {
   interviewing?: number;
   invitesSent?: number;
   unansweredInvites?: number;
+  // Enhanced insights
+  paymentVerified?: boolean;
+  screeningQuestionCount?: number;
 }
 
 let safariUp: boolean | null = null;
@@ -195,6 +198,10 @@ async function processJobs(
       proposals: job.proposals,
       clientHireRate: job.clientHireRate,
       clientHires: job.clientHires,
+      competitiveBidRange: job.competitiveBidRange,
+      interviewing: job.interviewing,
+      invitesSent: job.invitesSent,
+      paymentVerified: job.paymentVerified,
     });
     job.score = result.score;
     job.reasoning = result.reasoning;
@@ -243,6 +250,9 @@ async function processJobs(
       interviewing: job.interviewing,
       invitesSent: job.invitesSent,
       unansweredInvites: job.unansweredInvites,
+      // Enhanced insights
+      paymentVerified: job.paymentVerified,
+      screeningQuestionCount: job.screeningQuestionCount,
     }).catch((e) => logger.warn(`[Upwork] Failed to save: ${(e as Error).message}`));
 
     if (result.score >= scoreThreshold) {

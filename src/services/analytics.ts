@@ -47,6 +47,19 @@ interface ProposalRow {
   created_at: string;
   updated_at: string | null;
   outcome_at: string | null;
+  // Plus insights
+  client_hire_rate: number | null;
+  client_hires: number | null;
+  competitive_bid_low: number | null;
+  competitive_bid_avg: number | null;
+  competitive_bid_high: number | null;
+  interviewing: number | null;
+  invites_sent: number | null;
+  unanswered_invites: number | null;
+  payment_verified: boolean | null;
+  screening_question_count: number | null;
+  bid_competitiveness: number | null;
+  submitted_at: string | null;
 }
 
 export interface FullAnalytics {
@@ -56,8 +69,36 @@ export interface FullAnalytics {
   timing: TimingAnalysis;
   textInsights: TextMiningInsights;
   pipeline: PipelineHealth;
+  plusInsights: PlusInsightsAnalytics;
   niches: NichePerformance[];
   recommendations: string[];
+}
+
+interface PlusInsightsAnalytics {
+  competitiveBidding: {
+    jobsWithBidData: number;
+    avgCompetitiveBid: number;
+    avgOurBid: number;
+    avgBidCompetitiveness: number;  // < 1 = we undercut, > 1 = premium
+    bidCompetitivenessVsOutcome: Array<{ range: string; count: number; winRate: number }>;
+  };
+  clientQuality: {
+    avgHireRate: number;
+    hireRateVsOutcome: Array<{ range: string; count: number; winRate: number }>;
+    paymentVerifiedRate: number;
+    verifiedVsUnverified: { verified: { count: number; winRate: number }; unverified: { count: number; winRate: number } };
+  };
+  competitionLevel: {
+    avgInterviewing: number;
+    avgInvitesSent: number;
+    lowCompetitionWinRate: number;  // < 5 interviewing
+    highCompetitionWinRate: number; // >= 5 interviewing
+  };
+  responseSpeed: {
+    avgTimeToSubmit: number | null;  // hours from scrape to submit
+    fastSubmitWinRate: number;       // submitted within 2 hours
+    slowSubmitWinRate: number;       // submitted after 2 hours
+  };
 }
 
 interface OverviewStats {
@@ -182,7 +223,7 @@ async function fetchAllProposals(): Promise<ProposalRow[]> {
 
   while (true) {
     const res = await safeFetch(
-      `${SUPABASE_URL}/rest/v1/upwork_proposals?select=job_id,job_title,job_description,job_url,budget,score,pre_score,status,proposal_text,submitted_bid_amount,submitted_connects_cost,tags,source,reasoning,created_at,updated_at,outcome_at&order=created_at.desc&limit=${limit}&offset=${offset}`,
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?select=job_id,job_title,job_description,job_url,budget,score,pre_score,status,proposal_text,submitted_bid_amount,submitted_connects_cost,tags,source,reasoning,created_at,updated_at,outcome_at,client_hire_rate,client_hires,competitive_bid_low,competitive_bid_avg,competitive_bid_high,interviewing,invites_sent,unanswered_invites,payment_verified,screening_question_count,bid_competitiveness,submitted_at&order=created_at.desc&limit=${limit}&offset=${offset}`,
       { headers: supabaseHeaders() },
     );
     if (!res.ok) {
@@ -557,6 +598,122 @@ function computeNiches(rows: ProposalRow[]): NichePerformance[] {
     .sort((a, b) => b.count - a.count);
 }
 
+// ── Plus Insights Analytics ─────────────────────────────
+
+function computePlusInsights(rows: ProposalRow[]): PlusInsightsAnalytics {
+  const withBidData = rows.filter((r) => r.competitive_bid_avg !== null && r.competitive_bid_avg > 0);
+  const withOutcome = (subset: ProposalRow[]) => subset.filter((r) => ["won", "rejected", "no_response", "interviewed"].includes(r.status));
+  const winRate = (subset: ProposalRow[]) => {
+    const oc = withOutcome(subset);
+    if (oc.length === 0) return 0;
+    return Math.round((oc.filter((r) => r.status === "won").length / oc.length) * 100);
+  };
+
+  // Competitive bidding analysis
+  const avgCompBid = withBidData.length > 0
+    ? Math.round(withBidData.reduce((s, r) => s + (r.competitive_bid_avg || 0), 0) / withBidData.length)
+    : 0;
+  const withOurBid = rows.filter((r) => r.submitted_bid_amount !== null && r.submitted_bid_amount > 0);
+  const avgOurBid = withOurBid.length > 0
+    ? Math.round(withOurBid.reduce((s, r) => s + (r.submitted_bid_amount || 0), 0) / withOurBid.length)
+    : 0;
+  const withCompScore = rows.filter((r) => r.bid_competitiveness !== null);
+  const avgCompetitiveness = withCompScore.length > 0
+    ? Math.round((withCompScore.reduce((s, r) => s + (r.bid_competitiveness || 0), 0) / withCompScore.length) * 100) / 100
+    : 0;
+
+  // Bid competitiveness vs outcome
+  const compRanges = [
+    { range: "< 0.8 (undercut)", min: 0, max: 0.8 },
+    { range: "0.8 - 1.0 (competitive)", min: 0.8, max: 1.0 },
+    { range: "1.0 - 1.2 (at market)", min: 1.0, max: 1.2 },
+    { range: "> 1.2 (premium)", min: 1.2, max: Infinity },
+  ];
+  const bidCompVsOutcome = compRanges.map((r) => {
+    const inRange = withCompScore.filter((row) => (row.bid_competitiveness || 0) >= r.min && (row.bid_competitiveness || 0) < r.max);
+    return { range: r.range, count: inRange.length, winRate: winRate(inRange) };
+  });
+
+  // Client quality
+  const withHireRate = rows.filter((r) => r.client_hire_rate !== null);
+  const avgHireRate = withHireRate.length > 0
+    ? Math.round(withHireRate.reduce((s, r) => s + (r.client_hire_rate || 0), 0) / withHireRate.length)
+    : 0;
+  const hireRateRanges = [
+    { range: "0-25%", min: 0, max: 25 },
+    { range: "25-50%", min: 25, max: 50 },
+    { range: "50-75%", min: 50, max: 75 },
+    { range: "75-100%", min: 75, max: 101 },
+  ];
+  const hireRateVsOutcome = hireRateRanges.map((r) => {
+    const inRange = withHireRate.filter((row) => (row.client_hire_rate || 0) >= r.min && (row.client_hire_rate || 0) < r.max);
+    return { range: r.range, count: inRange.length, winRate: winRate(inRange) };
+  });
+
+  const verified = rows.filter((r) => r.payment_verified === true);
+  const unverified = rows.filter((r) => r.payment_verified === false);
+  const paymentVerifiedRate = rows.length > 0 ? Math.round((verified.length / rows.length) * 100) : 0;
+
+  // Competition level
+  const withInterview = rows.filter((r) => r.interviewing !== null);
+  const avgInterviewing = withInterview.length > 0
+    ? Math.round((withInterview.reduce((s, r) => s + (r.interviewing || 0), 0) / withInterview.length) * 10) / 10
+    : 0;
+  const withInvites = rows.filter((r) => r.invites_sent !== null);
+  const avgInvites = withInvites.length > 0
+    ? Math.round((withInvites.reduce((s, r) => s + (r.invites_sent || 0), 0) / withInvites.length) * 10) / 10
+    : 0;
+  const lowComp = withInterview.filter((r) => (r.interviewing || 0) < 5);
+  const highComp = withInterview.filter((r) => (r.interviewing || 0) >= 5);
+
+  // Response speed
+  const submitted = rows.filter((r) => r.submitted_at && r.created_at);
+  const submitTimes = submitted.map((r) =>
+    (new Date(r.submitted_at!).getTime() - new Date(r.created_at).getTime()) / (1000 * 60 * 60)
+  ).filter((h) => h >= 0 && h < 168); // Filter out negative/extreme values
+  const avgSubmitTime = submitTimes.length > 0
+    ? Math.round((submitTimes.reduce((a, b) => a + b, 0) / submitTimes.length) * 10) / 10
+    : null;
+  const fastSubmit = submitted.filter((r) => {
+    const hours = (new Date(r.submitted_at!).getTime() - new Date(r.created_at).getTime()) / (1000 * 60 * 60);
+    return hours >= 0 && hours <= 2;
+  });
+  const slowSubmit = submitted.filter((r) => {
+    const hours = (new Date(r.submitted_at!).getTime() - new Date(r.created_at).getTime()) / (1000 * 60 * 60);
+    return hours > 2;
+  });
+
+  return {
+    competitiveBidding: {
+      jobsWithBidData: withBidData.length,
+      avgCompetitiveBid: avgCompBid,
+      avgOurBid: avgOurBid,
+      avgBidCompetitiveness: avgCompetitiveness,
+      bidCompetitivenessVsOutcome: bidCompVsOutcome,
+    },
+    clientQuality: {
+      avgHireRate,
+      hireRateVsOutcome,
+      paymentVerifiedRate,
+      verifiedVsUnverified: {
+        verified: { count: verified.length, winRate: winRate(verified) },
+        unverified: { count: unverified.length, winRate: winRate(unverified) },
+      },
+    },
+    competitionLevel: {
+      avgInterviewing,
+      avgInvitesSent: avgInvites,
+      lowCompetitionWinRate: winRate(lowComp),
+      highCompetitionWinRate: winRate(highComp),
+    },
+    responseSpeed: {
+      avgTimeToSubmit: avgSubmitTime,
+      fastSubmitWinRate: winRate(fastSubmit),
+      slowSubmitWinRate: winRate(slowSubmit),
+    },
+  };
+}
+
 // ── AI-Powered Recommendations ─────────────────────────
 
 async function generateRecommendations(analytics: Omit<FullAnalytics, "recommendations">): Promise<string[]> {
@@ -577,6 +734,10 @@ Top tech combos: ${analytics.textInsights.topTechCombos.slice(0, 5).map((c) => `
 Budget-score correlation: ${analytics.pricing.budgetScoreCorrelation}
 Optimal bid: $${analytics.pricing.optimalBidRange.sweetSpot}
 Best days: ${analytics.timing.bestDays.slice(0, 3).map((d) => `${d.day} (${d.avgScore})`).join(", ")}
+Plus insights: ${analytics.plusInsights.competitiveBidding.jobsWithBidData} jobs with bid data, avg competitive bid $${analytics.plusInsights.competitiveBidding.avgCompetitiveBid}, our avg bid $${analytics.plusInsights.competitiveBidding.avgOurBid}, competitiveness ratio ${analytics.plusInsights.competitiveBidding.avgBidCompetitiveness}
+Client quality: avg hire rate ${analytics.plusInsights.clientQuality.avgHireRate}%, payment verified ${analytics.plusInsights.clientQuality.paymentVerifiedRate}%
+Competition: avg interviewing ${analytics.plusInsights.competitionLevel.avgInterviewing}, low comp win rate ${analytics.plusInsights.competitionLevel.lowCompetitionWinRate}% vs high comp ${analytics.plusInsights.competitionLevel.highCompetitionWinRate}%
+Response speed: avg ${analytics.plusInsights.responseSpeed.avgTimeToSubmit || "N/A"}h to submit, fast (<2h) win rate ${analytics.plusInsights.responseSpeed.fastSubmitWinRate}% vs slow ${analytics.plusInsights.responseSpeed.slowSubmitWinRate}%
 
 Reply as a JSON array of 5 strings. No markdown.`,
       }],
@@ -605,12 +766,13 @@ export async function runFullAnalytics(): Promise<FullAnalytics> {
   const timing = computeTiming(rows);
   const textInsights = computeTextInsights(rows);
   const pipeline = computePipeline(rows);
+  const plusInsights = computePlusInsights(rows);
   const niches = computeNiches(rows);
 
-  const partial = { overview, pricing, closeRate, timing, textInsights, pipeline, niches, recommendations: [] as string[] };
+  const partial = { overview, pricing, closeRate, timing, textInsights, pipeline, plusInsights, niches, recommendations: [] as string[] };
   const recommendations = await generateRecommendations(partial);
 
-  logger.info(`[Analytics] Complete — ${rows.length} jobs analyzed across ${niches.length} niches`);
+  logger.info(`[Analytics] Complete — ${rows.length} jobs analyzed across ${niches.length} niches (${plusInsights.competitiveBidding.jobsWithBidData} with Plus bid data)`);
   return { ...partial, recommendations };
 }
 
@@ -655,6 +817,14 @@ ${analytics.textInsights.redFlagPatterns.slice(0, 5).map((f) => `  "${f.pattern}
 TIMING:
 Best days: ${analytics.timing.bestDays.slice(0, 3).map((d) => `${d.day} (${d.avgScore} avg score, ${d.count} jobs)`).join(", ")}
 Volume trend: ${analytics.timing.volumeTrend}
+
+FREELANCER PLUS COMPETITIVE INSIGHTS:
+- ${analytics.plusInsights.competitiveBidding.jobsWithBidData} jobs with competitive bid data
+- Average competitor bid: $${analytics.plusInsights.competitiveBidding.avgCompetitiveBid}, Our avg bid: $${analytics.plusInsights.competitiveBidding.avgOurBid}
+- Bid competitiveness ratio: ${analytics.plusInsights.competitiveBidding.avgBidCompetitiveness} (< 1 = undercutting, > 1 = premium)
+- Avg client hire rate: ${analytics.plusInsights.clientQuality.avgHireRate}%
+- Competition: avg ${analytics.plusInsights.competitionLevel.avgInterviewing} candidates interviewing per job
+- Response speed: avg ${analytics.plusInsights.responseSpeed.avgTimeToSubmit || "N/A"} hours to submit
 
 RECOMMENDATIONS:
 ${analytics.recommendations.map((r, i) => `${i + 1}. ${r}`).join("\n")}

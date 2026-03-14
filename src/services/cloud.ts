@@ -76,6 +76,9 @@ export async function saveProposal(proposal: {
   interviewing?: number;
   invitesSent?: number;
   unansweredInvites?: number;
+  // Enhanced insights
+  paymentVerified?: boolean;
+  screeningQuestionCount?: number;
 }): Promise<boolean> {
   try {
     const body: Record<string, unknown> = {
@@ -101,7 +104,15 @@ export async function saveProposal(proposal: {
       interviewing: proposal.interviewing ?? null,
       invites_sent: proposal.invitesSent ?? null,
       unanswered_invites: proposal.unansweredInvites ?? null,
+      // Enhanced insights
+      payment_verified: proposal.paymentVerified ?? null,
+      screening_question_count: proposal.screeningQuestionCount ?? null,
     };
+
+    // Calculate bid competitiveness: our bid / avg competitive bid
+    if (proposal.bid && proposal.competitiveBidRange?.avg && proposal.competitiveBidRange.avg > 0) {
+      body.bid_competitiveness = Math.round((proposal.bid / proposal.competitiveBidRange.avg) * 100) / 100;
+    }
 
     // Try upsert first, fall back to PATCH if 409
     let res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals`, {
@@ -130,10 +141,15 @@ export async function saveProposal(proposal: {
 
 export async function updateProposalStatus(jobId: string, status: string, extra: Record<string, unknown> = {}): Promise<void> {
   try {
+    const updateBody: Record<string, unknown> = { status, updated_at: new Date().toISOString(), ...extra };
+    // Track actual submission time
+    if (status === "submitted") {
+      updateBody.submitted_at = new Date().toISOString();
+    }
     const res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}`, {
       method: "PATCH",
       headers: supabaseHeaders(),
-      body: JSON.stringify({ status, updated_at: new Date().toISOString(), ...extra }),
+      body: JSON.stringify(updateBody),
     });
     if (!res.ok) {
       const err = await res.text().catch(() => "");
@@ -283,6 +299,7 @@ export async function saveAnalyticsSnapshot(analytics: {
   timing: Record<string, unknown>;
   textInsights: Record<string, unknown>;
   pipeline: Record<string, unknown>;
+  plusInsights?: Record<string, unknown>;
   niches: unknown[];
   recommendations: string[];
 }, report?: string, contentIdeas?: unknown[]): Promise<string | null> {
@@ -321,6 +338,7 @@ export async function saveAnalyticsSnapshot(analytics: {
       jobs_per_week: timing.jobsPerWeek,
       error_rate: pipeline.errorRate,
       source_comparison: pipeline.sourceComparison,
+      plus_insights: analytics.plusInsights || null,
       recommendations: analytics.recommendations,
       narrative_report: report || null,
       content_ideas: contentIdeas || null,
@@ -402,6 +420,21 @@ export async function getLatestSnapshot(): Promise<Record<string, unknown> | nul
     return data.length > 0 ? data[0] : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Get Plus insights data for analytics — competitive bid data, hire rates, etc.
+ */
+export async function getPlusInsightsData(): Promise<Record<string, unknown>[]> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?select=job_id,job_title,score,status,budget,submitted_bid_amount,client_hire_rate,client_hires,competitive_bid_low,competitive_bid_avg,competitive_bid_high,interviewing,invites_sent,unanswered_invites,payment_verified,screening_question_count,bid_competitiveness,submitted_at,outcome_at,created_at&competitive_bid_avg=not.is.null&order=created_at.desc`,
+      { headers: supabaseHeaders() }
+    );
+    return res.ok ? (await res.json()) as Record<string, unknown>[] : [];
+  } catch {
+    return [];
   }
 }
 

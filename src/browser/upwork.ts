@@ -47,6 +47,9 @@ export interface ScrapedJob {
   interviewing?: number;
   invitesSent?: number;
   unansweredInvites?: number;
+  // Enhanced insights
+  paymentVerified?: boolean;
+  screeningQuestionCount?: number;
 }
 
 export interface SearchFilters {
@@ -418,6 +421,9 @@ async function scrapeCurrentPage(page: Page, limit: number): Promise<ScrapedJob[
       const spendMatch = allText.match(/\$[\d,.]+[KkMm]?\+?\s*(?:spent|total)/i);
       clientSpend = spendMatch ? spendMatch[0] : '';
 
+      // Payment verified
+      const paymentVerified = /payment\s*(?:method\s*)?verified/i.test(allText) || undefined;
+
       // Freelancer Plus: Client hire rate from job cards
       const hireRateMatch = allText.match(/(\d+)%\s*hire\s*rate/i) || allText.match(/hire\s*rate[:\s]*(\d+)%/i);
       const clientHireRate = hireRateMatch ? parseInt(hireRateMatch[1]) : undefined;
@@ -473,6 +479,7 @@ async function scrapeCurrentPage(page: Page, limit: number): Promise<ScrapedJob[
         interviewing,
         invitesSent,
         unansweredInvites,
+        paymentVerified: paymentVerified || undefined,
       });
     }
 
