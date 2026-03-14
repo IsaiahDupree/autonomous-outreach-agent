@@ -332,6 +332,28 @@ router.get("/youtube/ideas", async (_req: Request, res: Response) => {
   }
 });
 
+// GET /api/youtube/report — Generate "What People Want from AI" style market analysis
+router.get("/youtube/report", async (_req: Request, res: Response) => {
+  try {
+    const { analyzeNiches, generateMarketReport } = await import("../services/youtube-ideas");
+    logger.info("[api] YouTube market report triggered");
+    const niches = await analyzeNiches();
+    if (niches.length === 0) {
+      res.status(404).json({ error: "No niche data found — run a scan first" });
+      return;
+    }
+    const report = await generateMarketReport(niches);
+    res.json({
+      niches: niches.length,
+      totalJobs: niches.reduce((s, n) => s + n.jobCount, 0),
+      report,
+    });
+  } catch (e) {
+    logger.error(`[api] YouTube report error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 // POST /api/youtube/generate — Run full pipeline: analyze → Claude generates ideas → save to Supabase
 router.post("/youtube/generate", async (_req: Request, res: Response) => {
   try {

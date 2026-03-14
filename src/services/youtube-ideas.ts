@@ -286,6 +286,93 @@ async function getExistingVideos(): Promise<string[]> {
 }
 
 /**
+ * Generate a "What People Want from AI" style market analysis report.
+ * Mirrors Isaiah's video format: budget distribution, category clustering with %,
+ * real project examples with ROI, and actionable strategies.
+ */
+export async function generateMarketReport(niches: NicheAnalysis[]): Promise<string> {
+  // Aggregate stats across all niches
+  const totalJobs = niches.reduce((sum, n) => sum + n.jobCount, 0);
+  const allBudgets = niches.flatMap((n) =>
+    n.exampleJobs.map((j) => {
+      const m = (j.budget || "").match(/\$([\d,]+)/);
+      return m ? parseFloat(m[1].replace(/,/g, "")) : 0;
+    }).filter((b) => b > 0),
+  );
+  const totalBudget = allBudgets.reduce((a, b) => a + b, 0);
+  const avgBudget = allBudgets.length > 0 ? Math.round(totalBudget / allBudgets.length) : 0;
+  const maxBudget = allBudgets.length > 0 ? Math.max(...allBudgets) : 0;
+
+  // Budget distribution tiers
+  const under100 = allBudgets.filter((b) => b < 100).length;
+  const range100_500 = allBudgets.filter((b) => b >= 100 && b < 500).length;
+  const range500_1500 = allBudgets.filter((b) => b >= 500 && b < 1500).length;
+  const over1500 = allBudgets.filter((b) => b >= 1500).length;
+  const budgetTotal = allBudgets.length || 1;
+
+  // Category breakdown with percentages
+  const categoryBreakdown = niches.map((n) => ({
+    label: n.label,
+    jobCount: n.jobCount,
+    pct: Math.round((n.jobCount / totalJobs) * 100),
+    avgBudget: n.avgBudget,
+    maxBudget: n.maxBudget,
+    budgetRange: n.budgetRange,
+    topJobs: n.exampleJobs.slice(0, 3),
+  }));
+
+  const nicheData = categoryBreakdown
+    .map((c) => `  ${c.label}: ${c.jobCount} jobs (${c.pct}%), avg $${c.avgBudget}, max $${c.maxBudget}\n    Top: ${c.topJobs.map((j) => `"${j.title}" (${j.budget})`).join(", ")}`)
+    .join("\n");
+
+  const msg = await client.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 2000,
+    messages: [{
+      role: "user",
+      content: `You are Isaiah, host of "What People Want from AI" — a YouTube channel analyzing AI service demand using real market data.
+
+Write a market analysis report in the EXACT style of this show. The format must include:
+
+1. OPENING HOOK with specific numbers ("We analyzed X real job postings with budgets totaling over $Y")
+2. KEY INSIGHT that challenges assumptions ("X% of these so-called AI jobs aren't really about building AI")
+3. BUDGET DISTRIBUTION breakdown with 4 tiers and what each tier typically involves
+4. TOP 3 CATEGORIES with percentage of total, average budgets, and real project examples with ROI math
+5. THE SWEET SPOT — which budget range has highest demand + best margins
+6. 3 UNDERSERVED OPPORTUNITIES with specific dollar amounts
+7. 5 ACTIONABLE STEPS viewers can implement today
+8. CLOSING with call to action
+
+Here is the REAL market data from ${totalJobs} Upwork AI job postings:
+
+Total budget pool: $${totalBudget.toLocaleString()}
+Average budget: $${avgBudget}
+Highest budget: $${maxBudget.toLocaleString()}
+
+Budget distribution:
+  Under $100: ${under100} jobs (${Math.round((under100 / budgetTotal) * 100)}%)
+  $100 - $500: ${range100_500} jobs (${Math.round((range100_500 / budgetTotal) * 100)}%)
+  $500 - $1,500: ${range500_1500} jobs (${Math.round((range500_1500 / budgetTotal) * 100)}%)
+  Over $1,500: ${over1500} jobs (${Math.round((over1500 / budgetTotal) * 100)}%)
+
+Category breakdown:
+${nicheData}
+
+IMPORTANT:
+- Use ONLY the real data provided — do not fabricate numbers
+- Calculate actual ROI examples (time saved × hourly rate = annual savings)
+- Reference specific job titles from the data as proof points
+- Keep the tone conversational but data-driven, like presenting to a smart audience
+- Output as plain text (video script format), NOT JSON or markdown`,
+    }],
+  });
+
+  const block = msg.content?.[0];
+  if (!block || !("text" in block)) throw new Error("Empty Claude response");
+  return block.text.trim();
+}
+
+/**
  * Full pipeline: analyze Upwork trends → cross-ref existing videos → generate ideas → save to Supabase.
  */
 export async function runContentIdeaPipeline(): Promise<{
