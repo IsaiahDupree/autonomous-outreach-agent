@@ -597,11 +597,16 @@ let _cfConsecutiveBlocks = 0;
 
 /**
  * Helper: get the active Upwork page after a potential CDP reconnect.
+ * Prefers search pages over proposal pages to avoid grabbing the dedicated submission tab.
  */
 async function getActivePage(): Promise<Page> {
   const b = await launch();
   const pages = await b.pages();
-  return pages.find(p => p.url().includes("upwork")) || pages[0];
+  // Prefer search/job listing pages, avoid proposal form pages (used by dedicated submit tab)
+  return pages.find(p => p.url().includes("upwork") && p.url().includes("/search/"))
+    || pages.find(p => p.url().includes("upwork") && !p.url().includes("/proposals/"))
+    || pages.find(p => p.url().includes("upwork"))
+    || pages[0];
 }
 
 /**

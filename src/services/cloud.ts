@@ -4,11 +4,23 @@
 import { SUPABASE_URL, SUPABASE_KEY, CRMLITE_URL, CRMLITE_API_KEY } from "../secret";
 import logger from "../config/logger";
 
-/** Retry-enabled fetch with timeout — 2 retries, 1s backoff */
+/** Retry-enabled fetch with timeout — retries on network/timeout/5xx errors, skips retries on 4xx */
 async function safeFetch(url: string, opts: RequestInit = {}, retries = 2, timeoutMs = 10000): Promise<Response> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
+      if (!res) throw new Error("fetch returned undefined");
+      // Don't retry client errors (4xx) except 408 (timeout) and 429 (rate limit)
+      if (!res.ok && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+        return res;
+      }
+      // Retry on 429 (rate limit) and 5xx (server errors)
+      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+        const delay = res.status === 429 ? 2000 : 1000;
+        logger.warn(`[Cloud] Server error ${res.status} — retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
       return res;
     } catch (e) {
       if (attempt === retries) throw e;
@@ -117,11 +129,19 @@ export async function saveProposal(proposal: {
 }
 
 export async function updateProposalStatus(jobId: string, status: string, extra: Record<string, unknown> = {}): Promise<void> {
-  await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}`, {
-    method: "PATCH",
-    headers: supabaseHeaders(),
-    body: JSON.stringify({ status, updated_at: new Date().toISOString(), ...extra }),
-  });
+  try {
+    const res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}`, {
+      method: "PATCH",
+      headers: supabaseHeaders(),
+      body: JSON.stringify({ status, updated_at: new Date().toISOString(), ...extra }),
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      logger.warn(`[Cloud] updateProposalStatus failed (${res.status}) for ${jobId}: ${err.slice(0, 200)}`);
+    }
+  } catch (e) {
+    logger.error(`[Cloud] updateProposalStatus error for ${jobId}: ${(e as Error).message}`);
+  }
 }
 
 export async function getPendingProposals(): Promise<Record<string, unknown>[]> {
@@ -252,4 +272,149 @@ export async function checkService(port: number): Promise<boolean> {
     const res = await fetch(`http://localhost:${port}/health`, { signal: AbortSignal.timeout(2000) });
     return res.ok;
   } catch { return false; }
+}
+
+// ── Analytics Snapshots — save computed analytics for external apps ──
+
+export async function saveAnalyticsSnapshot(analytics: {
+  overview: Record<string, unknown>;
+  pricing: Record<string, unknown>;
+  closeRate: Record<string, unknown>;
+  timing: Record<string, unknown>;
+  textInsights: Record<string, unknown>;
+  pipeline: Record<string, unknown>;
+  niches: unknown[];
+  recommendations: string[];
+}, report?: string, contentIdeas?: unknown[]): Promise<string | null> {
+  try {
+    const overview = analytics.overview as any;
+    const closeRate = analytics.closeRate as any;
+    const pricing = analytics.pricing as any;
+    const timing = analytics.timing as any;
+    const textInsights = analytics.textInsights as any;
+    const pipeline = analytics.pipeline as any;
+
+    const body = {
+      snapshot_type: "full",
+      total_jobs: overview.totalJobs,
+      total_budget: overview.totalBudget,
+      avg_budget: overview.avgBudget,
+      avg_score: overview.avgScore,
+      status_breakdown: overview.statusBreakdown,
+      score_distribution: overview.scoreDistribution,
+      submitted: closeRate.overall?.submitted,
+      won: closeRate.overall?.won,
+      rejected: closeRate.overall?.rejected,
+      win_rate: closeRate.overall?.winRate,
+      avg_time_to_outcome: closeRate.avgTimeToOutcome,
+      budget_tiers: pricing.budgetTiers,
+      optimal_bid_range: pricing.optimalBidRange,
+      hourly_vs_fixed: pricing.hourlyVsFixed,
+      niches: analytics.niches,
+      top_niches: (analytics.niches as any[]).sort((a, b) => b.count - a.count).slice(0, 5),
+      top_tech_combos: textInsights.topTechCombos,
+      client_pain_points: textInsights.clientPainPoints,
+      red_flags: textInsights.redFlagPatterns,
+      top_skills: textInsights.topSkillTags,
+      best_days: timing.bestDays,
+      volume_trend: timing.volumeTrend,
+      jobs_per_week: timing.jobsPerWeek,
+      error_rate: pipeline.errorRate,
+      source_comparison: pipeline.sourceComparison,
+      recommendations: analytics.recommendations,
+      narrative_report: report || null,
+      content_ideas: contentIdeas || null,
+      date_range: overview.dateRange,
+      proposal_count: overview.totalJobs,
+    };
+
+    const res = await safeFetch(`${SUPABASE_URL}/rest/v1/analytics_snapshots`, {
+      method: "POST",
+      headers: { ...supabaseHeaders(), Prefer: "return=representation" },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      logger.warn(`[Cloud] saveAnalyticsSnapshot failed (${res.status}): ${err.slice(0, 200)}`);
+      return null;
+    }
+
+    const [saved] = await res.json() as Array<{ id: string }>;
+    logger.info(`[Cloud] Analytics snapshot saved: ${saved.id}`);
+    return saved.id;
+  } catch (e) {
+    logger.error(`[Cloud] saveAnalyticsSnapshot error: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export async function saveContentBrief(brief: {
+  type: string;
+  title: string;
+  summary?: string;
+  content: string;
+  dataSources?: Record<string, unknown>;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}): Promise<string | null> {
+  try {
+    const body = {
+      brief_type: brief.type,
+      title: brief.title,
+      summary: brief.summary || null,
+      full_content: brief.content,
+      data_sources: brief.dataSources || null,
+      tags: brief.tags || null,
+      metadata: brief.metadata || null,
+      status: "draft",
+    };
+
+    const res = await safeFetch(`${SUPABASE_URL}/rest/v1/content_briefs`, {
+      method: "POST",
+      headers: { ...supabaseHeaders(), Prefer: "return=representation" },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      logger.warn(`[Cloud] saveContentBrief failed (${res.status}): ${err.slice(0, 200)}`);
+      return null;
+    }
+
+    const [saved] = await res.json() as Array<{ id: string }>;
+    logger.info(`[Cloud] Content brief saved: ${saved.id} — "${brief.title}"`);
+    return saved.id;
+  } catch (e) {
+    logger.error(`[Cloud] saveContentBrief error: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export async function getLatestSnapshot(): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/analytics_snapshots?snapshot_type=eq.full&order=created_at.desc&limit=1`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return null;
+    const data = await res.json() as Record<string, unknown>[];
+    return data.length > 0 ? data[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getContentBriefs(type?: string, limit = 10): Promise<Record<string, unknown>[]> {
+  try {
+    const params = new URLSearchParams({ order: "created_at.desc", limit: String(limit) });
+    if (type) params.set("brief_type", `eq.${type}`);
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/content_briefs?${params}`,
+      { headers: supabaseHeaders() }
+    );
+    return res.ok ? (await res.json()) as Record<string, unknown>[] : [];
+  } catch {
+    return [];
+  }
 }

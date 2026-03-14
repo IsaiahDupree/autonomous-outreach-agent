@@ -315,6 +315,14 @@ async function processJobs(
 
     if (autoSendEligible) {
       // ── AUTO-SEND: no human approval needed ──
+      // Re-check connects right before submission (may have changed since loop start)
+      const connectsNow = getConnectsRemaining();
+      if (connectsNow !== null && connectsNow < 16) {
+        logger.warn(`[Upwork] AUTO-SEND skipped: only ${connectsNow} connects remaining`);
+        await tg.notify(`⚠️ Auto-send skipped for "${proposal.title.slice(0, 40)}" — only ${connectsNow} connects left`);
+        await cloud.updateProposalStatus(proposal.id, "queued");
+        continue;
+      }
       logger.info(`[Upwork] AUTO-SEND: score ${proposal.score}/10 >= ${AUTO_SEND_MIN_SCORE} — submitting "${proposal.title.slice(0, 50)}"`);
       await tg.notify(`🤖 *Auto-sending proposal* (score ${proposal.score}/10)\n\n${preview}`);
 

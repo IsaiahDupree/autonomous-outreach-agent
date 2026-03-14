@@ -170,7 +170,8 @@ describe("getProposalsByFilter", () => {
   });
 
   it("returns empty array on error", async () => {
-    mockFetch.mockResolvedValueOnce({ ok: false, status: 500 });
+    // safeFetch retries on 500, so mock all attempts
+    mockFetch.mockResolvedValue({ ok: false, status: 500 });
 
     const results = await cloud.getProposalsByFilter({ status: "queued" });
     expect(results).toEqual([]);
@@ -198,7 +199,8 @@ describe("getStatusCounts", () => {
   });
 
   it("returns empty object on error", async () => {
-    mockFetch.mockResolvedValueOnce({ ok: false, status: 500 });
+    // safeFetch retries on 500, so mock all attempts
+    mockFetch.mockResolvedValue({ ok: false, status: 500 });
     const counts = await cloud.getStatusCounts();
     expect(counts).toEqual({});
   });

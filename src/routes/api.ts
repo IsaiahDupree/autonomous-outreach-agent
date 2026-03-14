@@ -402,4 +402,154 @@ router.get("/analytics/report", async (_req: Request, res: Response) => {
   }
 });
 
+// ── Analytics Snapshots — save & retrieve for external apps ──
+
+// POST /api/analytics/snapshot — Run full analytics and save snapshot to Supabase
+router.post("/analytics/snapshot", async (_req: Request, res: Response) => {
+  try {
+    const { runFullAnalytics, generateAnalyticsReport } = await import("../services/analytics");
+    logger.info("[api] Analytics snapshot triggered");
+    const analytics = await runFullAnalytics();
+    const report = await generateAnalyticsReport(analytics);
+
+    // Get content ideas if available
+    let contentIdeas: unknown[] | undefined;
+    try {
+      const { analyzeNiches } = await import("../services/youtube-ideas");
+      const niches = await analyzeNiches();
+      contentIdeas = niches.map(n => ({
+        niche: n.label,
+        jobCount: n.jobCount,
+        avgBudget: n.avgBudget,
+        budgetRange: n.budgetRange,
+        topJobs: n.exampleJobs?.slice(0, 3),
+      }));
+    } catch { /* content ideas are optional */ }
+
+    const snapshotId = await cloud.saveAnalyticsSnapshot(
+      analytics as any,
+      report,
+      contentIdeas,
+    );
+
+    // Also save the report as a content brief
+    if (snapshotId) {
+      await cloud.saveContentBrief({
+        type: "market_report",
+        title: `Upwork Market Report — ${new Date().toISOString().split("T")[0]}`,
+        summary: `Analysis of ${(analytics as any).overview?.totalJobs || 0} jobs. Win rate: ${(analytics as any).closeRate?.overall?.winRate || 0}%. Top niches: ${((analytics as any).niches || []).slice(0, 3).map((n: any) => n.niche).join(", ")}`,
+        content: report,
+        dataSources: { analytics_snapshot_id: snapshotId, proposal_count: (analytics as any).overview?.totalJobs },
+        tags: ["market-report", "analytics", "weekly"],
+        metadata: { word_count: report.split(/\s+/).length },
+      });
+    }
+
+    res.json({
+      ok: true,
+      snapshotId,
+      totalJobs: (analytics as any).overview?.totalJobs,
+      winRate: (analytics as any).closeRate?.overall?.winRate,
+      topNiches: ((analytics as any).niches || []).slice(0, 5).map((n: any) => n.niche),
+      recommendations: (analytics as any).recommendations,
+    });
+  } catch (e) {
+    logger.error(`[api] Analytics snapshot error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// GET /api/analytics/latest — Get most recent analytics snapshot from Supabase
+router.get("/analytics/latest", async (_req: Request, res: Response) => {
+  try {
+    const snapshot = await cloud.getLatestSnapshot();
+    if (!snapshot) {
+      res.status(404).json({ error: "No snapshots found. Run POST /api/analytics/snapshot first." });
+      return;
+    }
+    res.json(snapshot);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// ── Content Briefs — pre-packaged content for podcast/YouTube ──
+
+// POST /api/content/brief — Generate a content brief from latest analytics
+router.post("/content/brief", async (req: Request, res: Response) => {
+  const { type = "podcast_episode" } = req.body as { type?: string };
+  try {
+    const { runFullAnalytics, generateAnalyticsReport } = await import("../services/analytics");
+    const analytics = await runFullAnalytics();
+    const overview = analytics.overview;
+    const closeRate = analytics.closeRate;
+
+    // Generate tailored content based on type
+    let title: string;
+    let content: string;
+
+    if (type === "youtube_script") {
+      content = await generateAnalyticsReport(analytics);
+      title = `What People Want from AI — Week of ${new Date().toISOString().split("T")[0]}`;
+    } else {
+      // Podcast / general brief
+      const topNiches = analytics.niches.slice(0, 5);
+      const topCombos = analytics.textInsights.topTechCombos.slice(0, 5);
+      const painPoints = analytics.textInsights.clientPainPoints.slice(0, 5);
+
+      content = [
+        `# Upwork AI Market Brief — ${new Date().toLocaleDateString()}`,
+        ``,
+        `## Key Numbers`,
+        `- ${overview.totalJobs} jobs analyzed, $${Math.round(overview.totalBudget).toLocaleString()} total budget pool`,
+        `- Average budget: $${Math.round(overview.avgBudget)}`,
+        `- Win rate: ${closeRate.overall.winRate}% (${closeRate.overall.won} won / ${closeRate.overall.submitted} submitted)`,
+        ``,
+        `## Top Niches by Demand`,
+        ...topNiches.map((n, i) => `${i + 1}. **${n.niche}** — ${n.count} jobs, avg $${Math.round(n.avgBudget)}, ${n.winRate}% win rate`),
+        ``,
+        `## Trending Tech Combos`,
+        ...topCombos.map((c, i) => `${i + 1}. ${c.combo} (${c.count} jobs)`),
+        ``,
+        `## What Clients Are Struggling With`,
+        ...painPoints.map((p, i) => `${i + 1}. "${p.phrase}" (${p.count} mentions)`),
+        ``,
+        `## Recommendations`,
+        ...analytics.recommendations.map((r, i) => `${i + 1}. ${r}`),
+        ``,
+        `## Best Days to Apply`,
+        ...analytics.timing.bestDays.slice(0, 3).map((d, i) => `${i + 1}. ${d.day} — avg score ${d.avgScore.toFixed(1)} (${d.count} jobs)`),
+      ].join("\n");
+      title = `AI Freelancing Market Brief — ${new Date().toISOString().split("T")[0]}`;
+    }
+
+    const briefId = await cloud.saveContentBrief({
+      type,
+      title,
+      summary: `${overview.totalJobs} jobs, $${Math.round(overview.avgBudget)} avg budget, ${closeRate.overall.winRate}% win rate`,
+      content,
+      dataSources: { proposal_count: overview.totalJobs, date: new Date().toISOString() },
+      tags: [type, "ai-market", new Date().toISOString().split("T")[0]],
+      metadata: { word_count: content.split(/\s+/).length },
+    });
+
+    res.json({ ok: true, briefId, title, type, wordCount: content.split(/\s+/).length, content });
+  } catch (e) {
+    logger.error(`[api] Content brief error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// GET /api/content/briefs — List content briefs
+router.get("/content/briefs", async (req: Request, res: Response) => {
+  const type = req.query.type as string | undefined;
+  const limit = parseInt(req.query.limit as string) || 10;
+  try {
+    const briefs = await cloud.getContentBriefs(type, limit);
+    res.json(briefs);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 export default router;
