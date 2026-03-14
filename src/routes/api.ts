@@ -367,4 +367,33 @@ router.post("/youtube/generate", async (_req: Request, res: Response) => {
   }
 });
 
+// ── Analytics: comprehensive Upwork data analysis ──
+
+// GET /api/analytics — Full analytics dashboard (pricing, close rates, timing, text mining, pipeline health)
+router.get("/analytics", async (_req: Request, res: Response) => {
+  try {
+    const { runFullAnalytics } = await import("../services/analytics");
+    logger.info("[api] Full analytics triggered");
+    const analytics = await runFullAnalytics();
+    res.json(analytics);
+  } catch (e) {
+    logger.error(`[api] Analytics error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// GET /api/analytics/report — Generate a narrated video script from analytics data
+router.get("/analytics/report", async (_req: Request, res: Response) => {
+  try {
+    const { runFullAnalytics, generateAnalyticsReport } = await import("../services/analytics");
+    logger.info("[api] Analytics report triggered");
+    const analytics = await runFullAnalytics();
+    const report = await generateAnalyticsReport(analytics);
+    res.json({ ...analytics, report });
+  } catch (e) {
+    logger.error(`[api] Analytics report error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 export default router;
