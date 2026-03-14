@@ -1338,6 +1338,19 @@ export async function submitProposal(
 
     const jobId = jobUrl.match(/~(\w+)/)?.[1] || Date.now().toString();
 
+    // ── Solve Cloudflare if present ──────────────────────
+    const cfResult = await solveCloudflareWithRetry(page);
+    if (cfResult.page !== page) {
+      page = cfResult.page;
+      logger.info("[Browser/Upwork] Page changed after Cloudflare solve — re-navigating to job");
+      await page.goto(jobUrl, { waitUntil: "networkidle2", timeout: 30000 });
+      await humanDelay(2000, 3000);
+    }
+    if (!cfResult.passed) {
+      logger.error("[Browser/Upwork] Cloudflare challenge failed — cannot access job page");
+      return false;
+    }
+
     // Wait for SPA content to render
     await waitForContent(page);
     await page.screenshot({ path: `debug-proposal-job-${jobId}.png` }).catch(() => {});
@@ -1427,6 +1440,10 @@ export async function submitProposal(
       page = proposalPage;
       logger.info(`[Browser/Upwork] Switched to proposal page: ${page.url().slice(0, 80)}`);
     }
+
+    // Solve Cloudflare on proposal form page if needed
+    const cfForm = await solveCloudflareWithRetry(page);
+    if (cfForm.page !== page) page = cfForm.page;
 
     await waitForContent(page);
 

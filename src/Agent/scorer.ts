@@ -56,6 +56,11 @@ const ICP_STRONG_KEYWORDS = [
   "automation engineer", "automation specialist", "automation expert",
   "bot development", "process automation", "rpa",
   "webhook", "api development", "backend developer",
+  // Voice AI / Audio
+  "elevenlabs", "11labs", "voice ai", "text to speech", "voice cloning",
+  "voice agent", "voice assistant", "speech synthesis",
+  // Web apps
+  "web application", "dashboard", "admin panel", "portal",
 ];
 
 // ── ICP weak keywords — supporting signals ──

@@ -39,6 +39,10 @@ const UPWORK_KEYWORDS = [
   "mobile app development", "react native app", "flutter app", "cross platform app",
   // Niche 10: Full stack / SaaS / MVP
   "full stack app", "SaaS MVP", "full stack developer", "MVP development",
+  // Niche 11: Web app development
+  "web app development", "web application", "dashboard development", "admin panel",
+  // Niche 12: Voice AI / Audio
+  "elevenlabs", "11labs", "voice ai", "text to speech", "voice cloning", "voice agent",
 ];
 
 // Default filters — loosened to maximize job volume
