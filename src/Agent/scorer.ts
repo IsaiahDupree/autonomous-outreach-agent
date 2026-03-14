@@ -79,6 +79,23 @@ const ICP_WEAK_KEYWORDS = [
   "stripe", "payment", "billing",
 ];
 
+// Short keywords that need word-boundary matching to avoid false positives
+// (e.g., "llm" shouldn't match "william", "bot" shouldn't match "robot")
+const SHORT_KEYWORD_REGEX_CACHE = new Map<string, RegExp>();
+function matchesKeyword(text: string, kw: string): boolean {
+  // Multi-word phrases or long keywords: .includes() is fine
+  if (kw.length >= 5 || kw.includes(" ") || kw.includes(".")) {
+    return text.includes(kw);
+  }
+  // Short keywords: use word-boundary regex
+  let re = SHORT_KEYWORD_REGEX_CACHE.get(kw);
+  if (!re) {
+    re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    SHORT_KEYWORD_REGEX_CACHE.set(kw, re);
+  }
+  return re.test(text);
+}
+
 // ── Budget floors ── (URL filters already enforce minimums, these catch edge cases)
 const BUDGET_FLOOR_HOURLY = 20;   // below $20/hr → drop
 const BUDGET_FLOOR_FIXED = 200;   // below $200 fixed → drop
@@ -212,13 +229,14 @@ export function preScoreJob(job: {
 
   // ── Client hire rate filter (Freelancer Plus data) ──
   // Skip clients with very low hire rates (tire-kickers who post but never hire)
-  // Only filter if we have hire rate data AND they have enough hires to be meaningful
+  // Only filter if we have hire rate data AND the client has enough history to judge
   if (job.clientHireRate !== undefined && job.clientHireRate < MIN_CLIENT_HIRE_RATE) {
-    // Allow new clients (< 3 hires) — they may just be getting started
-    if (job.clientHires === undefined || job.clientHires >= 3) {
+    const isNewClient = job.clientHires !== undefined && job.clientHires < 3;
+    if (!isNewClient) {
+      // Exclude established clients (3+ hires) with poor hire rates
       return {
         score: 0, excluded: true,
-        excludeReason: `Low client hire rate: ${job.clientHireRate}% (min ${MIN_CLIENT_HIRE_RATE}%, ${job.clientHires || "?"} hires)`,
+        excludeReason: `Low client hire rate: ${job.clientHireRate}% (min ${MIN_CLIENT_HIRE_RATE}%, ${job.clientHires ?? "?"} hires)`,
         strongHits: [], weakHits: [],
         budgetBonus: 0, recencyBonus: 0,
       };
@@ -228,7 +246,7 @@ export function preScoreJob(job: {
   // ── ICP strong keyword matching (required — must have at least 1) ──
   const strongHits: string[] = [];
   for (const kw of ICP_STRONG_KEYWORDS) {
-    if (text.includes(kw)) strongHits.push(kw);
+    if (matchesKeyword(text, kw)) strongHits.push(kw);
   }
 
   if (strongHits.length === 0) {
@@ -249,7 +267,7 @@ export function preScoreJob(job: {
   // Weak keyword hits: +8 each, capped at 24
   const weakHits: string[] = [];
   for (const kw of ICP_WEAK_KEYWORDS) {
-    if (text.includes(kw)) weakHits.push(kw);
+    if (matchesKeyword(text, kw)) weakHits.push(kw);
   }
   score += Math.min(24, weakHits.length * 8);
 

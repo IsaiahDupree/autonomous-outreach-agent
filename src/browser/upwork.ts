@@ -1414,7 +1414,6 @@ export async function submitProposal(
 
   try {
     // Set busy flag so scan loop pauses
-    _browserBusy = true;
     setBrowserBusy(true);
 
     // Open a DEDICATED new tab for submission to avoid conflicts with scan's page.
@@ -1447,10 +1446,12 @@ export async function submitProposal(
     }
 
     // Auto-dismiss any browser dialogs (alert/confirm/prompt)
-    page.on("dialog", async (dialog) => {
+    // Use a named handler so we can clean it up in the finally block
+    const dialogHandler = async (dialog: any) => {
       logger.info(`[Browser/Upwork] Dialog dismissed: ${dialog.type()} — "${dialog.message().slice(0, 100)}"`);
       await dialog.dismiss().catch(() => {});
-    });
+    };
+    page.on("dialog", dialogHandler);
 
     // Navigate to job
     logger.info(`[Browser/Upwork] Navigating to job for proposal: ${jobUrl.slice(0, 80)}`);
@@ -1477,7 +1478,14 @@ export async function submitProposal(
     await page.screenshot({ path: `debug-proposal-job-${jobId}.png` }).catch(() => {});
 
     // ── Pre-check: is the job still open? ──────────────
-    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 2000)).catch(() => "");
+    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 2000)).catch((e) => {
+      logger.warn(`[Browser/Upwork] page.evaluate failed (pre-check): ${(e as Error).message}`);
+      return null;
+    });
+    if (pageText === null) {
+      logger.error("[Browser/Upwork] Cannot read page content — CDP session may be invalid");
+      return false;
+    }
     if (pageText.includes("client is suspended") || pageText.includes("no longer available") || pageText.includes("has been closed")) {
       logger.error(`[Browser/Upwork] Job is not available (suspended/closed/removed)`);
       await page.screenshot({ path: `debug-proposal-unavailable-${Date.now()}.png` }).catch(() => {});
@@ -2589,7 +2597,10 @@ export async function submitProposal(
     }
     return false;
   } finally {
-    // Close the dedicated submission tab to free resources
+    // Clean up event listeners and close the dedicated submission tab
+    if (page) {
+      page.removeAllListeners("dialog");
+    }
     if (dedicatedTab && page) {
       await page.close().catch(() => {});
       logger.info("[Browser/Upwork] Closed dedicated submission tab");

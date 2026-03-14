@@ -168,6 +168,27 @@ describe("preScoreJob — client hire rate filter", () => {
     });
     expect(r.excluded).toBe(false);
   });
+
+  it("excludes client at boundary (exactly 3 hires, low rate)", () => {
+    const r = preScoreJob({
+      title: "AI automation project",
+      description: "Build an ai automation workflow",
+      clientHireRate: 5,
+      clientHires: 3,
+    });
+    expect(r.excluded).toBe(true);
+  });
+
+  it("allows client with unknown hires but low rate (benefit of doubt)", () => {
+    const r = preScoreJob({
+      title: "AI automation project",
+      description: "Build an ai automation workflow",
+      clientHireRate: 5,
+      // clientHires not provided — no hire history = possibly new
+    });
+    // When clientHires is undefined, isNewClient = false, so this SHOULD exclude
+    expect(r.excluded).toBe(true);
+  });
 });
 
 // ── ICP Keyword Matching ──
@@ -189,6 +210,23 @@ describe("preScoreJob — ICP keyword matching", () => {
     });
     expect(r.excluded).toBe(false);
     expect(r.strongHits).toContain("ai automation");
+  });
+
+  it("matches short keywords like 'llm' with word boundaries (no false positives)", () => {
+    // "llm" should NOT match "william" or "llmm"
+    const r1 = preScoreJob({ title: "William's website", description: "excellence in programming" });
+    expect(r1.excluded).toBe(true); // no ICP match — "llm" inside "william" should not count
+
+    // "llm" SHOULD match standalone "LLM"
+    const r2 = preScoreJob({ title: "LLM integration", description: "Build an LLM-powered chatbot" });
+    expect(r2.excluded).toBe(false);
+    expect(r2.strongHits).toContain("llm");
+  });
+
+  it("matches short keywords like 'mvp' and 'etl' correctly", () => {
+    const r = preScoreJob({ title: "Build an MVP", description: "Need a prototype web app mvp" });
+    expect(r.excluded).toBe(false);
+    expect(r.strongHits).toContain("mvp");
   });
 
   it("matches 'web scraping' as strong keyword", () => {

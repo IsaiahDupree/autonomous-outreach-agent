@@ -258,7 +258,9 @@ router.post("/upwork/submit", async (req: Request, res: Response) => {
 // ── Batch submit: retry all queued/error jobs above a score threshold ──
 // POST /api/upwork/submit-batch { minScore?: 7, statuses?: ["queued","error"] }
 router.post("/upwork/submit-batch", async (req: Request, res: Response) => {
-  const { minScore = 7, statuses = ["queued"] } = req.body as { minScore?: number; statuses?: string[] };
+  const rawMinScore = req.body?.minScore;
+  const minScore = Math.max(0, Math.min(10, typeof rawMinScore === "number" ? rawMinScore : 7));
+  const { statuses = ["queued"] } = req.body as { statuses?: string[] };
   try {
     const rows = await cloud.getProposalsByFilter({ status: statuses, minScore });
     if (rows.length === 0) {
@@ -291,7 +293,11 @@ router.post("/upwork/submit-batch", async (req: Request, res: Response) => {
       for (const job of jobs) {
         try {
           await cloud.updateProposalStatus(job.id, "auto_sending");
-          const ok = await submitProposal(job);
+          // Timeout individual submissions at 3 minutes to prevent batch hangs
+          const ok = await Promise.race([
+            submitProposal(job),
+            new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("Submission timeout (3m)")), 180000)),
+          ]).catch((e) => { logger.error(`[api] Submit timeout/error: ${(e as Error).message}`); return false; });
           await cloud.updateProposalStatus(job.id, ok ? "submitted" : "error");
           if (ok) submitted++; else failed++;
           logger.info(`[api] Batch: ${ok ? "✓" : "✗"} ${job.title.slice(0, 50)}`);
