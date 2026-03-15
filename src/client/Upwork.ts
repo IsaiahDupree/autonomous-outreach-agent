@@ -12,7 +12,7 @@ import * as tg from "../services/telegram";
 import { generateCoverLetter, getPortfolioLine } from "../Agent";
 import { scoreJob } from "../Agent/scorer";
 import * as upworkBrowser from "../browser/upwork";
-import type { SearchFilters, UpworkNotification } from "../browser/upwork";
+import type { SearchFilters, UpworkNotification, ArchivedProposal } from "../browser/upwork";
 import { AUTO_SEND, AUTO_SEND_MIN_SCORE } from "../secret";
 import { getConnectsRemaining } from "../browser/upwork";
 
@@ -530,6 +530,7 @@ export async function checkAndProcessNotifications(): Promise<{
     milestone: "📋",
     payment: "💰",
     feedback: "⭐",
+    job_alert: "📋",
     other: "🔔",
   };
 
@@ -672,4 +673,244 @@ export async function getCloseRateMetrics(): Promise<{
     ? Math.round((metrics.won / metrics.submitted) * 100)
     : 0;
   return { ...metrics, closeRate };
+}
+
+// ── Archived Proposals & Lessons Learned ──────────────────────────────────
+
+/**
+ * Scrape archived proposals from Upwork and sync outcomes to Supabase.
+ * Updates existing proposals with their final outcome (hired, declined, etc.)
+ * and creates new records for proposals not yet tracked.
+ */
+export async function syncArchivedProposals(): Promise<{
+  total: number;
+  synced: number;
+  hired: ArchivedProposal[];
+  lost: ArchivedProposal[];
+}> {
+  const archived = await upworkBrowser.scrapeArchivedProposals();
+  if (archived.length === 0) {
+    return { total: 0, synced: 0, hired: [], lost: [] };
+  }
+
+  const hired: ArchivedProposal[] = [];
+  const lost: ArchivedProposal[] = [];
+  let synced = 0;
+
+  for (const p of archived) {
+    if (p.status === "hired") hired.push(p);
+    else lost.push(p);
+
+    if (!p.jobId) continue;
+
+    // Check if we already have this proposal
+    const existing = await cloud.getProposalsByFilter({ jobId: p.jobId, limit: 1 });
+
+    if (existing.length > 0) {
+      // Update outcome if not already set
+      const current = existing[0];
+      const currentStatus = current.status as string;
+      if (!["won", "rejected", "no_response"].includes(currentStatus)) {
+        const outcome = p.status === "hired" ? "won"
+          : p.status === "declined" ? "rejected"
+          : "no_response";
+        await cloud.recordOutcome(p.jobId, outcome as "won" | "rejected" | "no_response");
+        synced++;
+        logger.info(`[Upwork] Synced outcome: ${p.jobTitle.slice(0, 40)} → ${outcome}`);
+      }
+    } else {
+      // Save new record from archived data
+      await cloud.saveProposal({
+        jobId: p.jobId,
+        title: p.jobTitle,
+        url: p.jobUrl,
+        description: "",
+        budget: p.budget || "",
+        score: 0,
+        status: p.status === "hired" ? "won"
+          : p.status === "declined" ? "rejected"
+          : "no_response",
+        tags: [],
+      });
+      synced++;
+    }
+  }
+
+  logger.info(`[Upwork] Archived sync complete: ${archived.length} total, ${synced} synced, ${hired.length} hired, ${lost.length} lost`);
+  return { total: archived.length, synced, hired, lost };
+}
+
+/**
+ * Analyze lessons learned from won vs lost proposals.
+ * Compares patterns between hired and rejected/lost proposals to identify
+ * what works and what doesn't.
+ */
+export async function analyzeLessonsLearned(): Promise<{
+  totalAnalyzed: number;
+  won: number;
+  lost: number;
+  lessons: {
+    winPatterns: string[];
+    lossPatterns: string[];
+    recommendations: string[];
+    nichePerformance: Array<{ niche: string; won: number; lost: number; winRate: number }>;
+    bidAnalysis: { avgWinBid: number | null; avgLossBid: number | null; insight: string };
+    clientProfile: { avgHireRateWon: number | null; avgHireRateLost: number | null };
+  };
+  aiSummary?: string;
+}> {
+  // Get all proposals with outcomes
+  const won = await cloud.getProposalsByFilter({ status: "won", limit: 100 });
+  const rejected = await cloud.getProposalsByFilter({ status: "rejected", limit: 100 });
+  const noResponse = await cloud.getProposalsByFilter({ status: "no_response", limit: 100 });
+  const lost = [...rejected, ...noResponse];
+
+  if (won.length === 0 && lost.length === 0) {
+    return {
+      totalAnalyzed: 0, won: 0, lost: 0,
+      lessons: {
+        winPatterns: [], lossPatterns: [], recommendations: [],
+        nichePerformance: [],
+        bidAnalysis: { avgWinBid: null, avgLossBid: null, insight: "No data yet" },
+        clientProfile: { avgHireRateWon: null, avgHireRateLost: null },
+      },
+    };
+  }
+
+  // Analyze bid amounts
+  const winBids = won.map(p => p.submitted_bid_amount as number).filter(Boolean);
+  const lossBids = lost.map(p => p.submitted_bid_amount as number).filter(Boolean);
+  const avgWinBid = winBids.length > 0 ? Math.round(winBids.reduce((a, b) => a + b, 0) / winBids.length) : null;
+  const avgLossBid = lossBids.length > 0 ? Math.round(lossBids.reduce((a, b) => a + b, 0) / lossBids.length) : null;
+
+  let bidInsight = "Not enough data";
+  if (avgWinBid && avgLossBid) {
+    if (avgWinBid < avgLossBid) bidInsight = `Won bids avg $${avgWinBid} vs lost $${avgLossBid} — lower bids win more`;
+    else if (avgWinBid > avgLossBid) bidInsight = `Won bids avg $${avgWinBid} vs lost $${avgLossBid} — higher bids win (quality signal)`;
+    else bidInsight = `Won and lost bids similar (~$${avgWinBid}) — bid amount not a differentiator`;
+  }
+
+  // Client hire rate analysis
+  const winHireRates = won.map(p => p.client_hire_rate as number).filter(Boolean);
+  const lossHireRates = lost.map(p => p.client_hire_rate as number).filter(Boolean);
+  const avgHireRateWon = winHireRates.length > 0 ? Math.round(winHireRates.reduce((a, b) => a + b, 0) / winHireRates.length) : null;
+  const avgHireRateLost = lossHireRates.length > 0 ? Math.round(lossHireRates.reduce((a, b) => a + b, 0) / lossHireRates.length) : null;
+
+  // Niche performance from tags
+  const nicheMap = new Map<string, { won: number; lost: number }>();
+  for (const p of won) {
+    const tags = (p.tags as string[]) || [];
+    for (const tag of tags) {
+      const entry = nicheMap.get(tag) || { won: 0, lost: 0 };
+      entry.won++;
+      nicheMap.set(tag, entry);
+    }
+  }
+  for (const p of lost) {
+    const tags = (p.tags as string[]) || [];
+    for (const tag of tags) {
+      const entry = nicheMap.get(tag) || { won: 0, lost: 0 };
+      entry.lost++;
+      nicheMap.set(tag, entry);
+    }
+  }
+  const nichePerformance = Array.from(nicheMap.entries())
+    .map(([niche, data]) => ({
+      niche,
+      won: data.won,
+      lost: data.lost,
+      winRate: Math.round((data.won / (data.won + data.lost)) * 100),
+    }))
+    .filter(n => n.won + n.lost >= 2)
+    .sort((a, b) => b.winRate - a.winRate);
+
+  // Score analysis
+  const avgWonScore = won.length > 0 ? Math.round((won.reduce((a, p) => a + (p.score as number || 0), 0) / won.length) * 10) / 10 : 0;
+  const avgLostScore = lost.length > 0 ? Math.round((lost.reduce((a, p) => a + (p.score as number || 0), 0) / lost.length) * 10) / 10 : 0;
+
+  // Deterministic pattern extraction
+  const winPatterns: string[] = [];
+  const lossPatterns: string[] = [];
+
+  if (avgWonScore > avgLostScore + 1) winPatterns.push(`Higher-scored jobs win more (avg ${avgWonScore} vs ${avgLostScore})`);
+  if (avgHireRateWon && avgHireRateLost && avgHireRateWon > avgHireRateLost)
+    winPatterns.push(`Clients with higher hire rates (${avgHireRateWon}%) more likely to hire us`);
+  if (nichePerformance.length > 0 && nichePerformance[0].winRate > 50)
+    winPatterns.push(`Best niche: "${nichePerformance[0].niche}" (${nichePerformance[0].winRate}% win rate)`);
+
+  if (noResponse.length > rejected.length)
+    lossPatterns.push(`${noResponse.length} no-response vs ${rejected.length} explicit rejections — many clients ghost`);
+  if (nichePerformance.length > 0) {
+    const worstNiche = nichePerformance[nichePerformance.length - 1];
+    if (worstNiche.winRate < 20 && worstNiche.won + worstNiche.lost >= 3)
+      lossPatterns.push(`Weakest niche: "${worstNiche.niche}" (${worstNiche.winRate}% win rate)`);
+  }
+
+  // Build AI summary from won cover letters vs lost ones
+  let aiSummary: string | undefined;
+  try {
+    const { ANTHROPIC_API_KEY } = await import("../secret");
+    if (ANTHROPIC_API_KEY && won.length >= 1) {
+      const Anthropic = (await import("@anthropic-ai/sdk")).default;
+      const ai = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+      const wonSamples = won.slice(0, 5).map(p =>
+        `TITLE: ${p.job_title}\nBID: $${p.submitted_bid_amount || "?"}\nSCORE: ${p.score}/10\nCOVER LETTER:\n${(p.proposal_text as string || "N/A").slice(0, 500)}`
+      ).join("\n---\n");
+
+      const lostSamples = lost.slice(0, 5).map(p =>
+        `TITLE: ${p.job_title}\nBID: $${p.submitted_bid_amount || "?"}\nSCORE: ${p.score}/10\nCOVER LETTER:\n${(p.proposal_text as string || "N/A").slice(0, 500)}`
+      ).join("\n---\n");
+
+      const resp = await ai.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        messages: [{
+          role: "user",
+          content: `Analyze these Upwork proposals. I won ${won.length} and lost ${lost.length}.
+
+WON PROPOSALS:
+${wonSamples}
+
+LOST PROPOSALS:
+${lostSamples}
+
+Give me 3-5 specific, actionable lessons learned. Focus on:
+1. What patterns appear in winning cover letters (tone, length, specificity)?
+2. What types of jobs/budgets convert better?
+3. What should I change about my approach?
+
+Be direct and specific. No generic advice.`,
+        }],
+      });
+
+      const content = resp.content[0];
+      if (content && content.type === "text") {
+        aiSummary = content.text;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[Upwork] AI lessons analysis failed: ${(e as Error).message}`);
+  }
+
+  const recommendations: string[] = [];
+  if (nichePerformance.length > 0) recommendations.push(`Focus on "${nichePerformance[0].niche}" — ${nichePerformance[0].winRate}% win rate`);
+  if (avgWinBid) recommendations.push(`Target bids around $${avgWinBid} (your winning average)`);
+  if (avgHireRateWon && avgHireRateWon > 50) recommendations.push(`Prioritize clients with ${avgHireRateWon}%+ hire rate`);
+  if (won.length > 0) recommendations.push(`Your scoring accuracy: won avg ${avgWonScore}/10, lost avg ${avgLostScore}/10`);
+
+  return {
+    totalAnalyzed: won.length + lost.length,
+    won: won.length,
+    lost: lost.length,
+    lessons: {
+      winPatterns,
+      lossPatterns,
+      recommendations,
+      nichePerformance,
+      bidAnalysis: { avgWinBid, avgLossBid, insight: bidInsight },
+      clientProfile: { avgHireRateWon, avgHireRateLost },
+    },
+    aiSummary,
+  };
 }

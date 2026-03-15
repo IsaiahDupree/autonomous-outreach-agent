@@ -593,4 +593,26 @@ router.get("/content/briefs", async (req: Request, res: Response) => {
   }
 });
 
+// ── Archived Proposals & Lessons Learned ──
+
+router.get("/upwork/archived", async (_req: Request, res: Response) => {
+  try {
+    const { syncArchivedProposals } = await import("../client/Upwork");
+    const result = await syncArchivedProposals();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+router.get("/upwork/lessons", async (_req: Request, res: Response) => {
+  try {
+    const { analyzeLessonsLearned } = await import("../client/Upwork");
+    const result = await analyzeLessonsLearned();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 export default router;

@@ -2625,7 +2625,7 @@ export async function submitProposal(
 
 export interface UpworkNotification {
   id: string;
-  type: "interview_invite" | "message" | "offer" | "hire" | "proposal_viewed" | "proposal_declined" | "milestone" | "payment" | "feedback" | "other";
+  type: "interview_invite" | "message" | "offer" | "hire" | "proposal_viewed" | "proposal_declined" | "milestone" | "payment" | "feedback" | "job_alert" | "other";
   title: string;
   body: string;
   time: string;
@@ -2670,10 +2670,10 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
       await restoreCookies(page);
     }
 
-    // Navigate to Upwork homepage (notifications are in the header)
+    // Navigate directly to Upwork notifications page
     logger.info("[Browser/Upwork] Checking notifications...");
-    await page.goto("https://www.upwork.com/nx/find-work/", { waitUntil: "networkidle2", timeout: 30000 });
-    await humanDelay(2000, 3000);
+    await page.goto("https://www.upwork.com/nx/find-work/", { waitUntil: "networkidle2", timeout: 45000 });
+    await humanDelay(3000, 5000);
 
     // Solve Cloudflare if needed
     const cf = await solveCloudflareWithRetry(page);
@@ -2683,17 +2683,20 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
       return [];
     }
 
-    // Click notification bell — try multiple selectors
-    const bellSelectors = [
-      // The XPath the user provided maps to the notification bell SVG in the nav
-      'nav ul li button[aria-label*="notification" i]',
-      'button[data-test="notification-bell"]',
-      'button[aria-label*="Notification" i]',
-      '[data-cy="notification-bell"]',
-      'button.nav-notification',
-    ];
+    // Wait for the SPA to fully render (nav bar must be visible)
+    await page.waitForSelector("header nav, nav[role='navigation'], [class*='navbar']", { timeout: 15000 }).catch(() => {});
+    await humanDelay(2000, 3000);
 
+    // Click notification bell — try multiple strategies
     let bellClicked = false;
+
+    // Strategy 1: aria-label selectors
+    const bellSelectors = [
+      'button[aria-label*="notification" i]',
+      'button[aria-label*="Notification" i]',
+      'button[data-test="notification-bell"]',
+      '[data-cy="notification-bell"]',
+    ];
     for (const sel of bellSelectors) {
       const btn = await page.$(sel);
       if (btn) {
@@ -2704,25 +2707,33 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
       }
     }
 
-    // Fallback: find by text or SVG in nav buttons
+    // Strategy 2: find bell by nav position (7th item from user's XPath)
     if (!bellClicked) {
       bellClicked = await page.evaluate(() => {
-        // Find all nav buttons, look for the one with notification-related content
-        const navButtons = document.querySelectorAll("header nav ul li button, header button");
+        // Look for nav buttons with badge/count or bell SVG
+        const navButtons = document.querySelectorAll("header nav ul li button, header button, nav button");
         for (const btn of Array.from(navButtons)) {
-          const aria = btn.getAttribute("aria-label") || "";
-          const text = btn.textContent?.trim() || "";
-          // Notification bell usually has a badge number or "notifications" aria
-          if (aria.toLowerCase().includes("notif") || text.match(/^\d+$/) || btn.querySelector('svg[data-cy*="bell"], svg[class*="bell"]')) {
+          const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+          const html = btn.innerHTML || "";
+          // Bell icon usually has a path with bell shape or "notification" in attributes
+          if (aria.includes("notif") || html.includes("bell") || btn.querySelector("[class*='bell']")) {
             (btn as HTMLElement).click();
             return true;
           }
         }
-        // Last resort: click 7th li button in nav (from the XPath)
-        const navLis = document.querySelectorAll("header nav ul li");
-        if (navLis.length >= 7) {
-          const btn = navLis[6].querySelector("button");
-          if (btn) { btn.click(); return true; }
+        // XPath fallback: 7th li in the header nav
+        const navLis = document.querySelectorAll("header nav ul li, nav[role='navigation'] ul li");
+        for (let i = 5; i < Math.min(navLis.length, 9); i++) {
+          const btn = navLis[i].querySelector("button");
+          if (btn) {
+            const text = btn.textContent?.trim() || "";
+            const html = btn.innerHTML || "";
+            // Notification button usually has a number badge or SVG, not much text
+            if ((text.length < 5 || text.match(/^\d+$/)) && html.includes("svg")) {
+              btn.click();
+              return true;
+            }
+          }
         }
         return false;
       });
@@ -2730,33 +2741,36 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
     }
 
     if (!bellClicked) {
-      logger.warn("[Browser/Upwork] Could not find notification bell");
-      await page.screenshot({ path: "debug-notif-no-bell.png" }).catch(() => {});
-      return [];
-    }
+      // Strategy 3: Navigate directly to notifications page URL
+      logger.info("[Browser/Upwork] Bell not found — navigating to notifications page directly");
+      await page.goto("https://www.upwork.com/ab/notifications", { waitUntil: "networkidle2", timeout: 30000 });
+      await humanDelay(3000, 5000);
+      const cf2 = await solveCloudflareWithRetry(page);
+      if (cf2.page !== page) page = cf2.page;
+    } else {
+      // Wait for notification dropdown to appear
+      await humanDelay(2000, 3000);
 
-    // Wait for notification dropdown/panel to load
-    await humanDelay(1500, 2500);
-
-    // Try to load all notifications (might need to click "See all" or scroll)
-    const seeAllClicked = await page.evaluate(() => {
-      const links = document.querySelectorAll("a, button");
-      for (const link of Array.from(links)) {
-        const t = (link.textContent?.trim() || "").toLowerCase();
-        if (t.includes("see all") || t.includes("view all") || t.includes("all notifications")) {
-          (link as HTMLElement).click();
-          return true;
+      // Try to click "See all" to get the full list
+      const seeAllClicked = await page.evaluate(() => {
+        const links = document.querySelectorAll("a, button");
+        for (const link of Array.from(links)) {
+          const t = (link.textContent?.trim() || "").toLowerCase();
+          if (t.includes("see all") || t.includes("view all") || t.includes("all notifications")) {
+            (link as HTMLElement).click();
+            return true;
+          }
         }
-      }
-      return false;
-    });
+        return false;
+      });
 
-    if (seeAllClicked) {
-      logger.info("[Browser/Upwork] Clicked 'See all notifications'");
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10000 }).catch(() => {}),
-        humanDelay(3000, 5000),
-      ]);
+      if (seeAllClicked) {
+        logger.info("[Browser/Upwork] Clicked 'See all notifications'");
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {}),
+          humanDelay(4000, 6000),
+        ]);
+      }
     }
 
     await page.screenshot({ path: "debug-notifications.png" }).catch(() => {});
@@ -2841,7 +2855,10 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
       let jobTitle: string | undefined;
       let clientName: string | undefined;
 
-      if (raw.includes("invited you to") || raw.includes("interview") || raw.includes("invitation")) {
+      // Job alert notifications (most common — "JobsNew job:" or "New job:" prefix)
+      if (raw.includes("new job:") || raw.includes("jobsnew job")) {
+        type = "job_alert";
+      } else if (raw.includes("invited you to") || raw.includes("interview") || raw.includes("invitation")) {
         type = "interview_invite";
       } else if (raw.includes("sent you a message") || raw.includes("new message") || raw.includes("messaged you")) {
         type = "message";
@@ -2849,7 +2866,7 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
         type = "offer";
       } else if (raw.includes("hired you") || raw.includes("you've been hired") || raw.includes("contract started")) {
         type = "hire";
-      } else if (raw.includes("viewed your proposal") || raw.includes("proposal was viewed")) {
+      } else if (raw.includes("was viewed") || raw.includes("viewed your proposal") || raw.includes("proposal was viewed")) {
         type = "proposal_viewed";
       } else if (raw.includes("declined") || raw.includes("not selected") || raw.includes("proposal wasn't")) {
         type = "proposal_declined";
@@ -2861,9 +2878,19 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
         type = "feedback";
       }
 
-      // Extract job title — often in quotes or after "for"
-      const jobMatch = n.raw.match(/(?:for|on|to)\s+"([^"]+)"/i) || n.raw.match(/(?:for|on)\s+(.{10,60})(?:\s+job|\s*$)/i);
-      if (jobMatch) jobTitle = jobMatch[1].trim();
+      // Extract job title from notification text
+      if (type === "job_alert") {
+        // "JobsNew job: Some Title Here 7:48 PM" or "New job: Some Title Here"
+        const alertMatch = n.raw.match(/(?:new job|jobsnew job)[:\s]+(.+?)(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)|$)/i);
+        if (alertMatch) jobTitle = alertMatch[1].trim();
+      } else if (type === "proposal_viewed") {
+        // "EngageYour proposal for Some Job Title was viewed."
+        const viewedMatch = n.raw.match(/proposal for\s+(.+?)\s+was viewed/i);
+        if (viewedMatch) jobTitle = viewedMatch[1].trim();
+      } else {
+        const jobMatch = n.raw.match(/(?:for|on|to)\s+"([^"]+)"/i) || n.raw.match(/(?:for|on)\s+(.{10,60})(?:\s+job|\s*$)/i);
+        if (jobMatch) jobTitle = jobMatch[1].trim();
+      }
 
       // Extract client name — often first word/name before "invited" or "sent"
       const clientMatch = n.raw.match(/^([A-Z][a-z]+ [A-Z][a-z]+|[A-Z][a-z]+)\s+(?:invited|sent|hired|viewed)/);
@@ -2883,10 +2910,252 @@ export async function checkNotifications(): Promise<UpworkNotification[]> {
       };
     });
 
-    logger.info(`[Browser/Upwork] Found ${classified.length} notifications (${classified.filter(n => n.isUnread).length} unread)`);
-    return classified;
+    // Dedup by URL (dropdown + full page can produce duplicates)
+    const seen = new Set<string>();
+    const deduped = classified.filter((n) => {
+      const key = n.url || n.raw.slice(0, 100);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    logger.info(`[Browser/Upwork] Found ${deduped.length} notifications (${deduped.filter(n => n.isUnread).length} unread, deduped from ${classified.length})`);
+    return deduped;
   } catch (e) {
     logger.error(`[Browser/Upwork] checkNotifications error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (dedicatedTab && page) {
+      await page.close().catch(() => {});
+    }
+    setBrowserBusy(false);
+  }
+}
+
+// ── Archived Proposals ──────────────────────────────────
+
+export interface ArchivedProposal {
+  jobTitle: string;
+  jobUrl: string;
+  jobId: string;
+  status: "hired" | "archived" | "withdrawn" | "declined" | "closed";
+  clientName?: string;
+  budget?: string;
+  bidAmount?: string;
+  submittedDate?: string;
+  outcome?: string;
+  /** Raw text for debugging */
+  raw: string;
+}
+
+/**
+ * Scrape archived proposals from /nx/proposals/archived
+ * Returns both hired and lost proposals with metadata.
+ */
+export async function scrapeArchivedProposals(): Promise<ArchivedProposal[]> {
+  let page: Page | null = null;
+  setBrowserBusy(true);
+
+  let dedicatedTab = false;
+  try {
+    // Open a DEDICATED tab for archived scraping (don't steal the scan's page)
+    const b = await launch();
+    page = await b.newPage();
+    dedicatedTab = true;
+    if (hasSavedCookies()) {
+      await restoreCookies(page);
+    }
+
+    // Navigate to archived proposals
+    logger.info("[Browser/Upwork] Navigating to archived proposals (dedicated tab)...");
+    await page.goto("https://www.upwork.com/nx/proposals/archived", {
+      waitUntil: "networkidle2", timeout: 30000,
+    });
+    await humanDelay(3000, 5000);
+
+    // Check if we got redirected to login
+    const currentUrl = page.url();
+    if (currentUrl.includes("login") || currentUrl.includes("account-security")) {
+      logger.warn("[Browser/Upwork] Session expired — re-authenticating...");
+      await ensureLoggedIn(page);
+      await page.goto("https://www.upwork.com/nx/proposals/archived", {
+        waitUntil: "networkidle2", timeout: 30000,
+      });
+      await humanDelay(3000, 5000);
+      if (page.url().includes("login")) {
+        logger.error("[Browser/Upwork] Failed to authenticate for archived proposals");
+        return [];
+      }
+    }
+
+    // Wait for content to render
+    await page.waitForSelector("h1, [class*='proposal'], table, tr.details-row", { timeout: 15000 }).catch(() => {});
+
+
+    // Log total count from page header
+    const totalCount = await page.evaluate(() => {
+      const match = (document.body.innerText || "").match(/Archived proposals\s*\((\d+)\)/i);
+      return match ? parseInt(match[1]) : 0;
+    });
+    logger.info(`[Browser/Upwork] Archived proposals page: ${totalCount} total listed`);
+
+    // Scroll to load all proposals (lazy-loaded)
+    let prevCount = 0;
+    for (let scroll = 0; scroll < 30; scroll++) {
+      const count = await page.evaluate(() =>
+        document.querySelectorAll("tr.details-row, a.up-n-link, a[href*='/nx/proposals/']").length
+      );
+      if (count === prevCount && scroll > 3) break;
+      prevCount = count;
+      await page.evaluate(() => window.scrollBy(0, 800));
+      await humanDelay(400, 800);
+    }
+
+    // Scrape current page first, then paginate
+    let allProposals: Array<{
+      jobTitle: string; jobUrl: string; jobId: string;
+      status: string; clientName: string; budget: string;
+      bidAmount: string; submittedDate: string; outcome: string;
+      raw: string;
+    }> = [];
+
+    // Helper to scrape current page proposals
+    const scrapePage = async () => {
+      const pageProposals = await page!.evaluate(() => {
+        const results: Array<{
+          jobTitle: string; jobUrl: string; jobId: string;
+          status: string; clientName: string; budget: string;
+          bidAmount: string; submittedDate: string; outcome: string;
+          raw: string;
+        }> = [];
+        const links = document.querySelectorAll("a[href*='/nx/proposals/']");
+        for (const link of Array.from(links)) {
+          const href = (link as HTMLAnchorElement).href || "";
+          const proposalIdMatch = href.match(/\/proposals\/(\d{10,})/);
+          if (!proposalIdMatch) continue;
+          const jobTitle = link.textContent?.trim() || "";
+          if (jobTitle.length < 5) continue;
+          const row = link.closest("tr") || link.parentElement?.parentElement?.parentElement;
+          const rowText = row?.textContent?.trim() || jobTitle;
+          let status = "archived";
+          const lower = rowText.toLowerCase();
+          if (lower.includes("hired")) status = "hired";
+          else if (lower.includes("withdrawn") || lower.includes("you withdrew")) status = "withdrawn";
+          else if (lower.includes("declined") || lower.includes("not selected") || lower.includes("wasn't selected")) status = "declined";
+          else if (lower.includes("job is closed") || lower.includes("job closed") || lower.includes("no longer available")) status = "closed";
+          const dateMatch = rowText.match(/(?:Initiated|Received)\s+(\w+ \d{1,2},?\s*\d{4})/i) || rowText.match(/(\w+ \d{1,2},?\s*\d{4})/);
+          results.push({
+            jobTitle: jobTitle.slice(0, 200), jobUrl: href, jobId: proposalIdMatch[1],
+            status, clientName: "", budget: "", bidAmount: "",
+            submittedDate: dateMatch ? dateMatch[1] : "", outcome: status,
+            raw: rowText.slice(0, 500),
+          });
+        }
+        return results;
+      });
+      return pageProposals;
+    };
+
+    // Scrape page 1
+    allProposals.push(...await scrapePage());
+    logger.info(`[Browser/Upwork] Page 1: ${allProposals.length} proposals`);
+
+    // Navigate through pagination using the "next" arrow button
+    const totalPages = Math.ceil(totalCount / Math.max(allProposals.length, 10));
+    for (let pageNum = 2; pageNum <= Math.min(totalPages, 10); pageNum++) {
+      // Scroll to bottom to reveal pagination
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await humanDelay(800, 1500);
+      await page.evaluate(() => window.scrollBy(0, -300));
+      await humanDelay(500, 1000);
+
+      // Click the forward arrow in the FIRST pagination widget (archived proposals, "of 7")
+      // Pagination layout: [<prev] [page1] [page2] ... [next>]
+      // Buttons order: empty(prev), "go to page N"..., "Current page X of 7 X", ..., empty(next)
+      // We want the empty button AFTER the "Current page X of 7" button
+      const clicked = await page.evaluate(() => {
+        const realClick = (el: Element) => {
+          el.scrollIntoView({ block: "center", inline: "center" });
+          const rect = el.getBoundingClientRect();
+          const opts = { bubbles: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+          el.dispatchEvent(new MouseEvent("mousedown", opts));
+          el.dispatchEvent(new MouseEvent("mouseup", opts));
+          el.dispatchEvent(new MouseEvent("click", opts));
+        };
+
+        const allBtns = Array.from(document.querySelectorAll("button[class*='pagination']"));
+        const debug: string[] = [];
+
+        // Find the forward arrow: the button with aria-label containing "next" or "forward"
+        for (const btn of allBtns) {
+          const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+          debug.push(`"${(btn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 25)}" aria="${aria.slice(0, 20)}"`);
+          if (aria.includes("next") || aria.includes("forward")) {
+            // Make sure it's not disabled
+            if (btn.hasAttribute("disabled")) return "DISABLED next button — last page";
+            realClick(btn);
+            return `dispatched next-arrow aria="${aria}"`;
+          }
+        }
+
+        // Fallback: find "Current page X of 7" and click the button right after it
+        let foundArchivedCurrent = false;
+        for (let i = 0; i < allBtns.length; i++) {
+          const text = (allBtns[i].textContent || "").replace(/\s+/g, " ").trim();
+          if (text.match(/Current page \d+ of [5-9]\d*/)) {
+            foundArchivedCurrent = true;
+            // Next button after the current page (could be a page number or the arrow)
+            if (i + 1 < allBtns.length) {
+              const nextBtn = allBtns[i + 1];
+              if (!nextBtn.hasAttribute("disabled")) {
+                realClick(nextBtn);
+                return `dispatched btn after current: "${(nextBtn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30)}"`;
+              }
+            }
+          }
+        }
+
+        return `NOT_FOUND btns:[${debug.join(" | ")}]`;
+      });
+
+      logger.info(`[Browser/Upwork] Pagination: ${clicked}`);
+      if (clicked.includes("NOT_FOUND") || clicked.includes("DISABLED")) {
+        logger.info(`[Browser/Upwork] Pagination stopped: ${clicked}`);
+        break;
+      }
+
+      // Wait for Vue SPA to re-render after pagination click
+      const prevIds = new Set(allProposals.map(p => p.jobId));
+      await humanDelay(3000, 5000);
+
+      // Scroll to load all rows on new page
+      for (let s = 0; s < 5; s++) {
+        await page.evaluate(() => window.scrollBy(0, 800));
+        await humanDelay(300, 500);
+      }
+      const pageResults = await scrapePage();
+      // Filter out duplicates from previous pages before counting
+      const newResults = pageResults.filter(p => !prevIds.has(p.jobId));
+      allProposals.push(...newResults);
+      logger.info(`[Browser/Upwork] Page ${pageNum}: ${pageResults.length} scraped, ${newResults.length} new (total: ${allProposals.length})`);
+      if (newResults.length === 0) {
+        logger.info(`[Browser/Upwork] Page ${pageNum} had no new proposals — pagination may not have worked`);
+        break;
+      }
+    }
+
+    // Dedup by jobId
+    const seen = new Set<string>();
+    const deduped = allProposals.filter((p) => {
+      if (!p.jobId || seen.has(p.jobId)) return false;
+      seen.add(p.jobId);
+      return true;
+    });
+
+    logger.info(`[Browser/Upwork] Scraped ${deduped.length} archived proposals (${deduped.filter(p => p.status === "hired").length} hired)`);
+    return deduped as ArchivedProposal[];
+  } catch (e) {
+    logger.error(`[Browser/Upwork] scrapeArchivedProposals error: ${(e as Error).message}`);
     return [];
   } finally {
     if (dedicatedTab && page) {
