@@ -14,12 +14,26 @@ export interface CharacterConfig {
   name: string;
   persona: string;
   tone: string;
+  name_signoff?: string;
   icp: Record<string, unknown>;
   portfolio?: {
     url: string;
     label?: string;
     templates?: Record<string, string>;
   };
+  github?: {
+    username: string;
+    repos: Record<string, {
+      url: string;
+      description: string;
+      keywords: string[];
+    }>;
+  };
+  winningExamples?: Array<{
+    style: string;
+    description: string;
+    job: string;
+  }>;
   upwork?: Record<string, unknown>;
   approvalRequired: boolean;
 }
@@ -68,7 +82,24 @@ export function getPortfolioLine(tags?: string[]): string {
 }
 
 /**
+ * Find a matching GitHub repo based on job title/description keywords
+ */
+export function getMatchingGithubRepo(job: { title: string; description: string }): string {
+  const repos = characterConfig?.github?.repos;
+  if (!repos) return "";
+  const jobText = `${job.title} ${job.description}`.toLowerCase();
+  for (const [, repo] of Object.entries(repos)) {
+    const matchCount = repo.keywords.filter(kw => jobText.includes(kw.toLowerCase())).length;
+    if (matchCount >= 2) {
+      return `\n\nHere's my GitHub repo with a working implementation: ${repo.url}\n${repo.description}`;
+    }
+  }
+  return "";
+}
+
+/**
  * Generate an Upwork cover letter for a job posting
+ * Style modeled after Isaiah's winning proposals: warm, proof-driven, structured.
  */
 export async function generateCoverLetter(job: {
   title: string;
@@ -76,27 +107,52 @@ export async function generateCoverLetter(job: {
   budget?: string;
 }): Promise<string> {
   const persona = characterConfig?.persona || "a professional AI automation consultant";
+  const signoff = characterConfig?.name_signoff || "";
+  const githubProof = getMatchingGithubRepo(job);
+
   const prompt = `You are ${persona}.
 
-Write a SHORT (150-200 word) Upwork cover letter for this job:
+Write an Upwork cover letter (150-250 words) for this job:
 Title: ${job.title}
 Budget: ${job.budget || "not specified"}
-Description: ${job.description.slice(0, 500)}
+Description: ${job.description.slice(0, 600)}
+${githubProof ? `\nYou have this relevant GitHub repo to reference:${githubProof}` : ""}
 
-Rules:
-- Start with a specific hook referencing their exact need
-- Mention 1 concrete similar project you've built
-- State a clear outcome/deliverable
-- End with a soft CTA (not pushy)
-- NO generic phrases like "I am writing to apply"
-- NO markdown formatting whatsoever — no bold, no bullets, no headers, no asterisks
-- Write in plain text only, like a normal person typing a message
-- Use short paragraphs separated by blank lines
+STYLE — model these winning proposals that got hired:
+
+EXAMPLE 1 (proof-first, led with existing repo):
+"I'd be thrilled to help—I've already built and open-sourced a working solution that covers nearly all your outlined objectives.
+🔗 Here's my GitHub repo: [url]
+✅ Why I'm a strong fit:
+I've already built a containerized FastAPI + MongoDB Atlas Search system that includes:
+Vector search using paraphrase-multilingual-MiniLM-L12-v2..."
+
+EXAMPLE 2 (technical-depth, named exact hardware/libs):
+"Hi there, I'd love to help with this project. I'm an aerospace engineer with experience in computational fluid dynamics and GPU acceleration...
+I currently run tests and development on an RTX 4070, which allows me to prototype and benchmark GPU-based implementations efficiently..."
+
+EXAMPLE 3 (structured plan with numbered steps):
+"I'd love to help you streamline the conversion...
+Here's how I would approach the project:
+1. Translation Automation — I will use OpenAI's language models to accurately translate...
+2. Voice Generation — I'll feed the translated lines into ElevenLabs...
+3. Scripted Automation — I'll develop a custom script to..."
+
+RULES:
+- Start with "Hi there," or "I'd love to help" — warm and personal
+- Use bullet points (•), numbered lists, and emojis (✅ 🔗 📌) where helpful for structure
+- Name EXACT technologies, libraries, hardware — never be vague
+- If you have a GitHub repo, lead with it as proof
+- Include 1 concrete similar project with specific results (numbers, timelines)
+- End with a structured deliverable plan OR a soft CTA
+- Sign off with: "Best,\\n${signoff || "Isaiah"}"
+- Sound like a real engineer excited about the work, not a template
+- NO generic filler like "I am writing to express my interest"
 - Return ONLY the cover letter text, no preamble`;
 
   const msg = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 400,
+    max_tokens: 600,
     messages: [{ role: "user", content: prompt }],
   });
 
@@ -125,7 +181,7 @@ Description: ${job.description.slice(0, 300)}
 Question: ${question}
 
 Write a concise, specific answer (2-4 sentences). Reference your relevant experience.
-NO markdown. Plain text only. Sound like a real person, not a template.
+Name exact technologies and tools. Sound like a real engineer, not a template.
 Return ONLY the answer text.`,
     }],
   });

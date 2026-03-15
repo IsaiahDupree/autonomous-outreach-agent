@@ -36,7 +36,7 @@ src/services/telegram.ts → Approval flow + notifications
 - **`_browserBusy`** — Flag that pauses scan loop during proposal submission
 - **Tab cleanup** — Close stale tabs every 5 keywords and before each submission
 - **Vue reactivity** — Upwork uses Vue 2; use Puppeteer keyboard input, not nativeSetter for form fields
-- **Plain text only** — Cover letters must have NO markdown (no bold, bullets, asterisks)
+- **Winning style** — Cover letters use bullets (•), numbered lists, emojis (✅🔗), and sign off with name
 
 ## Testing
 
