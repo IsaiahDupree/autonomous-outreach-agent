@@ -595,7 +595,7 @@ router.get("/content/briefs", async (req: Request, res: Response) => {
 
 // ── Archived Proposals & Lessons Learned ──
 
-router.get("/upwork/archived", async (_req: Request, res: Response) => {
+router.post("/upwork/archived", async (_req: Request, res: Response) => {
   try {
     const { syncArchivedProposals } = await import("../client/Upwork");
     const result = await syncArchivedProposals();

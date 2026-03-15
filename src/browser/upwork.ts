@@ -3102,7 +3102,7 @@ export async function scrapeArchivedProposals(): Promise<ArchivedProposal[]> {
         let foundArchivedCurrent = false;
         for (let i = 0; i < allBtns.length; i++) {
           const text = (allBtns[i].textContent || "").replace(/\s+/g, " ").trim();
-          if (text.match(/Current page \d+ of [5-9]\d*/)) {
+          if (text.match(/Current page \d+ of [2-9]\d*/)) {
             foundArchivedCurrent = true;
             // Next button after the current page (could be a page number or the arrow)
             if (i + 1 < allBtns.length) {

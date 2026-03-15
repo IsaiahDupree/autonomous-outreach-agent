@@ -697,29 +697,40 @@ export async function syncArchivedProposals(): Promise<{
   const lost: ArchivedProposal[] = [];
   let synced = 0;
 
+  // Fetch all tracked proposals once (not per-loop) for title matching
+  const allTracked = await cloud.getProposalsByFilter({ limit: 500 });
+
   for (const p of archived) {
     if (p.status === "hired") hired.push(p);
     else lost.push(p);
 
     if (!p.jobId) continue;
+    // Skip withdrawn proposals — freelancer cancelled, not a client outcome
+    if (p.status === "withdrawn") continue;
 
-    // Check if we already have this proposal
-    const existing = await cloud.getProposalsByFilter({ jobId: p.jobId, limit: 1 });
+    // Match by title (archived page exposes proposal IDs, not job IDs)
+    const titleLower = p.jobTitle.toLowerCase();
+    const existing = allTracked.find(
+      (r) => {
+        const dbTitle = (r.job_title as string || "").toLowerCase();
+        return dbTitle.includes(titleLower.slice(0, 40))
+          || titleLower.includes(dbTitle.slice(0, 40));
+      }
+    );
 
-    if (existing.length > 0) {
-      // Update outcome if not already set
-      const current = existing[0];
-      const currentStatus = current.status as string;
+    const outcome = p.status === "hired" ? "won"
+      : p.status === "declined" ? "rejected"
+      : "no_response";
+
+    if (existing) {
+      const currentStatus = existing.status as string;
       if (!["won", "rejected", "no_response"].includes(currentStatus)) {
-        const outcome = p.status === "hired" ? "won"
-          : p.status === "declined" ? "rejected"
-          : "no_response";
-        await cloud.recordOutcome(p.jobId, outcome as "won" | "rejected" | "no_response");
+        await cloud.recordOutcome(existing.job_id as string, outcome as "won" | "rejected" | "no_response");
         synced++;
         logger.info(`[Upwork] Synced outcome: ${p.jobTitle.slice(0, 40)} → ${outcome}`);
       }
     } else {
-      // Save new record from archived data
+      // Save new record from archived data (jobs we didn't track)
       await cloud.saveProposal({
         jobId: p.jobId,
         title: p.jobTitle,
@@ -727,9 +738,7 @@ export async function syncArchivedProposals(): Promise<{
         description: "",
         budget: p.budget || "",
         score: 0,
-        status: p.status === "hired" ? "won"
-          : p.status === "declined" ? "rejected"
-          : "no_response",
+        status: outcome,
         tags: [],
       });
       synced++;

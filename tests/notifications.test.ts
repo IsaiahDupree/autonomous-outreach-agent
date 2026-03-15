@@ -374,35 +374,36 @@ describe("syncArchivedProposals", () => {
     expect(result.lost).toEqual([]);
   });
 
-  it("syncs hired proposals as won", async () => {
+  it("syncs hired proposals as won by title match", async () => {
     vi.mocked(upworkBrowser.scrapeArchivedProposals).mockResolvedValue([
-      { jobTitle: "AI Agent", jobUrl: "https://upwork.com/jobs/~0abc", jobId: "abc123", status: "hired", raw: "hired" },
+      { jobTitle: "AI Agent Builder", jobUrl: "https://upwork.com/nx/proposals/123", jobId: "123", status: "hired", raw: "hired" },
     ]);
+    // Bulk query returns all tracked proposals — title matching finds it
     vi.mocked(cloud.getProposalsByFilter).mockResolvedValue([
-      { job_id: "abc123", job_title: "AI Agent", status: "submitted" } as any,
+      { job_id: "~0abc", job_title: "AI Agent Builder", status: "submitted" } as any,
     ]);
 
     const result = await syncArchivedProposals();
     expect(result.hired.length).toBe(1);
-    expect(cloud.recordOutcome).toHaveBeenCalledWith("abc123", "won");
+    expect(cloud.recordOutcome).toHaveBeenCalledWith("~0abc", "won");
   });
 
-  it("syncs declined proposals as rejected", async () => {
+  it("syncs declined proposals as rejected by title match", async () => {
     vi.mocked(upworkBrowser.scrapeArchivedProposals).mockResolvedValue([
-      { jobTitle: "Web App", jobUrl: "https://upwork.com/jobs/~0def", jobId: "def456", status: "declined", raw: "declined" },
+      { jobTitle: "Web App Development", jobUrl: "https://upwork.com/nx/proposals/456", jobId: "456", status: "declined", raw: "declined" },
     ]);
     vi.mocked(cloud.getProposalsByFilter).mockResolvedValue([
-      { job_id: "def456", job_title: "Web App", status: "submitted" } as any,
+      { job_id: "~0def", job_title: "Web App Development", status: "submitted" } as any,
     ]);
 
     const result = await syncArchivedProposals();
     expect(result.lost.length).toBe(1);
-    expect(cloud.recordOutcome).toHaveBeenCalledWith("def456", "rejected");
+    expect(cloud.recordOutcome).toHaveBeenCalledWith("~0def", "rejected");
   });
 
-  it("creates new record for unknown archived proposals", async () => {
+  it("creates new record for untracked archived proposals", async () => {
     vi.mocked(upworkBrowser.scrapeArchivedProposals).mockResolvedValue([
-      { jobTitle: "New Job", jobUrl: "https://upwork.com/jobs/~0xyz", jobId: "xyz789", status: "closed", raw: "closed" },
+      { jobTitle: "New Job Title", jobUrl: "https://upwork.com/nx/proposals/789", jobId: "xyz789", status: "closed", raw: "closed" },
     ]);
     vi.mocked(cloud.getProposalsByFilter).mockResolvedValue([]);
 
@@ -410,21 +411,33 @@ describe("syncArchivedProposals", () => {
     expect(result.synced).toBe(1);
     expect(cloud.saveProposal).toHaveBeenCalledWith(expect.objectContaining({
       jobId: "xyz789",
-      title: "New Job",
+      title: "New Job Title",
       status: "no_response",
     }));
   });
 
   it("skips proposals already marked as won", async () => {
     vi.mocked(upworkBrowser.scrapeArchivedProposals).mockResolvedValue([
-      { jobTitle: "Done Job", jobUrl: "https://upwork.com/jobs/~0aaa", jobId: "aaa111", status: "hired", raw: "hired" },
+      { jobTitle: "Done Job", jobUrl: "https://upwork.com/nx/proposals/111", jobId: "aaa111", status: "hired", raw: "hired" },
     ]);
     vi.mocked(cloud.getProposalsByFilter).mockResolvedValue([
-      { job_id: "aaa111", job_title: "Done Job", status: "won" } as any,
+      { job_id: "~0aaa", job_title: "Done Job", status: "won" } as any,
     ]);
 
     const result = await syncArchivedProposals();
     expect(result.synced).toBe(0);
+    expect(cloud.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  it("skips withdrawn proposals (freelancer cancelled)", async () => {
+    vi.mocked(upworkBrowser.scrapeArchivedProposals).mockResolvedValue([
+      { jobTitle: "Withdrawn Job", jobUrl: "u", jobId: "w1", status: "withdrawn", raw: "" },
+    ]);
+    vi.mocked(cloud.getProposalsByFilter).mockResolvedValue([]);
+
+    const result = await syncArchivedProposals();
+    expect(result.synced).toBe(0);
+    expect(cloud.saveProposal).not.toHaveBeenCalled();
     expect(cloud.recordOutcome).not.toHaveBeenCalled();
   });
 
