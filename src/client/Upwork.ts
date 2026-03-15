@@ -12,7 +12,7 @@ import * as tg from "../services/telegram";
 import { generateCoverLetter, getPortfolioLine } from "../Agent";
 import { scoreJob } from "../Agent/scorer";
 import * as upworkBrowser from "../browser/upwork";
-import type { SearchFilters } from "../browser/upwork";
+import type { SearchFilters, UpworkNotification } from "../browser/upwork";
 import { AUTO_SEND, AUTO_SEND_MIN_SCORE } from "../secret";
 import { getConnectsRemaining } from "../browser/upwork";
 
@@ -497,6 +497,162 @@ export async function submitTopQueued(count = 1): Promise<{ submitted: number; f
   logger.info(`[Upwork] ${summary}`);
   await tg.notify(summary);
   return { submitted, failed };
+}
+
+/**
+ * Check Upwork notifications, classify them, forward important ones to Telegram,
+ * and auto-record outcomes (hired, declined, etc.)
+ */
+export async function checkAndProcessNotifications(): Promise<{
+  total: number;
+  unread: number;
+  actionable: number;
+  notifications: UpworkNotification[];
+}> {
+  const notifications = await upworkBrowser.checkNotifications();
+  if (notifications.length === 0) {
+    return { total: 0, unread: 0, actionable: 0, notifications: [] };
+  }
+
+  const unread = notifications.filter((n) => n.isUnread);
+  const actionable = notifications.filter((n) =>
+    ["interview_invite", "offer", "hire", "message", "proposal_declined"].includes(n.type)
+  );
+
+  // Emoji map for notification types
+  const emoji: Record<string, string> = {
+    interview_invite: "📩",
+    message: "💬",
+    offer: "🎉",
+    hire: "🏆",
+    proposal_viewed: "👁",
+    proposal_declined: "❌",
+    milestone: "📋",
+    payment: "💰",
+    feedback: "⭐",
+    other: "🔔",
+  };
+
+  // Forward actionable notifications to Telegram
+  if (actionable.length > 0) {
+    const lines = actionable.map((n) => {
+      const e = emoji[n.type] || "🔔";
+      const client = n.clientName ? ` from ${n.clientName}` : "";
+      const job = n.jobTitle ? `\n   Job: ${n.jobTitle}` : "";
+      const link = n.url ? `\n   🔗 ${n.url}` : "";
+      return `${e} *${n.type.replace(/_/g, " ").toUpperCase()}*${client}${job}\n   ${n.title.slice(0, 100)}${link}`;
+    });
+    await tg.notify(`🔔 *${actionable.length} Upwork notification${actionable.length > 1 ? "s" : ""}*\n\n${lines.join("\n\n")}`);
+  }
+
+  // Auto-apply to interview invites — score the job, and if high enough, generate + submit proposal
+  const invites = notifications.filter((n) => n.type === "interview_invite" && n.url);
+  if (invites.length > 0) {
+    logger.info(`[Upwork] Processing ${invites.length} interview invite(s) for potential auto-apply`);
+    for (const invite of invites) {
+      if (!invite.url) continue;
+      // Check if we already have this job in Supabase
+      const jobIdMatch = invite.url.match(/~0?([a-f0-9]{10,})/);
+      const jobId = jobIdMatch ? jobIdMatch[1] : "";
+      if (jobId && await cloud.proposalExists(jobId)) {
+        logger.info(`[Upwork] Invite job already processed: ${jobId}`);
+        continue;
+      }
+
+      // Get job details from the invite URL
+      try {
+        const details = await upworkBrowser.getJobDetails(invite.url);
+        if (!details) continue;
+
+        // Score the job
+        const result = await (await import("../Agent/scorer")).scoreJob({
+          title: details.title,
+          description: details.description,
+          budget: details.budget,
+          proposals: details.proposals,
+          clientHireRate: details.clientInfo.hireRate,
+        });
+
+        logger.info(`[Upwork] Invite job scored: [${result.score}/10] "${details.title.slice(0, 50)}"`);
+
+        // Invites are higher priority — lower the threshold by 1 (client chose us)
+        const inviteThreshold = Math.max(4, (AUTO_SEND_MIN_SCORE || 7) - 2);
+
+        if (result.score >= inviteThreshold && !result.excluded) {
+          const built = await buildProposal({
+            id: jobId, title: details.title, description: details.description,
+            url: invite.url, budget: details.budget, score: result.score,
+            tags: result.tags, reasoning: result.reasoning, bidRange: result.bidRange,
+          });
+
+          await cloud.saveProposal({
+            jobId, title: details.title, url: invite.url,
+            description: details.description, budget: details.budget,
+            score: result.score, preScore: result.preScore,
+            coverLetter: built.coverLetter, status: "auto_sending",
+            reasoning: result.reasoning, tags: result.tags,
+          });
+
+          await tg.notify(`📩 *Auto-applying to invite* [${result.score}/10]\n${details.title.slice(0, 60)}\n💰 ${details.budget || "N/A"}\n🔗 ${invite.url}`);
+
+          const ok = await submitProposal(built);
+          await cloud.updateProposalStatus(jobId, ok ? "submitted" : "error");
+          await tg.notify(ok
+            ? `🚀 Invite proposal submitted: ${details.title.slice(0, 50)}`
+            : `❌ Invite proposal failed: ${details.title.slice(0, 50)}`);
+        } else {
+          // Save but don't auto-send — queue for manual review
+          await cloud.saveProposal({
+            jobId, title: details.title, url: invite.url,
+            description: details.description, budget: details.budget,
+            score: result.score, status: result.excluded ? "excluded" : "queued",
+            reasoning: result.reasoning || result.excluded, tags: result.tags,
+          });
+          if (!result.excluded) {
+            await tg.notify(`📩 *Invite queued* [${result.score}/10] — below auto-apply threshold\n${details.title.slice(0, 60)}\n🔗 ${invite.url}`);
+          }
+        }
+      } catch (e) {
+        logger.error(`[Upwork] Invite auto-apply error: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  // Auto-record outcomes from notifications
+  for (const n of notifications) {
+    if (n.type === "hire" && n.jobTitle) {
+      // Try to find the proposal in Supabase and mark as won
+      const proposals = await cloud.getProposalsByFilter({ status: ["submitted", "interviewed"], limit: 50 });
+      const match = proposals.find((p) =>
+        n.jobTitle && (p.job_title as string || "").toLowerCase().includes(n.jobTitle.toLowerCase().slice(0, 30))
+      );
+      if (match) {
+        await cloud.recordOutcome(match.job_id as string, "won");
+        logger.info(`[Upwork] Auto-recorded WIN: ${match.job_title}`);
+        await tg.notify(`🏆 *AUTO-RECORDED WIN*: ${(match.job_title as string).slice(0, 60)}`);
+      }
+    } else if (n.type === "proposal_declined" && n.jobTitle) {
+      const proposals = await cloud.getProposalsByFilter({ status: ["submitted", "interviewed"], limit: 50 });
+      const match = proposals.find((p) =>
+        n.jobTitle && (p.job_title as string || "").toLowerCase().includes(n.jobTitle.toLowerCase().slice(0, 30))
+      );
+      if (match) {
+        await cloud.recordOutcome(match.job_id as string, "rejected");
+        logger.info(`[Upwork] Auto-recorded REJECTED: ${match.job_title}`);
+      }
+    } else if (n.type === "interview_invite" && n.jobTitle) {
+      const proposals = await cloud.getProposalsByFilter({ status: "submitted", limit: 50 });
+      const match = proposals.find((p) =>
+        n.jobTitle && (p.job_title as string || "").toLowerCase().includes(n.jobTitle.toLowerCase().slice(0, 30))
+      );
+      if (match) {
+        await cloud.recordOutcome(match.job_id as string, "interviewed");
+        logger.info(`[Upwork] Auto-recorded INTERVIEWED: ${match.job_title}`);
+      }
+    }
+  }
+
+  return { total: notifications.length, unread: unread.length, actionable: actionable.length, notifications };
 }
 
 /**

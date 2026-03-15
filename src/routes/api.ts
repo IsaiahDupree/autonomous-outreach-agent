@@ -255,6 +255,20 @@ router.post("/upwork/submit", async (req: Request, res: Response) => {
   }
 });
 
+// ── Notifications: check Upwork notifications and process them ──
+// GET /api/upwork/notifications
+router.get("/upwork/notifications", async (_req: Request, res: Response) => {
+  try {
+    const { checkAndProcessNotifications } = await import("../client/Upwork");
+    logger.info("[api] Notification check triggered");
+    const result = await checkAndProcessNotifications();
+    res.json(result);
+  } catch (e) {
+    logger.error(`[api] Notification check error: ${(e as Error).message}`);
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 // ── Auto-submit: submit top queued jobs to meet daily minimum ──
 // POST /api/upwork/auto-submit { target?: 2 }
 router.post("/upwork/auto-submit", async (req: Request, res: Response) => {

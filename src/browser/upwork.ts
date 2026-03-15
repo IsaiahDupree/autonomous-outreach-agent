@@ -2620,3 +2620,278 @@ export async function submitProposal(
     setBrowserBusy(false);
   }
 }
+
+// ── Notification Types ──────────────────────────────────
+
+export interface UpworkNotification {
+  id: string;
+  type: "interview_invite" | "message" | "offer" | "hire" | "proposal_viewed" | "proposal_declined" | "milestone" | "payment" | "feedback" | "other";
+  title: string;
+  body: string;
+  time: string;
+  url?: string;
+  jobTitle?: string;
+  clientName?: string;
+  isUnread: boolean;
+  raw: string;
+}
+
+/**
+ * Check Upwork notifications — opens notification panel, scrapes all items.
+ * Uses a dedicated tab to avoid interfering with scan/submit.
+ */
+export async function checkNotifications(): Promise<UpworkNotification[]> {
+  let page: Page | null = null;
+  let dedicatedTab = false;
+
+  try {
+    setBrowserBusy(true);
+    const b = await launch();
+
+    // Copy cookies from existing Upwork page
+    const existingPages = await b.pages();
+    const upworkPage = existingPages.find(p => p.url().includes("upwork.com") && !p.url().includes("about:blank"));
+    let cookies: any[] = [];
+    if (upworkPage) {
+      cookies = await upworkPage.cookies().catch(() => []);
+    }
+
+    page = await b.newPage();
+    dedicatedTab = true;
+
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+    });
+
+    if (cookies.length > 0) {
+      await page.setCookie(...cookies);
+    } else if (hasSavedCookies()) {
+      await restoreCookies(page);
+    }
+
+    // Navigate to Upwork homepage (notifications are in the header)
+    logger.info("[Browser/Upwork] Checking notifications...");
+    await page.goto("https://www.upwork.com/nx/find-work/", { waitUntil: "networkidle2", timeout: 30000 });
+    await humanDelay(2000, 3000);
+
+    // Solve Cloudflare if needed
+    const cf = await solveCloudflareWithRetry(page);
+    if (cf.page !== page) page = cf.page;
+    if (!cf.passed) {
+      logger.error("[Browser/Upwork] Cloudflare blocked notification check");
+      return [];
+    }
+
+    // Click notification bell — try multiple selectors
+    const bellSelectors = [
+      // The XPath the user provided maps to the notification bell SVG in the nav
+      'nav ul li button[aria-label*="notification" i]',
+      'button[data-test="notification-bell"]',
+      'button[aria-label*="Notification" i]',
+      '[data-cy="notification-bell"]',
+      'button.nav-notification',
+    ];
+
+    let bellClicked = false;
+    for (const sel of bellSelectors) {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        bellClicked = true;
+        logger.info(`[Browser/Upwork] Clicked notification bell: ${sel}`);
+        break;
+      }
+    }
+
+    // Fallback: find by text or SVG in nav buttons
+    if (!bellClicked) {
+      bellClicked = await page.evaluate(() => {
+        // Find all nav buttons, look for the one with notification-related content
+        const navButtons = document.querySelectorAll("header nav ul li button, header button");
+        for (const btn of Array.from(navButtons)) {
+          const aria = btn.getAttribute("aria-label") || "";
+          const text = btn.textContent?.trim() || "";
+          // Notification bell usually has a badge number or "notifications" aria
+          if (aria.toLowerCase().includes("notif") || text.match(/^\d+$/) || btn.querySelector('svg[data-cy*="bell"], svg[class*="bell"]')) {
+            (btn as HTMLElement).click();
+            return true;
+          }
+        }
+        // Last resort: click 7th li button in nav (from the XPath)
+        const navLis = document.querySelectorAll("header nav ul li");
+        if (navLis.length >= 7) {
+          const btn = navLis[6].querySelector("button");
+          if (btn) { btn.click(); return true; }
+        }
+        return false;
+      });
+      if (bellClicked) logger.info("[Browser/Upwork] Clicked notification bell via fallback");
+    }
+
+    if (!bellClicked) {
+      logger.warn("[Browser/Upwork] Could not find notification bell");
+      await page.screenshot({ path: "debug-notif-no-bell.png" }).catch(() => {});
+      return [];
+    }
+
+    // Wait for notification dropdown/panel to load
+    await humanDelay(1500, 2500);
+
+    // Try to load all notifications (might need to click "See all" or scroll)
+    const seeAllClicked = await page.evaluate(() => {
+      const links = document.querySelectorAll("a, button");
+      for (const link of Array.from(links)) {
+        const t = (link.textContent?.trim() || "").toLowerCase();
+        if (t.includes("see all") || t.includes("view all") || t.includes("all notifications")) {
+          (link as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (seeAllClicked) {
+      logger.info("[Browser/Upwork] Clicked 'See all notifications'");
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10000 }).catch(() => {}),
+        humanDelay(3000, 5000),
+      ]);
+    }
+
+    await page.screenshot({ path: "debug-notifications.png" }).catch(() => {});
+
+    // Scrape notifications from the panel/page
+    const notifications = await page.evaluate(() => {
+      const results: Array<{
+        title: string; body: string; time: string; url: string;
+        isUnread: boolean; raw: string;
+      }> = [];
+
+      // Strategy 1: Notification dropdown items
+      const items = document.querySelectorAll(
+        '[class*="notification"] li, [class*="notification"] [role="listitem"], ' +
+        '[data-test*="notification"] li, .notification-item, .up-notification-item, ' +
+        '[class*="NotificationItem"], [class*="notif-item"]'
+      );
+
+      if (items.length > 0) {
+        items.forEach((item) => {
+          const text = item.textContent?.trim() || "";
+          if (text.length < 5) return;
+          const link = item.querySelector("a");
+          const url = link?.href || "";
+          const titleEl = item.querySelector("strong, b, [class*='title'], [class*='name']");
+          const title = titleEl?.textContent?.trim() || text.slice(0, 80);
+          const body = text.replace(title, "").trim().slice(0, 300);
+          const timeEl = item.querySelector("time, [class*='time'], [class*='date'], small");
+          const time = timeEl?.textContent?.trim() || "";
+          const isUnread = item.classList.contains("unread") ||
+            !!item.querySelector("[class*='unread'], [class*='new'], .badge") ||
+            item.getAttribute("aria-label")?.includes("unread") || false;
+          results.push({ title, body, time, url, isUnread, raw: text.slice(0, 500) });
+        });
+      }
+
+      // Strategy 2: If on full notifications page, find table/list rows
+      if (results.length === 0) {
+        const rows = document.querySelectorAll(
+          "tr[class*='notif'], div[class*='notif'], " +
+          "[class*='feed-item'], [class*='activity-item'], " +
+          "section[class*='notification'] > div"
+        );
+        rows.forEach((row) => {
+          const text = row.textContent?.trim() || "";
+          if (text.length < 5) return;
+          const link = row.querySelector("a");
+          const url = link?.href || "";
+          const title = text.slice(0, 80);
+          const time = (row.querySelector("time, small, [class*='time']")?.textContent?.trim()) || "";
+          results.push({ title, body: text.slice(80, 300), time, url, isUnread: false, raw: text.slice(0, 500) });
+        });
+      }
+
+      // Strategy 3: Generic — grab all text blocks in the notification area
+      if (results.length === 0) {
+        const container = document.querySelector(
+          "[class*='notification-list'], [class*='NotificationList'], " +
+          "[role='dialog'][class*='notif'], [class*='dropdown'][class*='notif']"
+        );
+        if (container) {
+          const children = container.children;
+          for (const child of Array.from(children)) {
+            const text = child.textContent?.trim() || "";
+            if (text.length < 10) continue;
+            const link = child.querySelector("a");
+            results.push({
+              title: text.slice(0, 80), body: text.slice(80, 300),
+              time: "", url: link?.href || "", isUnread: false, raw: text.slice(0, 500),
+            });
+          }
+        }
+      }
+
+      return results;
+    });
+
+    // Classify each notification
+    const classified: UpworkNotification[] = notifications.map((n, i) => {
+      const raw = n.raw.toLowerCase();
+      let type: UpworkNotification["type"] = "other";
+      let jobTitle: string | undefined;
+      let clientName: string | undefined;
+
+      if (raw.includes("invited you to") || raw.includes("interview") || raw.includes("invitation")) {
+        type = "interview_invite";
+      } else if (raw.includes("sent you a message") || raw.includes("new message") || raw.includes("messaged you")) {
+        type = "message";
+      } else if (raw.includes("sent you an offer") || raw.includes("offer received") || raw.includes("new offer")) {
+        type = "offer";
+      } else if (raw.includes("hired you") || raw.includes("you've been hired") || raw.includes("contract started")) {
+        type = "hire";
+      } else if (raw.includes("viewed your proposal") || raw.includes("proposal was viewed")) {
+        type = "proposal_viewed";
+      } else if (raw.includes("declined") || raw.includes("not selected") || raw.includes("proposal wasn't")) {
+        type = "proposal_declined";
+      } else if (raw.includes("milestone") || raw.includes("escrow")) {
+        type = "milestone";
+      } else if (raw.includes("payment") || raw.includes("paid") || raw.includes("earnings")) {
+        type = "payment";
+      } else if (raw.includes("feedback") || raw.includes("review") || raw.includes("rating")) {
+        type = "feedback";
+      }
+
+      // Extract job title — often in quotes or after "for"
+      const jobMatch = n.raw.match(/(?:for|on|to)\s+"([^"]+)"/i) || n.raw.match(/(?:for|on)\s+(.{10,60})(?:\s+job|\s*$)/i);
+      if (jobMatch) jobTitle = jobMatch[1].trim();
+
+      // Extract client name — often first word/name before "invited" or "sent"
+      const clientMatch = n.raw.match(/^([A-Z][a-z]+ [A-Z][a-z]+|[A-Z][a-z]+)\s+(?:invited|sent|hired|viewed)/);
+      if (clientMatch) clientName = clientMatch[1];
+
+      return {
+        id: `notif-${Date.now()}-${i}`,
+        type,
+        title: n.title,
+        body: n.body,
+        time: n.time,
+        url: n.url || undefined,
+        jobTitle,
+        clientName,
+        isUnread: n.isUnread,
+        raw: n.raw,
+      };
+    });
+
+    logger.info(`[Browser/Upwork] Found ${classified.length} notifications (${classified.filter(n => n.isUnread).length} unread)`);
+    return classified;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] checkNotifications error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (dedicatedTab && page) {
+      await page.close().catch(() => {});
+    }
+    setBrowserBusy(false);
+  }
+}

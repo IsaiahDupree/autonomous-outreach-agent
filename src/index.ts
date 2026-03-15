@@ -11,7 +11,7 @@ import { shutdown } from "./services";
 import { notify } from "./services/telegram";
 import app from "./app";
 import { initAgent } from "./Agent/index";
-import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics, submitTopQueued } from "./client/Upwork";
+import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics, submitTopQueued, checkAndProcessNotifications } from "./client/Upwork";
 import { runDiscoveryCycle } from "./client/Chrome";
 import { PORT, BROWSER_MODE } from "./secret";
 import { engine } from "./browser";
@@ -171,6 +171,12 @@ async function startServer() {
   cron.schedule("0 8,20 * * *", async () => {
     logger.info("[cron] Auto-submit top queued (daily minimum)");
     await submitTopQueued(DAILY_SUBMIT_TARGET).catch((e) => logger.error("[cron] auto-submit error", e));
+  });
+
+  // Check Upwork notifications every 6 hours — auto-record outcomes + forward to Telegram
+  cron.schedule("0 2,8,14,20 * * *", async () => {
+    logger.info("[cron] Checking Upwork notifications");
+    await checkAndProcessNotifications().catch((e) => logger.error("[cron] notification check error", e));
   });
 
   // Daily metrics report at 9 AM
