@@ -36,7 +36,7 @@ async function checkSafari(): Promise<boolean> {
 
 export async function checkCDP(): Promise<boolean> {
   if (BROWSER_MODE === "puppeteer") return false;
-  if (cdpUp !== null) return cdpUp;
+  // Always re-check — CDP can reconnect after Cloudflare disconnects
   try {
     const res = await fetch(`http://localhost:${CHROME_CDP_PORT}/json`, { signal: AbortSignal.timeout(2000) });
     cdpUp = res.ok;

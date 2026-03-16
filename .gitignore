@@ -29,3 +29,6 @@ logs/
 
 # Browser session data
 saved-cookies.json
+
+# Supabase CLI temp
+supabase/.temp/

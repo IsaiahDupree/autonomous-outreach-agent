@@ -9,7 +9,8 @@ import { SAFARI_UPWORK_PORT, BROWSER_MODE } from "../secret";
 import * as cloud from "../services/cloud";
 import * as obsidian from "../services/obsidian";
 import * as tg from "../services/telegram";
-import { generateCoverLetter, getPortfolioLine } from "../Agent";
+import { generateCoverLetter, getPortfolioLine, qualityCheckCoverLetter, refineCoverLetter } from "../Agent";
+import { researchJob, formatResearchBrief } from "../services/research";
 import { scoreJob } from "../Agent/scorer";
 import * as upworkBrowser from "../browser/upwork";
 import type { SearchFilters, UpworkNotification, ArchivedProposal } from "../browser/upwork";
@@ -105,11 +106,64 @@ export async function scanBestMatches(limit = 20): Promise<UpworkJob[]> {
 }
 
 export async function buildProposal(job: UpworkJob): Promise<UpworkJob> {
-  const coverLetter = await generateCoverLetter({
+  // Research the job with Perplexity for technical context
+  let researchBrief: string | undefined;
+  try {
+    const research = await researchJob({
+      title: job.title,
+      description: job.description,
+      budget: job.budget,
+      skills: job.skills || job.tags,
+    });
+    if (research) {
+      researchBrief = formatResearchBrief(research);
+      logger.info(`[Upwork] Research complete for "${job.title.slice(0, 50)}" — ${research.techInsights.length} insights`);
+    }
+  } catch (e) {
+    logger.warn(`[Upwork] Research failed: ${(e as Error).message} — proceeding without`);
+  }
+
+  let coverLetter = await generateCoverLetter({
     title: job.title,
     description: job.description,
     budget: job.budget,
+    researchBrief,
   });
+
+  // Quality gate: validate cover letter meets winning proposal standards
+  const qualityCheck = qualityCheckCoverLetter(coverLetter, {
+    title: job.title,
+    description: job.description,
+    skills: job.skills || job.tags,
+    tags: job.tags,
+  });
+
+  if (!qualityCheck.passed) {
+    logger.info(`[Upwork] Quality gate FAILED (${qualityCheck.score}/100) for "${job.title.slice(0, 50)}" — refining...`);
+    logger.info(`[Upwork]   Failed: ${qualityCheck.checks.filter(c => !c.passed).map(c => c.name).join(", ")}`);
+    try {
+      coverLetter = await refineCoverLetter(coverLetter, {
+        title: job.title,
+        description: job.description,
+        skills: job.skills || job.tags,
+        tags: job.tags,
+      }, qualityCheck);
+
+      // Re-check after refinement
+      const recheck = qualityCheckCoverLetter(coverLetter, {
+        title: job.title,
+        description: job.description,
+        skills: job.skills || job.tags,
+        tags: job.tags,
+      });
+      logger.info(`[Upwork] Quality re-check: ${recheck.score}/100 (${recheck.passed ? "PASSED" : "still failing"})`);
+    } catch (e) {
+      logger.warn(`[Upwork] Refinement failed: ${(e as Error).message} — using original`);
+    }
+  } else {
+    logger.info(`[Upwork] Quality gate PASSED (${qualityCheck.score}/100) for "${job.title.slice(0, 50)}"`);
+  }
+
   return { ...job, coverLetter };
 }
 
@@ -615,6 +669,78 @@ export async function checkAndProcessNotifications(): Promise<{
         }
       } catch (e) {
         logger.error(`[Upwork] Invite auto-apply error: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  // Process unread job alerts — score them and auto-apply to good fits
+  const jobAlerts = notifications.filter((n) => n.type === "job_alert" && n.isUnread && n.url);
+  if (jobAlerts.length > 0) {
+    const maxToProcess = 5; // Limit to avoid long processing times
+    const alertsToProcess = jobAlerts.slice(0, maxToProcess);
+    logger.info(`[Upwork] Processing ${alertsToProcess.length}/${jobAlerts.length} unread job alerts`);
+
+    for (const alert of alertsToProcess) {
+      if (!alert.url) continue;
+      const jobIdMatch = alert.url.match(/~0?([a-f0-9]{10,})/);
+      const jobId = jobIdMatch ? jobIdMatch[1] : "";
+      if (jobId && await cloud.proposalExists(jobId)) {
+        logger.info(`[Upwork] Alert job already processed: ${jobId}`);
+        continue;
+      }
+
+      try {
+        const details = await upworkBrowser.getJobDetails(alert.url);
+        if (!details) continue;
+
+        const result = await scoreJob({
+          title: details.title,
+          description: details.description,
+          budget: details.budget,
+          proposals: details.proposals,
+          clientHireRate: details.clientInfo.hireRate,
+        });
+
+        logger.info(`[Upwork] Alert job scored: [${result.score}/10] "${details.title.slice(0, 50)}" ${result.excluded ? "(EXCLUDED)" : ""}`);
+
+        if (result.excluded) continue;
+
+        if (result.score >= (AUTO_SEND_MIN_SCORE || 7)) {
+          // High score — build proposal and auto-submit
+          const built = await buildProposal({
+            id: jobId, title: details.title, description: details.description,
+            url: alert.url, budget: details.budget, score: result.score,
+            tags: result.tags, reasoning: result.reasoning, bidRange: result.bidRange,
+          });
+
+          await cloud.saveProposal({
+            jobId, title: details.title, url: alert.url,
+            description: details.description, budget: details.budget,
+            score: result.score, preScore: result.preScore,
+            coverLetter: built.coverLetter, status: "auto_sending",
+            reasoning: result.reasoning, tags: result.tags,
+          });
+
+          await tg.notify(`🔔 *Job alert auto-apply* [${result.score}/10]\n${details.title.slice(0, 60)}\n💰 ${details.budget || "N/A"}\n🔗 ${alert.url}`);
+
+          const ok = await submitProposal(built);
+          await cloud.updateProposalStatus(jobId, ok ? "submitted" : "error");
+          await tg.notify(ok
+            ? `🚀 Alert proposal submitted: ${details.title.slice(0, 50)}`
+            : `❌ Alert proposal failed: ${details.title.slice(0, 50)}`);
+        } else if (result.score >= 5) {
+          // Medium score — save and queue for review
+          await cloud.saveProposal({
+            jobId, title: details.title, url: alert.url,
+            description: details.description, budget: details.budget,
+            score: result.score, status: "queued",
+            reasoning: result.reasoning, tags: result.tags,
+          });
+          await tg.notify(`📋 *Job alert queued* [${result.score}/10]\n${details.title.slice(0, 60)}\n💰 ${details.budget || "N/A"}\n🔗 ${alert.url}`);
+        }
+        // Below 5 — silently skip
+      } catch (e) {
+        logger.error(`[Upwork] Job alert processing error: ${(e as Error).message}`);
       }
     }
   }

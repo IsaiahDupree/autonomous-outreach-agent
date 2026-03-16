@@ -32,3 +32,4 @@ export const BROWSER_HEADLESS = process.env.BROWSER_HEADLESS !== "false";
 // AUTO_SEND=true enables, AUTO_SEND_MIN_SCORE sets minimum score (default 7)
 export const AUTO_SEND = process.env.AUTO_SEND === "true";
 export const AUTO_SEND_MIN_SCORE = parseInt(process.env.AUTO_SEND_MIN_SCORE || "7");
+export const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY || "";

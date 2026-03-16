@@ -27,7 +27,187 @@
       "mongodb-search": {
         "url": "https://github.com/IsaiahDupree/mongodb-atlas-search-api",
         "description": "Containerized FastAPI + MongoDB Atlas Search with vector search, faceted e-commerce search, autosuggest, and collaborative filtering",
-        "keywords": ["mongodb", "atlas", "fastapi", "search", "vector", "docker", "api"]
+        "keywords": ["mongodb", "atlas", "fastapi", "search", "vector", "docker", "api", "e-commerce"]
+      },
+      "ai-video-platform": {
+        "url": "https://github.com/IsaiahDupree/ai-video-platform",
+        "description": "AI-powered video generation platform using Remotion, Gemini, and OpenAI",
+        "keywords": ["video", "remotion", "gemini", "openai", "generation", "ai video", "content"]
+      },
+      "n8n-video-processing": {
+        "url": "https://github.com/IsaiahDupree/n8n-video-processing",
+        "description": "n8n workflow for automated video processing pipeline",
+        "keywords": ["n8n", "video", "processing", "workflow", "automation", "pipeline"]
+      },
+      "tactile-comm-device": {
+        "url": "https://github.com/IsaiahDupree/tactile-comm-device",
+        "description": "Standalone tactile letter-button communicator (Arduino + VS1053 + PCF8575)",
+        "keywords": ["arduino", "esp32", "raspberry", "iot", "hardware", "embedded", "tactile", "speech"]
+      },
+      "content-intelligence": {
+        "url": "https://github.com/IsaiahDupree/content-intelligence",
+        "description": "Content intelligence and analysis platform",
+        "keywords": ["content", "intelligence", "analysis", "nlp", "ai", "marketing"]
+      },
+      "youtube-comment-automation": {
+        "url": "https://github.com/IsaiahDupree/youtube-comment-automation",
+        "description": "AI-powered YouTube comment automation platform with Supabase backend",
+        "keywords": ["youtube", "comment", "automation", "supabase", "social media"]
+      },
+      "excel-automation": {
+        "url": "https://github.com/IsaiahDupree/Excel-Automation-Manufacturing-Workflow",
+        "description": "Excel VBA automation for manufacturing workflows",
+        "keywords": ["excel", "vba", "automation", "manufacturing", "workflow", "spreadsheet"]
+      },
+      "bldc-motor-controller": {
+        "url": "https://github.com/IsaiahDupree/BLDC-Motor-Controller-Automation",
+        "description": "BLDC motor controller automation system",
+        "keywords": ["motor", "bldc", "controller", "automation", "hardware", "embedded"]
+      },
+      "home-assistant": {
+        "url": "https://github.com/IsaiahDupree/HomeAssistant_Integrations-",
+        "description": "Home Assistant custom integrations",
+        "keywords": ["home assistant", "smart home", "iot", "integration", "automation", "shelly"]
+      },
+      "bar-structure-analysis": {
+        "url": "https://github.com/IsaiahDupree/bar-structure-analysis",
+        "description": "Structural engineering bar analysis in MATLAB",
+        "keywords": ["matlab", "engineering", "structural", "analysis", "simulation", "fea"]
+      },
+      "gocator-matlab": {
+        "url": "https://github.com/IsaiahDupree/gocator-matlab-client",
+        "description": "MATLAB client for Gocator 3D sensors",
+        "keywords": ["matlab", "gocator", "sensor", "3d", "measurement", "inspection"]
+      },
+      "tts-comparison": {
+        "url": "https://github.com/IsaiahDupree/OpenSourceTTSComparison",
+        "description": "Open source text-to-speech model comparison and evaluation",
+        "keywords": ["tts", "text-to-speech", "voice", "speech", "elevenlabs", "audio"]
+      },
+      "open-voice": {
+        "url": "https://github.com/IsaiahDupree/OpenVoice",
+        "description": "Instant voice cloning by MIT and MyShell — audio foundation model",
+        "keywords": ["voice", "cloning", "tts", "speech", "ai", "audio", "synthesis"]
+      },
+      "autonomous-outreach": {
+        "url": "https://github.com/IsaiahDupree/autonomous-outreach-agent",
+        "description": "Autonomous outreach agent for Upwork proposals — TypeScript, Claude AI, Telegram approval, Obsidian logging",
+        "keywords": ["upwork", "automation", "outreach", "claude", "puppeteer", "telegram", "agent"]
+      },
+      "safari-automations": {
+        "url": "https://github.com/IsaiahDupree/Safari_Automations",
+        "description": "Safari browser automation tools",
+        "keywords": ["safari", "browser", "automation", "scraping", "web"]
+      },
+      "snapbot": {
+        "url": "https://github.com/IsaiahDupree/SnapBot",
+        "description": "Snap streak automation tool",
+        "keywords": ["snapchat", "automation", "bot", "social media"]
+      },
+      "amazon-search": {
+        "url": "https://github.com/IsaiahDupree/Amazon-Product-Search-Application",
+        "description": "Amazon product search application",
+        "keywords": ["amazon", "product", "search", "scraping", "e-commerce"]
+      },
+      "wifi-ble-mapper": {
+        "url": "https://github.com/IsaiahDupree/wifi-ble-location-mapper",
+        "description": "WiFi and BLE location mapping system",
+        "keywords": ["wifi", "ble", "bluetooth", "location", "mapping", "iot", "indoor"]
+      },
+      "two-stage-rocket": {
+        "url": "https://github.com/IsaiahDupree/two-stage-steam-rocket",
+        "description": "Engineering documentation and 3D models for a two-stage steam-powered rocket design",
+        "keywords": ["engineering", "rocket", "3d", "cad", "aerospace", "design"]
+      },
+      "reddit-research": {
+        "url": "https://github.com/IsaiahDupree/reddit-market-research",
+        "description": "Reddit market research and analysis tool",
+        "keywords": ["reddit", "research", "market", "scraping", "analysis", "social media"]
+      },
+      "media-pipeline": {
+        "url": "https://github.com/IsaiahDupree/media-pipeline",
+        "description": "Media processing and content pipeline",
+        "keywords": ["media", "pipeline", "video", "processing", "content", "automation"]
+      },
+      "obsidian-sync": {
+        "url": "https://github.com/IsaiahDupree/obsidian-second-brain-sync",
+        "description": "Obsidian second brain sync plugin",
+        "keywords": ["obsidian", "notes", "sync", "knowledge", "second brain"]
+      }
+    }
+  },
+  "youtube": {
+    "channel": "https://youtube.com/@isaiahdupree",
+    "videos": {
+      "n8n-claude-workflow": {
+        "url": "https://youtube.com/watch?v=k6jQXjQ2_EU",
+        "title": "How I Built an AI Automation Workflow with n8n and Claude in 30 Minutes",
+        "keywords": ["n8n", "claude", "automation", "workflow", "ai agent"]
+      },
+      "replaced-makecom": {
+        "url": "https://youtube.com/watch?v=tz96rKJpmLI",
+        "title": "I Replaced Make.com With 3 Claude API Calls (85% Cheaper)",
+        "keywords": ["make", "claude", "api", "automation", "cost", "openai"]
+      },
+      "ai-agents-business": {
+        "url": "https://youtube.com/watch?v=0jEcdwD-s3s",
+        "title": "AI Agents Can Run Your Entire Business Now (Here's How)",
+        "keywords": ["ai agent", "business", "automation", "multi-agent", "saas"]
+      },
+      "claude-bot-overnight": {
+        "url": "https://youtube.com/watch?v=Do0LzwqkJK4",
+        "title": "Claude Bot: Overnight Automation",
+        "keywords": ["claude", "bot", "automation", "cron", "overnight", "agent"]
+      },
+      "ai-market-research-bot": {
+        "url": "https://youtube.com/watch?v=Qqh_ADu8z6U",
+        "title": "AI Bot: Automate Market Research",
+        "keywords": ["ai", "bot", "market research", "scraping", "automation", "safari"]
+      },
+      "upwork-ai-report": {
+        "url": "https://youtube.com/watch?v=FSyYdWXdFeI",
+        "title": "Upwork AI Jobs Report — The AI Automation Opportunity (March 2026)",
+        "keywords": ["upwork", "ai", "jobs", "market", "report", "freelance"]
+      },
+      "ai-market-1633-jobs": {
+        "url": "https://youtube.com/watch?v=GgyvPYD-5jk",
+        "title": "AI Market Report: What 1,633 Real Jobs Reveal About AI Demand",
+        "keywords": ["ai", "market", "jobs", "data", "analysis", "report"]
+      },
+      "ai-video-creation": {
+        "url": "https://youtube.com/watch?v=z0x86JxrSrE",
+        "title": "AI Video Creation Pipeline",
+        "keywords": ["video", "ai", "creation", "pipeline", "content", "automation"]
+      },
+      "xai-makecom": {
+        "url": "https://youtube.com/watch?v=gSrQORxSRmo",
+        "title": "How to Set Up xAI's API on Make.com",
+        "keywords": ["xai", "make", "api", "automation", "workflow", "integration"]
+      },
+      "instagram-automation": {
+        "url": "https://youtube.com/watch?v=PSRzX5oko4Q",
+        "title": "Automate Your Instagram Posts Easily",
+        "keywords": ["instagram", "automation", "social media", "posting", "bot"]
+      },
+      "free-ai-apis": {
+        "url": "https://youtube.com/watch?v=InyGjSa6fpc",
+        "title": "Don't Pay For AI APIs, Do This Instead",
+        "keywords": ["ai", "api", "free", "local", "gpu", "self-hosted", "llm"]
+      },
+      "app-store-submission": {
+        "url": "https://youtube.com/watch?v=n2kXrBLTv1M",
+        "title": "App Store Submission Made Easy",
+        "keywords": ["app", "ios", "mobile", "app store", "submission", "react native"]
+      },
+      "vr-app": {
+        "url": "https://youtube.com/watch?v=p07vTIMXg68",
+        "title": "Building My First VR App in a Car",
+        "keywords": ["vr", "app", "mobile", "development", "virtual reality"]
+      },
+      "claude-bots-money": {
+        "url": "https://youtube.com/watch?v=lhWZWb4O56k",
+        "title": "Claude Bots Making Money",
+        "keywords": ["claude", "bot", "money", "twitter", "automation", "revenue"]
       }
     }
   },

@@ -276,13 +276,23 @@ export async function waitForCloudflare(page: Page, maxWaitMs = 60000): Promise<
     return true;
   }
 
-  logger.info("[Browser] Cloudflare challenge detected — using disconnect+native-click strategy");
+  logger.info("[Browser] Cloudflare challenge detected");
 
-  // Wait for Turnstile widget to load
+  // ── Strategy 1: Wait + click WITHOUT disconnecting CDP ──
+  // This preserves page refs and cookies. Try this first.
   await humanDelay(3000, 5000);
 
-  // Get widget position while still connected
+  // Try to find and click the Turnstile checkbox via Puppeteer mouse
   const widgetBox = await page.evaluate(() => {
+    // Look for the Turnstile iframe or widget container
+    const iframes = document.querySelectorAll("iframe");
+    for (const iframe of Array.from(iframes)) {
+      const r = iframe.getBoundingClientRect();
+      if (r.width > 200 && r.width < 400 && r.height > 50 && r.height < 100) {
+        return { x: r.x, y: r.y, w: r.width, h: r.height };
+      }
+    }
+    // Fallback: look for any widget-like element
     const all = document.querySelectorAll("*");
     for (let i = 0; i < all.length; i++) {
       const el = all[i];
@@ -294,48 +304,83 @@ export async function waitForCloudflare(page: Page, maxWaitMs = 60000): Promise<
     return null;
   }).catch(() => null);
 
-  if (!widgetBox) {
-    logger.warn("[Browser] Could not find Turnstile widget position");
-    // Fall back to non-disconnect approach
+  if (widgetBox) {
+    // Click the checkbox area with Puppeteer mouse (no CDP disconnect)
+    const clickX = widgetBox.x + 28 + (Math.random() * 6 - 3);
+    const clickY = widgetBox.y + widgetBox.h / 2 + (Math.random() * 4 - 2);
+    logger.info(`[Browser] Clicking Turnstile at (${Math.round(clickX)}, ${Math.round(clickY)}) — keeping CDP connected`);
+
+    // Move mouse naturally then click
+    await page.mouse.move(clickX - 50, clickY + 30);
+    await humanDelay(200, 500);
+    await page.mouse.move(clickX, clickY, { steps: 5 });
+    await humanDelay(100, 300);
+    await page.mouse.click(clickX, clickY);
+
+    // Wait for verification
+    logger.info("[Browser] Waiting for Cloudflare verification (CDP still connected)...");
+    const waitMs = 12000 + Math.random() * 8000; // 12-20s
+    await new Promise(r => setTimeout(r, waitMs));
+
+    const t2 = await page.title().catch(() => "");
+    if (!t2.includes("Just a moment") && !t2.includes("Checking") && !t2.includes("Attention")) {
+      logger.info("[Browser] Cloudflare challenge PASSED (no disconnect needed)!");
+      return true;
+    }
+    logger.info("[Browser] Puppeteer click didn't solve Cloudflare — trying native click with CDP disconnect");
+  } else {
+    logger.warn("[Browser] Could not find Turnstile widget — trying solveTurnstile fallback");
     await solveTurnstile(page);
     await humanDelay(10000, 15000);
     const t2 = await page.title();
-    return !t2.includes("Just a moment") && !t2.includes("Checking");
+    if (!t2.includes("Just a moment") && !t2.includes("Checking")) return true;
   }
 
-  logger.info(`[Browser] Widget at x=${widgetBox.x}, y=${widgetBox.y}, w=${widgetBox.w}, h=${widgetBox.h}`);
+  // ── Strategy 2: Disconnect CDP + native click (last resort) ──
+  logger.info("[Browser] Falling back to disconnect+native-click strategy");
 
-  // Get window bounds for screen coordinate conversion
+  // Re-find widget (may have changed)
+  const widgetBox2 = await page.evaluate(() => {
+    const all = document.querySelectorAll("*");
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      const r = el.getBoundingClientRect();
+      if (r.width > 200 && r.width < 400 && r.height > 50 && r.height < 100 && r.y > 100) {
+        return { x: r.x, y: r.y, w: r.width, h: r.height };
+      }
+    }
+    return null;
+  }).catch(() => null);
+
+  if (!widgetBox2) {
+    logger.warn("[Browser] Still no widget found — giving up");
+    return false;
+  }
+
   const { getWindowBounds } = await import("./mouse");
   const winBounds = await getWindowBounds(page);
-
-  // Calculate click target (checkbox is ~28px from left, vertically centered)
-  const clickPageX = widgetBox.x + 28;
-  const clickPageY = widgetBox.y + widgetBox.h / 2;
+  const clickPageX = widgetBox2.x + 28;
+  const clickPageY = widgetBox2.y + widgetBox2.h / 2;
   const clickScreenX = Math.round(winBounds.x + clickPageX);
   const clickScreenY = Math.round(winBounds.y + clickPageY);
 
   logger.info(`[Browser] Will click at screen(${clickScreenX}, ${clickScreenY})`);
 
-  // DISCONNECT CDP — this removes all automation fingerprints from Chrome
+  // DISCONNECT CDP
   logger.info("[Browser] Disconnecting CDP to clear automation traces...");
   browser!.disconnect();
   browser = null;
 
-  // Wait longer for CDP to fully detach — gives Chrome time to "forget" automation
   await new Promise((r) => setTimeout(r, 3000 + Math.random() * 2000));
 
-  // Now click with native OS mouse — Chrome is running as a completely normal browser
+  // Native click
   logger.info("[Browser] Clicking Turnstile with native mouse (CDP disconnected)...");
   const { nativeClickExported } = await import("./mouse");
-
-  // Add slight random jitter to the click coordinates each time
   const jitterX = Math.round(clickScreenX + (Math.random() * 6 - 3));
   const jitterY = Math.round(clickScreenY + (Math.random() * 6 - 3));
   nativeClickExported(jitterX, jitterY);
 
-  // Wait for Cloudflare verification — randomize to avoid pattern detection
-  const verifyWaitMs = 20000 + Math.random() * 10000; // 20-30s
+  const verifyWaitMs = 20000 + Math.random() * 10000;
   logger.info(`[Browser] Waiting ${Math.round(verifyWaitMs / 1000)}s for Cloudflare to verify (CDP disconnected)...`);
   await new Promise((r) => setTimeout(r, verifyWaitMs));
 
@@ -364,7 +409,7 @@ export async function waitForCloudflare(page: Page, maxWaitMs = 60000): Promise<
   logger.info("[Browser] Reconnected to Chrome");
   browser.on("disconnected", () => { browser = null; });
 
-  // Check if Cloudflare passed by looking at the current page
+  // Check if Cloudflare passed
   const pages = await browser.pages();
   if (pages.length > 0) {
     const currentTitle = await pages[0].title();

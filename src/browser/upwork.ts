@@ -1465,20 +1465,24 @@ export async function submitProposal(
     };
     page.on("dialog", dialogHandler);
 
-    // Navigate to job
-    logger.info(`[Browser/Upwork] Navigating to job for proposal: ${jobUrl.slice(0, 80)}`);
-    await page.goto(jobUrl, { waitUntil: "networkidle2", timeout: 30000 });
-    await humanDelay(2000, 3000);
-
+    // Navigate to job using Chrome's native navigation (less detectable than page.goto)
     const jobId = jobUrl.match(/~(\w+)/)?.[1] || Date.now().toString();
+    logger.info(`[Browser/Upwork] Navigating to job for proposal: ${jobUrl.slice(0, 80)}`);
+    await page.evaluate((url: string) => { window.location.href = url; }, jobUrl);
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
+    await humanDelay(2000, 3000);
 
     // ── Solve Cloudflare if present ──────────────────────
     const cfResult = await solveCloudflareWithRetry(page);
     if (cfResult.page !== page) {
       page = cfResult.page;
-      logger.info("[Browser/Upwork] Page changed after Cloudflare solve — re-navigating to job");
-      await page.goto(jobUrl, { waitUntil: "networkidle2", timeout: 30000 });
-      await humanDelay(2000, 3000);
+      // After CDP reconnect, check if we're already on the job page
+      const currentUrl = await page.url();
+      if (!currentUrl.includes(jobId)) {
+        logger.info("[Browser/Upwork] Page changed after Cloudflare — navigating via JS");
+        await page.evaluate((url: string) => { window.location.href = url; }, jobUrl);
+        await new Promise(r => setTimeout(r, 8000)); // wait for SPA to load
+      }
     }
     if (!cfResult.passed) {
       logger.error("[Browser/Upwork] Cloudflare challenge failed — cannot access job page");
@@ -2523,6 +2527,47 @@ export async function submitProposal(
       resultUrl.includes("/proposals/") && !resultUrl.includes("/proposals/job/");
 
     if (isSuccess) {
+      // Handle "Enhance your proposal" / boost upsell modal if it appears
+      try {
+        await humanDelay(1500, 2500);
+        const enhanceHandled = await page.evaluate(() => {
+          const bodyText = document.body.innerText.toLowerCase();
+          // Check for enhance/boost modal
+          if (bodyText.includes("enhance your proposal") || bodyText.includes("boost your proposal") ||
+              bodyText.includes("get more visibility") || bodyText.includes("boosted proposal")) {
+            // Look for "Enhance" or "Boost" button
+            const btns = Array.from(document.querySelectorAll("button"));
+            for (const b of btns) {
+              const t = b.textContent?.trim().toLowerCase() || "";
+              if ((t.includes("enhance") || t.includes("boost") || t.includes("get boosted")) && !b.disabled) {
+                b.click();
+                return "clicked-enhance";
+              }
+            }
+            // If no enhance button, dismiss modal (click "No thanks" / "Skip" / "Maybe later")
+            for (const b of btns) {
+              const t = b.textContent?.trim().toLowerCase() || "";
+              if (t.includes("no thanks") || t.includes("skip") || t.includes("maybe later") || t.includes("not now")) {
+                b.click();
+                return "dismissed";
+              }
+            }
+            return "enhance-modal-visible";
+          }
+          return "no-enhance-modal";
+        });
+        if (enhanceHandled === "clicked-enhance") {
+          logger.info("[Browser/Upwork] Clicked 'Enhance' on boost modal — proposal boosted!");
+          await humanDelay(2000, 3000);
+        } else if (enhanceHandled === "dismissed") {
+          logger.info("[Browser/Upwork] Dismissed enhance modal");
+        } else if (enhanceHandled === "enhance-modal-visible") {
+          logger.warn("[Browser/Upwork] Enhance modal visible but no button found");
+        }
+      } catch (enhanceErr) {
+        logger.warn(`[Browser/Upwork] Enhance modal check failed: ${(enhanceErr as Error).message}`);
+      }
+
       // Hard verification: navigate to proposals page and confirm it's listed
       logger.info("[Browser/Upwork] Submission looks successful — verifying on proposals page...");
       try {

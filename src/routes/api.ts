@@ -9,6 +9,7 @@ import logger from "../config/logger";
 import { submitProposal, buildProposal } from "../client/Upwork";
 import type { UpworkJob } from "../client/Upwork";
 import { getConnectsRemaining } from "../browser/upwork";
+import * as tg from "../services/telegram";
 
 const router = Router();
 
@@ -246,9 +247,14 @@ router.post("/upwork/submit", async (req: Request, res: Response) => {
       const ok = await submitProposal(job);
       await cloud.updateProposalStatus(jobId, ok ? "submitted" : "error");
       logger.info(`[api] Submit result for ${jobId}: ${ok ? "SUCCESS" : "FAILED"}`);
+      // Notify Telegram
+      const emoji = ok ? "🚀" : "❌";
+      const budget = job.budget ? ` | 💰 ${job.budget}` : "";
+      await tg.notify(`${emoji} *Proposal ${ok ? "submitted" : "FAILED"}*\n${job.title.slice(0, 60)}${budget}\n🔗 ${job.url}`);
     })().catch(e => {
       logger.error(`[api] Submit error for ${jobId}: ${(e as Error).message}`);
       cloud.updateProposalStatus(jobId, "error").catch((e) => logger.error(`[api] Failed to mark ${jobId} as error: ${(e as Error).message}`));
+      tg.notify(`❌ *Proposal submit crashed*\n${job.title.slice(0, 60)}\n${(e as Error).message.slice(0, 100)}`).catch(() => {});
     });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
@@ -329,6 +335,8 @@ router.post("/upwork/submit-batch", async (req: Request, res: Response) => {
           await cloud.updateProposalStatus(job.id, ok ? "submitted" : "error");
           if (ok) submitted++; else failed++;
           logger.info(`[api] Batch: ${ok ? "✓" : "✗"} ${job.title.slice(0, 50)}`);
+          const emoji = ok ? "🚀" : "❌";
+          await tg.notify(`${emoji} *Batch ${ok ? "submitted" : "FAILED"}*\n${job.title.slice(0, 60)}\n💰 ${job.budget || "N/A"}`);
           // Pause between submissions
           await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
         } catch (e) {
@@ -589,6 +597,31 @@ router.get("/content/briefs", async (req: Request, res: Response) => {
     const briefs = await cloud.getContentBriefs(type, limit);
     res.json(briefs);
   } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// ── Research: Perplexity job research ──
+// POST /api/upwork/research { title, description, budget?, skills? }
+router.post("/upwork/research", async (req: Request, res: Response) => {
+  const { title, description, budget, skills } = req.body as {
+    title?: string; description?: string; budget?: string; skills?: string[];
+  };
+  if (!title || !description) {
+    res.status(400).json({ error: "Required: title, description" });
+    return;
+  }
+  try {
+    const { researchJob, formatResearchBrief } = await import("../services/research");
+    logger.info(`[api] Research triggered for: ${title.slice(0, 50)}`);
+    const research = await researchJob({ title, description, budget, skills });
+    if (!research) {
+      res.status(503).json({ error: "Research unavailable — check PERPLEXITY_API_KEY" });
+      return;
+    }
+    res.json({ ...research, brief: formatResearchBrief(research) });
+  } catch (e) {
+    logger.error(`[api] Research error: ${(e as Error).message}`);
     res.status(500).json({ error: (e as Error).message });
   }
 });
