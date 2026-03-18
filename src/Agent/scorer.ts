@@ -52,6 +52,12 @@ const ICP_STRONG_KEYWORDS = [
   "mobile app", "react native", "flutter", "full stack",
   "ios app", "android app", "cross platform",
   "saas", "mvp", "prototype", "web app",
+  // CAD / 3D
+  "cad", "autocad", "solidworks", "fusion 360", "3d modeling", "3d printing",
+  "cad automation", "parametric design", "mechanical design",
+  // Arduino / Embedded / IoT
+  "arduino", "esp32", "raspberry pi", "iot", "embedded systems",
+  "microcontroller", "sensor", "firmware", "embedded developer",
   // Ops / infra
   "automation engineer", "automation specialist", "automation expert",
   "bot development", "process automation", "rpa",
@@ -77,6 +83,8 @@ const ICP_WEAK_KEYWORDS = [
   "django", "fastapi", "flask",
   "docker", "aws", "cloud", "deploy",
   "stripe", "payment", "billing",
+  "cad", "3d", "stl", "cnc", "laser", "pcb",
+  "arduino", "esp", "gpio", "serial", "i2c", "spi", "iot",
 ];
 
 // Short keywords that need word-boundary matching to avoid false positives

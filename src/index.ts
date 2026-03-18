@@ -43,6 +43,10 @@ const UPWORK_KEYWORDS = [
   "web app development", "web application", "dashboard development", "admin panel",
   // Niche 12: Voice AI / Audio
   "elevenlabs", "11labs", "voice ai", "text to speech", "voice cloning", "voice agent",
+  // Niche 13: CAD / 3D Design
+  "CAD design", "3D modeling", "AutoCAD", "SolidWorks", "Fusion 360", "CAD automation",
+  // Niche 14: Arduino / Embedded / IoT
+  "Arduino", "ESP32", "Raspberry Pi", "IoT development", "embedded systems", "microcontroller",
 ];
 
 // Default filters — loosened to maximize job volume
