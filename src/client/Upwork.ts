@@ -220,21 +220,19 @@ async function processJobs(
   scoreThreshold: number,
   label: string,
 ): Promise<void> {
+  const cycleStart = Date.now();
   if (jobs.length === 0) {
     logger.info(`[Upwork] ${label}: No jobs found`);
     return;
   }
 
-  // Dedup: skip jobs already in Supabase
-  const newJobs: UpworkJob[] = [];
-  let dupeCount = 0;
-  for (const job of jobs) {
-    if (await cloud.proposalExists(job.id)) {
-      dupeCount++;
-      continue;
-    }
-    newJobs.push(job);
-  }
+  // Dedup: skip jobs already in Supabase (parallel checks for speed)
+  const dupeChecks = await Promise.all(jobs.map(async (job) => ({
+    job,
+    exists: await cloud.proposalExists(job.id),
+  })));
+  const newJobs = dupeChecks.filter((c) => !c.exists).map((c) => c.job);
+  const dupeCount = dupeChecks.length - newJobs.length;
   if (dupeCount > 0) {
     logger.info(`[Upwork] ${label}: Skipped ${dupeCount} duplicates`);
   }
@@ -390,11 +388,17 @@ async function processJobs(
       logger.info(`[Upwork] AUTO-SEND: score ${proposal.score}/10 >= ${AUTO_SEND_MIN_SCORE} — submitting "${proposal.title.slice(0, 50)}"`);
       await tg.notify(`🤖 *Auto-sending proposal* (score ${proposal.score}/10)\n\n${preview}`);
 
+      const submitStart = Date.now();
       const ok = await submitProposal(proposal);
+      const submitSec = ((Date.now() - submitStart) / 1000).toFixed(0);
       const status = ok ? "submitted" : "error";
       await cloud.updateProposalStatus(proposal.id, status);
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, status);
-      await tg.notify(ok ? `🚀 Auto-submitted: ${proposal.title}` : `❌ Auto-submit failed: ${proposal.title}`);
+      const posted = proposal.posted || "";
+      const speedInfo = posted ? ` | Posted: ${posted}` : "";
+      await tg.notify(ok
+        ? `🚀 Auto-submitted in ${submitSec}s: ${proposal.title}${speedInfo}`
+        : `❌ Auto-submit failed (${submitSec}s): ${proposal.title}`);
     } else {
       // ── MANUAL APPROVAL: send to Telegram and wait ──
       await tg.sendForApproval({
@@ -432,6 +436,9 @@ async function processJobs(
       }
     }
   }
+
+  const cycleSec = ((Date.now() - cycleStart) / 1000).toFixed(0);
+  logger.info(`[Upwork] ${label} pipeline done in ${cycleSec}s — ${scoredJobs.length} qualified, ${newJobs.length} new`);
 }
 
 /**

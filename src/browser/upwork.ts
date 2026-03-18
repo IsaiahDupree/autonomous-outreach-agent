@@ -461,7 +461,9 @@ async function scrapeCurrentPage(page: Page, limit: number): Promise<ScrapedJob[
         if (t && t.length < 40) skillTags.push(t);
       });
 
-      const url = href.startsWith('http') ? href.split('?')[0] : (href ? `https://www.upwork.com${href.split('?')[0]}` : `https://www.upwork.com/jobs/~0${id}`);
+      // Always build URL from clean job ID — scraped hrefs contain search highlight markup
+      // e.g. "span-class-highlight-Automation-span-" in the path breaks job page navigation
+      const url = id ? `https://www.upwork.com/jobs/~0${id}` : (href.startsWith('http') ? href.split('?')[0] : `https://www.upwork.com${href.split('?')[0]}`);
 
       results.push({
         id,
@@ -1470,7 +1472,7 @@ export async function submitProposal(
     logger.info(`[Browser/Upwork] Navigating to job for proposal: ${jobUrl.slice(0, 80)}`);
     await page.evaluate((url: string) => { window.location.href = url; }, jobUrl);
     await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
-    await humanDelay(2000, 3000);
+    await humanDelay(800, 1500);
 
     // ── Solve Cloudflare if present ──────────────────────
     const cfResult = await solveCloudflareWithRetry(page);
@@ -1573,8 +1575,8 @@ export async function submitProposal(
 
     // Wait for navigation to proposal form
     await Promise.race([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {}),
-      humanDelay(5000, 7000),
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 12000 }).catch(() => {}),
+      humanDelay(3000, 5000),
     ]);
 
     // Re-get page if navigated to new tab

@@ -4,11 +4,111 @@
  */
 import Anthropic from "@anthropic-ai/sdk";
 import logger from "../config/logger";
-import { ANTHROPIC_API_KEY } from "../secret";
+import { ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN } from "../secret";
 import fs from "fs";
 import path from "path";
+import os from "os";
 
-const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+/**
+ * Claude OAuth auto-refresh.
+ * Reads token from ~/.claude/.credentials.json, auto-refreshes when expired.
+ * Fallback chain: OAuth (auto-refresh) → ANTHROPIC_AUTH_TOKEN env → ANTHROPIC_API_KEY
+ */
+const CRED_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
+const OAUTH_BETA = "oauth-2025-04-20";
+const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // refresh 5 min before expiry
+
+async function refreshOAuthToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string; expiresAt: number } | null> {
+  try {
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: OAUTH_CLIENT_ID,
+      refresh_token: refreshToken,
+    });
+    const res = await fetch(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    const data = await res.json() as { access_token?: string; refresh_token?: string; expires_in?: number; error?: string };
+    if (!data.access_token) {
+      logger.error(`[Agent] OAuth refresh failed: ${data.error || "no access_token"}`);
+      return null;
+    }
+    const result = {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token || refreshToken,
+      expiresAt: Date.now() + (data.expires_in || 28800) * 1000,
+    };
+    // Write refreshed credentials back to disk
+    const creds = JSON.parse(fs.readFileSync(CRED_PATH, "utf-8"));
+    creds.claudeAiOauth = { ...creds.claudeAiOauth, ...result };
+    fs.writeFileSync(CRED_PATH, JSON.stringify(creds), "utf-8");
+    logger.info(`[Agent] OAuth token refreshed — expires ${new Date(result.expiresAt).toISOString()}`);
+    return result;
+  } catch (e) {
+    logger.error(`[Agent] OAuth refresh error: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+function makeOAuthClient(token: string): Anthropic {
+  return new Anthropic({
+    authToken: token,
+    apiKey: null,
+    defaultHeaders: { "anthropic-beta": OAUTH_BETA },
+  });
+}
+
+async function getClientAsync(): Promise<Anthropic> {
+  // 1. Try Claude Code OAuth credentials (auto-refresh if expired)
+  try {
+    if (fs.existsSync(CRED_PATH)) {
+      const creds = JSON.parse(fs.readFileSync(CRED_PATH, "utf-8"));
+      const oauth = creds.claudeAiOauth;
+      if (oauth?.accessToken) {
+        const needsRefresh = oauth.expiresAt && oauth.expiresAt - Date.now() < TOKEN_REFRESH_BUFFER_MS;
+        if (!needsRefresh) {
+          return makeOAuthClient(oauth.accessToken);
+        }
+        // Token expired or about to expire — refresh it
+        if (oauth.refreshToken) {
+          logger.info("[Agent] OAuth token expiring soon — refreshing...");
+          const refreshed = await refreshOAuthToken(oauth.refreshToken);
+          if (refreshed) return makeOAuthClient(refreshed.accessToken);
+        }
+        // Refresh failed but token might still work
+        if (oauth.expiresAt > Date.now()) return makeOAuthClient(oauth.accessToken);
+        logger.warn("[Agent] OAuth token expired and refresh failed — falling back");
+      }
+    }
+  } catch (e) {
+    logger.warn(`[Agent] Failed to read Claude credentials: ${(e as Error).message}`);
+  }
+
+  // 2. Try env var auth token
+  if (ANTHROPIC_AUTH_TOKEN) return makeOAuthClient(ANTHROPIC_AUTH_TOKEN);
+
+  // 3. Fall back to API key
+  return new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+}
+
+// Synchronous version for backwards compat — uses cached token without refresh
+function getClient(): Anthropic {
+  try {
+    if (fs.existsSync(CRED_PATH)) {
+      const creds = JSON.parse(fs.readFileSync(CRED_PATH, "utf-8"));
+      const oauth = creds.claudeAiOauth;
+      if (oauth?.accessToken && (!oauth.expiresAt || oauth.expiresAt > Date.now())) {
+        return makeOAuthClient(oauth.accessToken);
+      }
+    }
+  } catch { /* fall through */ }
+  if (ANTHROPIC_AUTH_TOKEN) return makeOAuthClient(ANTHROPIC_AUTH_TOKEN);
+  return new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+}
 
 /**
  * Strip all markdown formatting from text — Upwork renders plain text only.
@@ -215,7 +315,7 @@ RULES:
   - Use plain dashes (-) or bullet chars (•) for lists, NOT markdown syntax
 - Return ONLY the cover letter text, no preamble`;
 
-  const msg = await client.messages.create({
+  const msg = await (await getClientAsync()).messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 600,
     messages: [{ role: "user", content: prompt }],
@@ -453,7 +553,7 @@ export async function refineCoverLetter(
   const signoff = characterConfig?.name_signoff || "Isaiah";
   const githubProof = getMatchingGithubRepo(job);
 
-  const msg = await client.messages.create({
+  const msg = await (await getClientAsync()).messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 600,
     messages: [{
@@ -500,7 +600,7 @@ export async function answerScreeningQuestion(
   job: { title: string; description: string },
 ): Promise<string> {
   const persona = characterConfig?.persona || "a professional AI automation consultant";
-  const msg = await client.messages.create({
+  const msg = await (await getClientAsync()).messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 200,
     messages: [{
@@ -532,7 +632,7 @@ export async function scoreProspectWithAI(profile: {
 }): Promise<number> {
   const text = `${profile.displayName || ""} | ${profile.headline || ""} | ${profile.bio || ""}`;
 
-  const msg = await client.messages.create({
+  const msg = await (await getClientAsync()).messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 50,
     messages: [{
@@ -557,7 +657,7 @@ export async function generateDMOpening(profile: {
   bio?: string;
   platform: string;
 }): Promise<string> {
-  const msg = await client.messages.create({
+  const msg = await (await getClientAsync()).messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 150,
     messages: [{

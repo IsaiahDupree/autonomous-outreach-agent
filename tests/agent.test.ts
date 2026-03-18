@@ -19,6 +19,7 @@ vi.mock("@anthropic-ai/sdk", () => ({
 
 vi.mock("../src/secret", () => ({
   ANTHROPIC_API_KEY: "test-key",
+  ANTHROPIC_AUTH_TOKEN: "",
 }));
 
 vi.mock("../src/config/logger", () => ({

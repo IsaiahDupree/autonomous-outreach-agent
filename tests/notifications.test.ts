@@ -15,6 +15,7 @@ vi.mock("../src/secret", () => ({
   PORT: 3000,
   BROWSER_MODE: "puppeteer",
   ANTHROPIC_API_KEY: "test-key",
+  ANTHROPIC_AUTH_TOKEN: "",
   AUTO_SEND: true,
   AUTO_SEND_MIN_SCORE: 7,
   TELEGRAM_BOT_TOKEN: "test-token",

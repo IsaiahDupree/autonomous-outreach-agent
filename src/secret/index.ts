@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 export const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+export const ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN || "";
 export const SUPABASE_URL = process.env.SUPABASE_URL || "https://ivhfuhxorppptyuofbgq.supabase.co";
 export const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || "";
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";

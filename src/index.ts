@@ -127,7 +127,8 @@ async function startServer() {
     // Single run mode
     if (!moduleFilter || moduleFilter === "upwork") await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
     if (moduleFilter === "best-matches") await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
-    if (!moduleFilter || moduleFilter === "chrome") await runDiscoveryCycle(CHROME_KEYWORDS);
+    // LinkedIn discovery disabled — not using LinkedIn outreach
+    // if (!moduleFilter || moduleFilter === "chrome") await runDiscoveryCycle(CHROME_KEYWORDS);
     if (moduleFilter === "metrics") await sendMetricsReport();
     await engine.close();
     process.exit(0);
@@ -147,23 +148,23 @@ async function startServer() {
   await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[startup] best-matches error", e));
 
   // Cron schedules
-  // Upwork keyword search every 3 hours (top of hour)
-  cron.schedule("0 */3 * * *", async () => {
+  // Upwork keyword search every 45 min — speed is critical for winning proposals
+  cron.schedule("*/45 * * * *", async () => {
     logger.info("[cron] Upwork keyword search");
     await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[cron] upwork error", e));
   });
 
-  // Best Matches feed every 3 hours (offset by 90 min so they alternate)
-  cron.schedule("30 1,4,7,10,13,16,19,22 * * *", async () => {
+  // Best Matches feed every 45 min (offset by ~22 min so they alternate with keyword search)
+  cron.schedule("22 */1 * * *", async () => {
     logger.info("[cron] Best Matches scan");
     await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[cron] best-matches error", e));
   });
 
-  // Chrome discovery every 30 minutes
-  cron.schedule("*/30 * * * *", async () => {
-    logger.info("[cron] Chrome discovery");
-    await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
-  });
+  // Chrome/LinkedIn discovery disabled — not using LinkedIn outreach
+  // cron.schedule("*/30 * * * *", async () => {
+  //   logger.info("[cron] Chrome discovery");
+  //   await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
+  // });
 
   // Auto-submit top queued proposals every 12 hours to meet daily minimum (2/day)
   // Runs at 8 AM and 8 PM UTC — picks highest-scoring queued jobs
@@ -173,8 +174,8 @@ async function startServer() {
     await submitTopQueued(DAILY_SUBMIT_TARGET).catch((e) => logger.error("[cron] auto-submit error", e));
   });
 
-  // Check Upwork notifications every 6 hours — auto-record outcomes + forward to Telegram
-  cron.schedule("0 2,8,14,20 * * *", async () => {
+  // Check Upwork notifications every hour — catch invites and job alerts fast
+  cron.schedule("0 * * * *", async () => {
     logger.info("[cron] Checking Upwork notifications");
     await checkAndProcessNotifications().catch((e) => logger.error("[cron] notification check error", e));
   });
@@ -185,7 +186,7 @@ async function startServer() {
     await sendMetricsReport().catch((e) => logger.error("[cron] metrics error", e));
   });
 
-  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 3h | Best Matches: every 3h (offset)\nAuto-submit: ${DAILY_SUBMIT_TARGET}/day (8 AM + 8 PM UTC)\nChrome: every 30min | Metrics: daily 9 AM`);
+  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 45min | Best Matches: every 45min (offset)\nNotifications: every 1h | Auto-submit: ${DAILY_SUBMIT_TARGET}/day\nMetrics: daily 9 AM`);
   logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
 
   const graceful = async () => {
