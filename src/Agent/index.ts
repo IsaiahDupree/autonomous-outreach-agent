@@ -62,7 +62,7 @@ function makeOAuthClient(token: string): Anthropic {
   });
 }
 
-async function getClientAsync(): Promise<Anthropic> {
+export async function getClientAsync(): Promise<Anthropic> {
   // 1. Try Claude Code OAuth credentials (auto-refresh if expired)
   try {
     if (fs.existsSync(CRED_PATH)) {
@@ -81,18 +81,18 @@ async function getClientAsync(): Promise<Anthropic> {
         }
         // Refresh failed but token might still work
         if (oauth.expiresAt > Date.now()) return makeOAuthClient(oauth.accessToken);
-        logger.warn("[Agent] OAuth token expired and refresh failed — falling back");
+        logger.error("[Agent] OAuth token expired and refresh failed");
       }
     }
   } catch (e) {
-    logger.warn(`[Agent] Failed to read Claude credentials: ${(e as Error).message}`);
+    logger.error(`[Agent] Failed to read Claude credentials: ${(e as Error).message}`);
   }
 
   // 2. Try env var auth token
   if (ANTHROPIC_AUTH_TOKEN) return makeOAuthClient(ANTHROPIC_AUTH_TOKEN);
 
-  // 3. Fall back to API key
-  return new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+  // No API key fallback — OAuth only
+  throw new Error("No OAuth credentials available. Run Claude Code to authenticate.");
 }
 
 // Synchronous version for backwards compat — uses cached token without refresh
@@ -107,7 +107,7 @@ function getClient(): Anthropic {
     }
   } catch { /* fall through */ }
   if (ANTHROPIC_AUTH_TOKEN) return makeOAuthClient(ANTHROPIC_AUTH_TOKEN);
-  return new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+  throw new Error("No OAuth credentials available. Run Claude Code to authenticate.");
 }
 
 /**

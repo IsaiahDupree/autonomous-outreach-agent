@@ -3,12 +3,8 @@
  * Stage 1: Hard excludes, budget floors, ICP keyword matching, point-based 0-100
  * Stage 2: Claude AI scoring for fit assessment (only for jobs that pass Stage 1)
  */
-import Anthropic from "@anthropic-ai/sdk";
 import logger from "../config/logger";
-import { ANTHROPIC_API_KEY } from "../secret";
-import { getCharacter } from "./index";
-
-const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+import { getCharacter, getClientAsync } from "./index";
 
 // ── Hard exclude keywords — instant drop if title or description matches ──
 const HARD_EXCLUDES = [
@@ -362,6 +358,7 @@ export async function scoreJob(job: {
   const persona = character?.persona || "AI automation consultant";
 
   try {
+    const client = await getClientAsync();
     const msg = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 200,

@@ -16,6 +16,8 @@ import { runDiscoveryCycle } from "./client/Chrome";
 import { PORT, BROWSER_MODE } from "./secret";
 import { engine } from "./browser";
 import cron from "node-cron";
+import * as control from "./services/process-control";
+import * as ops from "./services/operations";
 
 // Upwork search keywords — 10 niches × 2-3 variations each
 const UPWORK_KEYWORDS = [
@@ -95,6 +97,79 @@ async function sendMetricsReport(): Promise<void> {
   }
 }
 
+/**
+ * Listen for Telegram text commands: /pause, /resume, /stop, /status
+ * Runs alongside the approval polling — checks for message updates.
+ */
+function startTelegramCommandListener(): void {
+  const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = require("./secret");
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+
+  const API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+  let cmdOffset = 0;
+
+  const poll = async () => {
+    if (control.getState() === "stopped") return;
+    try {
+      const res = await fetch(`${API}/getUpdates?offset=${cmdOffset + 1}&timeout=10&allowed_updates=message`, {
+        signal: AbortSignal.timeout(15000),
+      });
+      const data = await res.json() as { result: Array<{ update_id: number; message?: { chat: { id: number }; text?: string } }> };
+
+      for (const update of data?.result || []) {
+        cmdOffset = Math.max(cmdOffset, update.update_id);
+        const msg = update.message;
+        if (!msg || String(msg.chat.id) !== String(TELEGRAM_CHAT_ID) || !msg.text) continue;
+
+        const cmd = msg.text.trim().toLowerCase();
+
+        if (cmd === "/pause" || cmd === "/pause scanning" || cmd === "/pause submitting" || cmd === "/pause notifications") {
+          const system = cmd.split(" ")[1];
+          if (system) {
+            control.pauseSystem(system);
+            await notify(`⏸️ *${system} paused*\nSend /resume ${system} to restart`);
+          } else {
+            control.pause("Telegram command");
+            await notify("⏸️ *Agent paused*\nAll cron jobs will skip.\nSend /resume to restart.");
+          }
+        } else if (cmd === "/resume" || cmd.startsWith("/resume ")) {
+          const system = cmd.split(" ")[1];
+          if (system) {
+            control.resumeSystem(system);
+            await notify(`▶️ *${system} resumed*`);
+          } else {
+            control.resume();
+            await notify("▶️ *Agent resumed* — all systems active");
+          }
+        } else if (cmd === "/stop") {
+          await notify("🛑 *Agent shutting down...*");
+          await control.stop("Telegram /stop command");
+          return; // exit poll loop
+        } else if (cmd === "/state" || cmd === "/status") {
+          const s = control.getFullState();
+          const uptime = Math.round(s.uptime / 60);
+          const paused = s.pausedSystems.length > 0 ? `\nPaused: ${s.pausedSystems.join(", ")}` : "";
+          await notify(
+            `📊 *Agent State: ${s.state.toUpperCase()}*\n` +
+            `⏱️ Uptime: ${uptime}m | 🧠 Memory: ${s.memory}MB${paused}\n` +
+            `PID: ${s.pid}`
+          );
+        }
+      }
+    } catch (e) {
+      // Silently retry on network errors
+      if ((e as Error).message?.includes("aborted")) { /* timeout, normal */ }
+      else logger.warn(`[telegram-cmd] Poll error: ${(e as Error).message}`);
+    }
+    // Continue polling
+    setTimeout(poll, 2000);
+  };
+
+  // Start after a delay to not conflict with approval polling initialization
+  setTimeout(poll, 5000);
+  logger.info("[telegram-cmd] Listening for /pause /resume /stop /status commands");
+}
+
 async function startServer() {
   // Init AI agent with character
   try {
@@ -145,23 +220,37 @@ async function startServer() {
     logger.info(`Health: http://localhost:${PORT}/api/health`);
   });
 
-  // Run initial scans on startup
+  // Run initial scans on startup (tracked)
   logger.info("[startup] Running initial Upwork scan...");
-  await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[startup] upwork error", e));
+  await ops.trackedSafe("scan_keywords", { source: "startup", keywords: UPWORK_KEYWORDS }, async (opId) => {
+    ops.addStep(opId, "search", `Searching ${UPWORK_KEYWORDS.length} keywords`);
+    await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
+  });
   logger.info("[startup] Running initial Best Matches scan...");
-  await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[startup] best-matches error", e));
-
-  // Cron schedules
-  // Upwork keyword search every 45 min — speed is critical for winning proposals
-  cron.schedule("*/45 * * * *", async () => {
-    logger.info("[cron] Upwork keyword search");
-    await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[cron] upwork error", e));
+  await ops.trackedSafe("scan_best_matches", { source: "startup" }, async () => {
+    await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
   });
 
-  // Best Matches feed every 45 min (offset by ~22 min so they alternate with keyword search)
-  cron.schedule("22 */1 * * *", async () => {
+  // Cron schedules — all check control.isActive() before running
+  // Upwork keyword search every 20 min — catch jobs within 30 min of posting
+  cron.schedule("*/20 * * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped keyword search (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("scanning")) { logger.info("[cron] Skipped keyword search (scanning paused)"); return; }
+    logger.info("[cron] Upwork keyword search");
+    await ops.trackedSafe("scan_keywords", { source: "cron", keywords: UPWORK_KEYWORDS }, async (opId) => {
+      ops.addStep(opId, "search", `Searching ${UPWORK_KEYWORDS.length} keywords`);
+      await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
+    });
+  });
+
+  // Best Matches feed every 20 min (offset by 10 min so they alternate with keyword search)
+  cron.schedule("10,30,50 * * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped Best Matches (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("scanning")) { logger.info("[cron] Skipped Best Matches (scanning paused)"); return; }
     logger.info("[cron] Best Matches scan");
-    await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD).catch((e) => logger.error("[cron] best-matches error", e));
+    await ops.trackedSafe("scan_best_matches", { source: "cron" }, async () => {
+      await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
+    });
   });
 
   // Chrome/LinkedIn discovery disabled — not using LinkedIn outreach
@@ -174,28 +263,47 @@ async function startServer() {
   // Runs at 8 AM and 8 PM UTC — picks highest-scoring queued jobs
   const DAILY_SUBMIT_TARGET = 2;
   cron.schedule("0 8,20 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped auto-submit (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped auto-submit (submitting paused)"); return; }
     logger.info("[cron] Auto-submit top queued (daily minimum)");
-    await submitTopQueued(DAILY_SUBMIT_TARGET).catch((e) => logger.error("[cron] auto-submit error", e));
+    await ops.trackedSafe("auto_submit", { source: "cron", target: DAILY_SUBMIT_TARGET }, async () => {
+      await submitTopQueued(DAILY_SUBMIT_TARGET);
+    });
   });
 
   // Check Upwork notifications every hour — catch invites and job alerts fast
   cron.schedule("0 * * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped notifications (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("notifications")) { logger.info("[cron] Skipped notifications (notifications paused)"); return; }
     logger.info("[cron] Checking Upwork notifications");
-    await checkAndProcessNotifications().catch((e) => logger.error("[cron] notification check error", e));
+    await ops.trackedSafe("check_notifications", { source: "cron" }, async () => {
+      await checkAndProcessNotifications();
+    });
   });
 
-  // Daily metrics report at 9 AM
+  // Daily metrics report at 9 AM (runs even when paused — it's read-only)
   cron.schedule("0 9 * * *", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
     logger.info("[cron] Daily metrics report");
-    await sendMetricsReport().catch((e) => logger.error("[cron] metrics error", e));
+    await ops.trackedSafe("metrics", { source: "cron" }, async () => {
+      await sendMetricsReport();
+    });
   });
 
-  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 45min | Best Matches: every 45min (offset)\nNotifications: every 1h | Auto-submit: ${DAILY_SUBMIT_TARGET}/day\nMetrics: daily 9 AM`);
-  logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
-
-  const graceful = async () => {
+  // Register cleanup for graceful stop (via API, Telegram, or signal)
+  control.onStop(async () => {
     await engine.close();
     shutdown(server);
+  });
+
+  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 20min | Best Matches: every 20min (offset)\nNotifications: every 1h | Auto-submit: ${DAILY_SUBMIT_TARGET}/day\nMetrics: daily 9 AM\n\n⏸️ /pause — pause all  |  🛑 /stop — shutdown`);
+  logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
+
+  // Start listening for Telegram control commands (/pause, /resume, /stop, /status)
+  startTelegramCommandListener();
+
+  const graceful = async () => {
+    await control.stop("Process signal");
   };
   process.on("SIGTERM", () => { logger.info("SIGTERM"); graceful(); });
   process.on("SIGINT", () => { logger.info("SIGINT"); graceful(); });

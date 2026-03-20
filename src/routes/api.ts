@@ -10,8 +10,211 @@ import { submitProposal, buildProposal } from "../client/Upwork";
 import type { UpworkJob } from "../client/Upwork";
 import { getConnectsRemaining } from "../browser/upwork";
 import * as tg from "../services/telegram";
+import * as control from "../services/process-control";
+import * as ops from "../services/operations";
 
 const router = Router();
+
+// ── Agent Process Control ──
+
+// GET /api/agent/state — Current agent state + uptime + memory
+router.get("/agent/state", (_req: Request, res: Response) => {
+  res.json(control.getFullState());
+});
+
+// POST /api/agent/pause — Pause all processing (cron jobs skip, in-progress work finishes)
+router.post("/agent/pause", async (req: Request, res: Response) => {
+  const { reason, system } = req.body as { reason?: string; system?: string };
+  if (system) {
+    control.pauseSystem(system);
+    res.json({ ok: true, message: `Subsystem "${system}" paused`, state: control.getFullState() });
+  } else {
+    control.pause(reason);
+    await tg.notify(`⏸️ *Agent paused*${reason ? `\nReason: ${reason}` : ""}\nSend /resume to restart`);
+    res.json({ ok: true, message: "Agent paused", state: control.getFullState() });
+  }
+});
+
+// POST /api/agent/resume — Resume processing
+router.post("/agent/resume", async (req: Request, res: Response) => {
+  const { system } = req.body as { system?: string };
+  if (system) {
+    control.resumeSystem(system);
+    res.json({ ok: true, message: `Subsystem "${system}" resumed`, state: control.getFullState() });
+  } else {
+    control.resume();
+    await tg.notify("▶️ *Agent resumed* — all systems active");
+    res.json({ ok: true, message: "Agent resumed", state: control.getFullState() });
+  }
+});
+
+// POST /api/agent/stop — Graceful shutdown (closes browser, server, exits)
+router.post("/agent/stop", async (req: Request, res: Response) => {
+  const { reason } = req.body as { reason?: string };
+  await tg.notify(`🛑 *Agent stopping*${reason ? `\nReason: ${reason}` : ""}`);
+  res.json({ ok: true, message: "Agent stopping..." });
+  // Give response time to flush, then stop
+  setTimeout(() => control.stop(reason), 500);
+});
+
+// ── Operations Tracking ──
+
+// GET /api/ops — List operations (filter: ?type=, ?status=, ?limit=)
+router.get("/ops", (_req: Request, res: Response) => {
+  const type = _req.query.type as ops.OpType | undefined;
+  const status = _req.query.status as ops.OpStatus | undefined;
+  const limit = parseInt(_req.query.limit as string) || 50;
+  const list = ops.listOps({ type, status, limit });
+  res.json({ count: list.length, operations: list });
+});
+
+// GET /api/ops/summary — Counts by status/type
+router.get("/ops/summary", (_req: Request, res: Response) => {
+  res.json(ops.getOpsSummary());
+});
+
+// GET /api/ops/running — Active operations
+router.get("/ops/running", (_req: Request, res: Response) => {
+  const running = ops.getRunningOps();
+  res.json({ count: running.length, operations: running });
+});
+
+// GET /api/ops/errors — Recent failures + error patterns + troubleshooting
+router.get("/ops/errors", (_req: Request, res: Response) => {
+  const limit = parseInt(_req.query.limit as string) || 10;
+  const recentErrors = ops.getRecentErrors(limit);
+  const patterns = ops.getErrorPatterns();
+  res.json({
+    recentErrors: recentErrors.map(o => ({
+      id: o.id,
+      type: o.type,
+      error: o.error,
+      completedAt: o.completedAt,
+      context: o.context,
+    })),
+    patterns,
+  });
+});
+
+// GET /api/ops/:id — Single op detail with children
+router.get("/ops/:id", (req: Request, res: Response) => {
+  const op = ops.getOp(req.params.id);
+  if (!op) {
+    res.status(404).json({ error: "Operation not found" });
+    return;
+  }
+  const children = ops.getChildOps(op.id);
+  res.json({ ...op, children: children.length > 0 ? children : undefined });
+});
+
+// POST /api/ops/:id/cancel — Cancel pending/running op
+router.post("/ops/:id/cancel", (req: Request, res: Response) => {
+  const ok = ops.cancelOp(req.params.id);
+  if (!ok) {
+    res.status(400).json({ error: "Cannot cancel — op not pending or running" });
+    return;
+  }
+  res.json({ ok: true, operation: ops.getOp(req.params.id) });
+});
+
+// POST /api/ops/:id/retry — Retry failed op (dispatches by type+context)
+router.post("/ops/:id/retry", async (req: Request, res: Response) => {
+  const op = ops.getOp(req.params.id);
+  if (!op) {
+    res.status(404).json({ error: "Operation not found" });
+    return;
+  }
+  if (op.status !== "failed") {
+    res.status(400).json({ error: "Only failed operations can be retried" });
+    return;
+  }
+  if (!op.error?.diagnosis.retryable) {
+    res.status(400).json({
+      error: "This error is not retryable",
+      diagnosis: op.error?.diagnosis,
+    });
+    return;
+  }
+
+  // Dispatch retry based on operation type
+  try {
+    let newOpId: string;
+    switch (op.type) {
+      case "scan_keywords": {
+        const { runProposalCycle } = await import("../client/Upwork");
+        newOpId = await ops.trackedSafe("scan_keywords", op.context, async (opId) => {
+          ops.addStep(opId, "scan", "Retrying keyword scan");
+          await runProposalCycle(
+            op.context.keywords as string[],
+            op.context.filters as any,
+            op.context.scoreThreshold as number,
+          );
+        });
+        break;
+      }
+      case "scan_best_matches": {
+        const { runBestMatchesCycle } = await import("../client/Upwork");
+        newOpId = await ops.trackedSafe("scan_best_matches", op.context, async () => {
+          await runBestMatchesCycle(op.context.scoreThreshold as number);
+        });
+        break;
+      }
+      case "submit_proposal": {
+        const jobId = op.context.jobId as string;
+        if (!jobId) {
+          res.status(400).json({ error: "No jobId in context — cannot retry" });
+          return;
+        }
+        // Re-trigger via the submit endpoint logic
+        const rows = await cloud.getProposalsByFilter({ jobId });
+        if (rows.length === 0) {
+          res.status(404).json({ error: `Job ${jobId} not found` });
+          return;
+        }
+        const row = rows[0];
+        const job = {
+          id: row.job_id as string,
+          title: (row.job_title as string) || "Untitled",
+          description: (row.job_description as string) || "",
+          url: row.job_url as string,
+          budget: row.budget as string | undefined,
+          score: row.score as number | undefined,
+          bid: row.submitted_bid_amount as number | undefined,
+          coverLetter: row.proposal_text as string | undefined,
+        };
+        newOpId = ops.createOp("submit_proposal", { jobId });
+        ops.startOp(newOpId);
+        // Run async
+        (async () => {
+          try {
+            await cloud.updateProposalStatus(jobId, "auto_sending");
+            const ok = await submitProposal(job);
+            await cloud.updateProposalStatus(jobId, ok ? "submitted" : "error");
+            if (ok) ops.completeOp(newOpId, { submitted: true });
+            else ops.failOp(newOpId, "Submission returned false");
+          } catch (e) {
+            ops.failOp(newOpId, e as Error);
+            await cloud.updateProposalStatus(jobId, "error").catch(() => {});
+          }
+        })();
+        break;
+      }
+      case "check_notifications": {
+        const { checkAndProcessNotifications } = await import("../client/Upwork");
+        newOpId = await ops.trackedSafe("check_notifications", {}, async () => {
+          await checkAndProcessNotifications();
+        });
+        break;
+      }
+      default:
+        res.status(400).json({ error: `Retry not implemented for type: ${op.type}` });
+        return;
+    }
+    res.json({ ok: true, originalOpId: op.id, newOpId, message: "Retry dispatched" });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
 
 // Health
 router.get("/health", async (_req: Request, res: Response) => {
@@ -44,8 +247,23 @@ router.get("/upwork/proposals", async (_req: Request, res: Response) => {
 // Trigger a cycle manually
 router.post("/upwork/scan", async (_req: Request, res: Response) => {
   logger.info("[api] Manual upwork scan triggered");
-  res.json({ ok: true, message: "Upwork scan queued" });
-  // Actual run happens async — trigger event or use queue
+  const opId = ops.createOp("scan_keywords", { source: "api" });
+  ops.startOp(opId);
+  res.json({ ok: true, message: "Upwork scan started", opId });
+
+  // Run async with tracking
+  (async () => {
+    try {
+      const { runProposalCycle } = await import("../client/Upwork");
+      // Import keywords/filters from index — they're module-level constants
+      // Use defaults since these aren't exported
+      ops.addStep(opId, "scan", "Running keyword search cycle");
+      await runProposalCycle([], {}, 5); // Will use internal defaults
+      ops.completeOp(opId, { source: "api" });
+    } catch (e) {
+      ops.failOp(opId, e as Error);
+    }
+  })();
 });
 
 router.post("/chrome/discover", async (_req: Request, res: Response) => {
@@ -239,19 +457,30 @@ router.post("/upwork/submit", async (req: Request, res: Response) => {
     };
 
     logger.info(`[api] Submit triggered for: ${job.title.slice(0, 50)}`);
-    res.json({ ok: true, message: "Submission started", jobId, title: job.title });
+    const opId = ops.createOp("submit_proposal", { jobId, title: job.title });
+    ops.startOp(opId);
+    res.json({ ok: true, message: "Submission started", jobId, title: job.title, opId });
 
     // Run async — don't block the response
     (async () => {
+      ops.addStep(opId, "update_status", "Marking as auto_sending");
       await cloud.updateProposalStatus(jobId, "auto_sending");
+      ops.completeStep(opId, "update_status");
+      ops.addStep(opId, "submit", "Filling and submitting proposal form");
       const ok = await submitProposal(job);
       await cloud.updateProposalStatus(jobId, ok ? "submitted" : "error");
+      if (ok) {
+        ops.completeStep(opId, "submit", "Submitted successfully");
+        ops.completeOp(opId, { submitted: true });
+      } else {
+        ops.failOp(opId, "Submission returned false — check browser logs");
+      }
       logger.info(`[api] Submit result for ${jobId}: ${ok ? "SUCCESS" : "FAILED"}`);
-      // Notify Telegram
       const emoji = ok ? "🚀" : "❌";
       const budget = job.budget ? ` | 💰 ${job.budget}` : "";
       await tg.notify(`${emoji} *Proposal ${ok ? "submitted" : "FAILED"}*\n${job.title.slice(0, 60)}${budget}\n🔗 ${job.url}`);
     })().catch(e => {
+      ops.failOp(opId, e as Error);
       logger.error(`[api] Submit error for ${jobId}: ${(e as Error).message}`);
       cloud.updateProposalStatus(jobId, "error").catch((e) => logger.error(`[api] Failed to mark ${jobId} as error: ${(e as Error).message}`));
       tg.notify(`❌ *Proposal submit crashed*\n${job.title.slice(0, 60)}\n${(e as Error).message.slice(0, 100)}`).catch(() => {});
@@ -264,14 +493,18 @@ router.post("/upwork/submit", async (req: Request, res: Response) => {
 // ── Notifications: check Upwork notifications and process them ──
 // GET /api/upwork/notifications
 router.get("/upwork/notifications", async (_req: Request, res: Response) => {
+  const opId = ops.createOp("check_notifications", { source: "api" });
   try {
     const { checkAndProcessNotifications } = await import("../client/Upwork");
     logger.info("[api] Notification check triggered");
+    ops.startOp(opId);
     const result = await checkAndProcessNotifications();
-    res.json(result);
+    ops.completeOp(opId, result);
+    res.json({ ...result, opId });
   } catch (e) {
+    ops.failOp(opId, e as Error);
     logger.error(`[api] Notification check error: ${(e as Error).message}`);
-    res.status(500).json({ error: (e as Error).message });
+    res.status(500).json({ error: (e as Error).message, opId });
   }
 });
 
@@ -282,8 +515,15 @@ router.post("/upwork/auto-submit", async (req: Request, res: Response) => {
   try {
     const { submitTopQueued } = await import("../client/Upwork");
     logger.info(`[api] Auto-submit triggered (target: ${target}/day)`);
-    res.json({ ok: true, message: `Auto-submit started (target: ${target}/day)` });
-    submitTopQueued(target).catch((e) => logger.error(`[api] Auto-submit error: ${(e as Error).message}`));
+    const opId = ops.createOp("auto_submit", { target });
+    ops.startOp(opId);
+    res.json({ ok: true, message: `Auto-submit started (target: ${target}/day)`, opId });
+    submitTopQueued(target)
+      .then(() => ops.completeOp(opId, { target }))
+      .catch((e) => {
+        ops.failOp(opId, e as Error);
+        logger.error(`[api] Auto-submit error: ${(e as Error).message}`);
+      });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }
