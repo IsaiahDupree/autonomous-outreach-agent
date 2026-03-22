@@ -167,8 +167,26 @@ export async function buildProposal(job: UpworkJob): Promise<UpworkJob> {
   return { ...job, coverLetter };
 }
 
+// Connects budget thresholds
+const MIN_CONNECTS_RESERVE = 50;   // warn below this
+const MIN_CONNECTS_CRITICAL = 20;  // refuse to submit below this
+
 export async function submitProposal(job: UpworkJob, opts?: { dryRun?: boolean }): Promise<boolean> {
   try {
+    // Connects budget check (skip for dry runs)
+    if (!opts?.dryRun) {
+      const connects = getConnectsRemaining();
+      if (connects !== null && connects < MIN_CONNECTS_CRITICAL) {
+        logger.warn(`[Upwork] Skipping submission — connects critically low (${connects})`);
+        await tg.notify(`⚠️ *Connects critically low: ${connects}*\nSkipping proposal for "${job.title.slice(0, 50)}"\nBuy more connects to resume submissions.`);
+        return false;
+      }
+      if (connects !== null && connects < MIN_CONNECTS_RESERVE) {
+        logger.warn(`[Upwork] Low connects warning: ${connects} remaining`);
+        await tg.notify(`⚠️ *Low connects: ${connects} remaining*\nSubmitting but running low. Consider buying more.`);
+      }
+    }
+
     // Regenerate cover letter if empty (e.g. queued jobs from before the fix)
     if (!job.coverLetter || job.coverLetter.trim().length === 0) {
       logger.info(`[Upwork] Cover letter empty for "${(job.title || "").slice(0, 50)}" — regenerating...`);
@@ -198,13 +216,21 @@ export async function submitProposal(job: UpworkJob, opts?: { dryRun?: boolean }
       return res.ok;
     }
     if (!opts?.dryRun && BROWSER_MODE === "safari") return false;
-    return await upworkBrowser.submitProposal(job.url, job.coverLetter || "", {
+    const result = await upworkBrowser.submitProposal(job.url, job.coverLetter || "", {
       dryRun: opts?.dryRun,
       milestones: job.bid ? [{ description: "Full project delivery", amount: job.bid }] : undefined,
       clientBudget: job.budget,
       jobTitle: job.title,
       jobDescription: job.description,
     });
+
+    // Track bid amount after successful submission
+    if (result && !opts?.dryRun && job.bid) {
+      await cloud.updateProposalBid(job.id, job.bid);
+      logger.info(`[Upwork] Tracked bid amount: $${job.bid} for ${job.id}`);
+    }
+
+    return result;
   } catch (e) {
     logger.error(`[Upwork] submitProposal error: ${(e as Error).message}`);
     return false;

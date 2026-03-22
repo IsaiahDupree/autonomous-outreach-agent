@@ -214,18 +214,33 @@
   "winningExamples": [
     {
       "style": "proof-first",
-      "description": "Led with existing GitHub repo that matched the job exactly",
-      "job": "Dockerized MongoDb Atlas search and FastAPI"
+      "description": "Led with existing GitHub repo (mongodb-atlas-search-api) that matched exactly — containerized FastAPI + MongoDB Atlas Search",
+      "job": "Dockerized MongoDB Atlas Search and FastAPI",
+      "outcome": "Won contract, delivered containerized search system with vector search + faceted e-commerce search"
     },
     {
       "style": "technical-depth",
-      "description": "Named exact hardware (RTX 4070), exact libraries (CuPy, Numba, PyTorch MPS)",
-      "job": "Convert CPU-based 2D CFD solver to GPU"
+      "description": "Named exact hardware (RTX 4070) and libraries (CuPy, Numba, PyTorch MPS) — showed GPU dev environment",
+      "job": "Convert CPU-based 2D CFD solver to GPU",
+      "outcome": "Won contract, achieved 50x speedup on computational fluid dynamics solver"
     },
     {
       "style": "structured-plan",
-      "description": "Numbered steps with specific deliverables, named exact tools",
-      "job": "AI Voice File Transformation"
+      "description": "Numbered steps with specific deliverables, named ElevenLabs + OpenAI for voice pipeline",
+      "job": "AI Automation Expert Needed for Voice File Transformation",
+      "outcome": "Won contract, automated multi-language voice pipeline"
+    },
+    {
+      "style": "domain-expert",
+      "description": "Referenced aerospace engineering background + MATLAB simulation expertise",
+      "job": "MATLAB Engineering Support Needed",
+      "outcome": "Won contract, delivered engineering analysis tools"
+    },
+    {
+      "style": "hardware-proof",
+      "description": "Referenced tactile-comm-device GitHub repo with Arduino/ESP32/VS1053/PCF8575",
+      "job": "Build Custom Touch-to-Speech Device with Tactile Letter Buttons",
+      "outcome": "Won contract, shipped custom PCB + firmware for assistive communication device"
     }
   ],
   "upwork": {

@@ -10,45 +10,41 @@ import logger from "./config/logger";
 import { shutdown } from "./services";
 import { notify } from "./services/telegram";
 import app from "./app";
-import { initAgent } from "./Agent/index";
+import { initAgent, proactiveTokenRefresh } from "./Agent/index";
 import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics, submitTopQueued, checkAndProcessNotifications } from "./client/Upwork";
+import * as cloud from "./services/cloud";
 import { runDiscoveryCycle } from "./client/Chrome";
 import { PORT, BROWSER_MODE } from "./secret";
 import { engine } from "./browser";
 import cron from "node-cron";
 import * as control from "./services/process-control";
 import * as ops from "./services/operations";
+import { startController, stopController } from "./controller";
 
-// Upwork search keywords — 10 niches × 2-3 variations each
+// Upwork search keywords — consolidated to ~30 high-signal terms (reduced from 55)
 const UPWORK_KEYWORDS = [
-  // Niche 1: AI/LLM automation
-  "AI automation", "LLM integration", "AI workflow",
-  // Niche 2: Claude/OpenAI/GPT
-  "Claude API", "OpenAI API", "GPT integration",
-  // Niche 3: Python automation/scripting
-  "Python automation", "Python script", "Python developer automation",
-  // Niche 4: Web scraping & data extraction
-  "web scraping", "data extraction", "web crawler",
-  // Niche 5: Chatbot / AI agent
-  "AI chatbot", "AI agent", "chatbot development",
-  // Niche 6: Marketing automation / CRM
-  "marketing automation", "CRM automation", "email automation",
-  // Niche 7: Workflow / no-code automation
-  "n8n automation", "zapier automation", "workflow automation", "make.com",
-  // Niche 8: Data pipeline / ETL
-  "data pipeline", "ETL pipeline", "data integration",
-  // Niche 9: Mobile app development
-  "mobile app development", "react native app", "flutter app", "cross platform app",
-  // Niche 10: Full stack / SaaS / MVP
-  "full stack app", "SaaS MVP", "full stack developer", "MVP development",
-  // Niche 11: Web app development
-  "web app development", "web application", "dashboard development", "admin panel",
-  // Niche 12: Voice AI / Audio
-  "elevenlabs", "11labs", "voice ai", "text to speech", "voice cloning", "voice agent",
-  // Niche 13: CAD / 3D Design
-  "CAD design", "3D modeling", "AutoCAD", "SolidWorks", "Fusion 360", "CAD automation",
-  // Niche 14: Arduino / Embedded / IoT
-  "Arduino", "ESP32", "Raspberry Pi", "IoT development", "embedded systems", "microcontroller",
+  // AI/LLM (core niche)
+  "AI automation", "AI agent", "Claude API",
+  // Python
+  "Python automation", "web scraping",
+  // Chatbot
+  "AI chatbot", "chatbot development",
+  // Marketing/CRM
+  "CRM automation", "email automation",
+  // Workflow/No-code
+  "n8n automation", "workflow automation",
+  // Data
+  "data pipeline", "data extraction",
+  // Mobile
+  "mobile app development", "react native app", "flutter app",
+  // Full stack / SaaS
+  "full stack developer", "SaaS MVP", "web application",
+  // Voice AI
+  "voice ai", "text to speech", "elevenlabs",
+  // CAD / 3D
+  "CAD design", "SolidWorks", "Fusion 360",
+  // IoT / Embedded
+  "Arduino", "ESP32", "Raspberry Pi", "embedded systems",
 ];
 
 // Default filters — loosened to maximize job volume
@@ -259,10 +255,10 @@ async function startServer() {
   //   await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
   // });
 
-  // Auto-submit top queued proposals every 12 hours to meet daily minimum (2/day)
-  // Runs at 8 AM and 8 PM UTC — picks highest-scoring queued jobs
-  const DAILY_SUBMIT_TARGET = 2;
-  cron.schedule("0 8,20 * * *", async () => {
+  // Auto-submit top queued proposals every 8 hours to meet daily minimum (8/day)
+  // Runs at 8 AM, 2 PM, and 8 PM UTC — picks highest-scoring queued jobs
+  const DAILY_SUBMIT_TARGET = 8;
+  cron.schedule("0 8,14,20 * * *", async () => {
     if (!control.isActive()) { logger.info("[cron] Skipped auto-submit (agent paused/stopped)"); return; }
     if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped auto-submit (submitting paused)"); return; }
     logger.info("[cron] Auto-submit top queued (daily minimum)");
@@ -281,6 +277,38 @@ async function startServer() {
     });
   });
 
+  // Expire stale queued/error jobs daily at 6 AM UTC — keeps the queue fresh
+  cron.schedule("0 6 * * *", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Expiring stale jobs (>72h old)");
+    await ops.trackedSafe("expire_stale", { source: "cron" }, async () => {
+      const count = await cloud.expireStaleJobs();
+      logger.info(`[cron] Expired ${count} stale jobs`);
+      if (count > 0) await notify(`🧹 Expired ${count} stale queued/error jobs (>72h old)`);
+    });
+  });
+
+  // Auto-retry recent error jobs every 6 hours — requeue errors <48h old
+  cron.schedule("0 3,9,15,21 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped error retry (agent paused/stopped)"); return; }
+    logger.info("[cron] Requeuing recent error jobs (<48h old)");
+    await ops.trackedSafe("requeue_errors", { source: "cron" }, async () => {
+      const count = await cloud.requeueRecentErrors();
+      logger.info(`[cron] Requeued ${count} error jobs for retry`);
+      if (count > 0) await notify(`🔄 Requeued ${count} recent error jobs for retry`);
+    });
+  });
+
+  // Proactive OAuth token refresh every 4 hours — keeps token fresh during quiet periods
+  cron.schedule("0 */4 * * *", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Proactive OAuth token refresh");
+    const ok = await proactiveTokenRefresh();
+    if (!ok) {
+      await notify("⚠️ *OAuth token refresh failed*\nAgent may lose API access. Check credentials.");
+    }
+  });
+
   // Daily metrics report at 9 AM (runs even when paused — it's read-only)
   cron.schedule("0 9 * * *", async () => {
     if (control.getState() === "stopped" || control.getState() === "stopping") return;
@@ -290,8 +318,19 @@ async function startServer() {
     });
   });
 
+  // Start the autonomous controller (Claude-powered decision loop)
+  try {
+    const { getClient } = await import("./Agent");
+    const client = getClient();
+    startController(client);
+    logger.info("[startup] Autonomous controller started");
+  } catch (e) {
+    logger.warn(`[startup] Controller not started: ${(e as Error).message}`);
+  }
+
   // Register cleanup for graceful stop (via API, Telegram, or signal)
   control.onStop(async () => {
+    stopController();
     await engine.close();
     shutdown(server);
   });

@@ -438,6 +438,82 @@ export async function getPlusInsightsData(): Promise<Record<string, unknown>[]> 
   }
 }
 
+/**
+ * Expire stale queued/error jobs that are older than 72 hours.
+ * Returns the count of expired rows.
+ */
+export async function expireStaleJobs(): Promise<number> {
+  try {
+    const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+    // Get queued/error jobs older than cutoff
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(queued,error)&created_at=lt.${cutoff}`,
+      {
+        method: "PATCH",
+        headers: { ...supabaseHeaders(), Prefer: "return=representation,count=exact" },
+        body: JSON.stringify({ status: "expired" }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] expireStaleJobs failed: ${res.status}`);
+      return 0;
+    }
+    const rows = await res.json() as unknown[];
+    return rows.length;
+  } catch (e) {
+    logger.error(`[Cloud] expireStaleJobs error: ${(e as Error).message}`);
+    return 0;
+  }
+}
+
+/**
+ * Requeue error-status jobs that are less than 48 hours old.
+ * Returns the count of requeued rows.
+ */
+export async function requeueRecentErrors(): Promise<number> {
+  try {
+    const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=eq.error&created_at=gt.${cutoff}`,
+      {
+        method: "PATCH",
+        headers: { ...supabaseHeaders(), Prefer: "return=representation,count=exact" },
+        body: JSON.stringify({ status: "queued" }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] requeueRecentErrors failed: ${res.status}`);
+      return 0;
+    }
+    const rows = await res.json() as unknown[];
+    return rows.length;
+  } catch (e) {
+    logger.error(`[Cloud] requeueRecentErrors error: ${(e as Error).message}`);
+    return 0;
+  }
+}
+
+/**
+ * Update the bid amount for a submitted proposal.
+ */
+export async function updateProposalBid(jobId: string, bid: number): Promise<void> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${jobId}`,
+      {
+        method: "PATCH",
+        headers: supabaseHeaders(),
+        body: JSON.stringify({ submitted_bid_amount: bid }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] updateProposalBid failed (${res.status}) for ${jobId}`);
+    }
+  } catch (e) {
+    logger.error(`[Cloud] updateProposalBid error for ${jobId}: ${(e as Error).message}`);
+  }
+}
+
 export async function getContentBriefs(type?: string, limit = 10): Promise<Record<string, unknown>[]> {
   try {
     const params = new URLSearchParams({ order: "created_at.desc", limit: String(limit) });

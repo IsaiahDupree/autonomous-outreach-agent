@@ -21,7 +21,9 @@ export type OpType =
   | "analytics"
   | "metrics"
   | "content_brief"
-  | "snapshot";
+  | "snapshot"
+  | "expire_stale"
+  | "requeue_errors";
 
 export type OpStatus = "pending" | "running" | "success" | "failed" | "cancelled";
 

@@ -62,6 +62,29 @@ function makeOAuthClient(token: string): Anthropic {
   });
 }
 
+/**
+ * Proactive token refresh — call periodically to keep OAuth token fresh.
+ * Returns true if token is valid (refreshed or still good), false on failure.
+ */
+export async function proactiveTokenRefresh(): Promise<boolean> {
+  try {
+    if (!fs.existsSync(CRED_PATH)) return false;
+    const creds = JSON.parse(fs.readFileSync(CRED_PATH, "utf-8"));
+    const oauth = creds.claudeAiOauth;
+    if (!oauth?.refreshToken) return false;
+    const needsRefresh = !oauth.expiresAt || oauth.expiresAt - Date.now() < TOKEN_REFRESH_BUFFER_MS * 2;
+    if (!needsRefresh) {
+      logger.info(`[Agent] OAuth token still valid — expires ${new Date(oauth.expiresAt).toISOString()}`);
+      return true;
+    }
+    const refreshed = await refreshOAuthToken(oauth.refreshToken);
+    return !!refreshed;
+  } catch (e) {
+    logger.error(`[Agent] proactiveTokenRefresh error: ${(e as Error).message}`);
+    return false;
+  }
+}
+
 export async function getClientAsync(): Promise<Anthropic> {
   // 1. Try Claude Code OAuth credentials (auto-refresh if expired)
   try {
@@ -96,7 +119,7 @@ export async function getClientAsync(): Promise<Anthropic> {
 }
 
 // Synchronous version for backwards compat — uses cached token without refresh
-function getClient(): Anthropic {
+export function getClient(): Anthropic {
   try {
     if (fs.existsSync(CRED_PATH)) {
       const creds = JSON.parse(fs.readFileSync(CRED_PATH, "utf-8"));
@@ -316,8 +339,8 @@ RULES:
 - Return ONLY the cover letter text, no preamble`;
 
   const msg = await (await getClientAsync()).messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 600,
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 800,
     messages: [{ role: "user", content: prompt }],
   });
 

@@ -12,6 +12,7 @@ import { getConnectsRemaining } from "../browser/upwork";
 import * as tg from "../services/telegram";
 import * as control from "../services/process-control";
 import * as ops from "../services/operations";
+import * as controller from "../controller";
 
 const router = Router();
 
@@ -214,6 +215,57 @@ router.post("/ops/:id/retry", async (req: Request, res: Response) => {
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }
+});
+
+// ── Controller ──
+
+// GET /api/controller/status — Controller state + recent decisions
+router.get("/controller/status", (_req: Request, res: Response) => {
+  res.json(controller.getControllerStatus());
+});
+
+// GET /api/controller/decisions — Full decision log
+router.get("/controller/decisions", (_req: Request, res: Response) => {
+  res.json(controller.getDecisionLog());
+});
+
+// POST /api/controller/cycle — Run a single decision cycle on demand
+router.post("/controller/cycle", async (_req: Request, res: Response) => {
+  try {
+    const decision = await controller.runOneCycle();
+    res.json({ ok: true, decision });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// POST /api/controller/start — Start the controller loop
+router.post("/controller/start", (_req: Request, res: Response) => {
+  if (controller.isRunning()) {
+    res.json({ ok: true, message: "Controller already running" });
+    return;
+  }
+  // Controller needs a Claude client — lazy-import from Agent module
+  (async () => {
+    try {
+      const { getClient } = await import("../Agent");
+      const client = getClient();
+      if (!client) {
+        res.status(503).json({ error: "Claude client not initialized — run initAgent first" });
+        return;
+      }
+      controller.startController(client);
+      res.json({ ok: true, message: "Controller started" });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  })();
+});
+
+// POST /api/controller/stop — Stop the controller loop
+router.post("/controller/stop", (_req: Request, res: Response) => {
+  controller.stopController();
+  res.json({ ok: true, message: "Controller stopped" });
 });
 
 // Health
