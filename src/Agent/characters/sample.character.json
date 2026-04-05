@@ -12,13 +12,28 @@
     "painPoints": ["manual execution work", "no time to build automations", "need more leads"]
   },
   "portfolio": {
-    "url": "https://isaiah-portfolio.com",
+    "url": "https://dupreeops-portfolio.vercel.app",
     "label": "See similar work I've delivered",
+    "nicheAnchors": {
+      "smma": { "anchor": "#niche-smma", "keywords": ["marketing", "social media", "smma", "lead gen", "outreach", "instagram", "facebook", "ads", "agency"] },
+      "ecommerce": { "anchor": "#niche-ecommerce", "keywords": ["ecommerce", "e-commerce", "shopify", "stripe", "product", "store", "dtc", "amazon", "whop"] },
+      "content": { "anchor": "#niche-content", "keywords": ["content", "video", "youtube", "tiktok", "creator", "media", "podcast", "blog", "cms"] },
+      "iot": { "anchor": "#niche-iot", "keywords": ["iot", "arduino", "esp32", "raspberry", "hardware", "embedded", "sensor", "motor", "can bus", "firmware"] },
+      "saas": { "anchor": "#niche-saas", "keywords": ["saas", "mvp", "startup", "full stack", "web app", "react", "next", "api", "dashboard", "platform"] },
+      "government": { "anchor": "#niche-government", "keywords": ["government", "enterprise", "compliance", "tender", "rfp", "procurement", "public sector"] },
+      "realestate": { "anchor": "#niche-realestate", "keywords": ["real estate", "property", "listing", "crm", "local business", "lead", "booking"] },
+      "research": { "anchor": "#niche-research", "keywords": ["research", "engineering", "matlab", "simulation", "data", "analysis", "scientific", "cfd", "fea", "gpu"] }
+    },
     "templates": {
-      "ai-automation": "I recently built a similar AI automation pipeline — here's a quick look at my relevant work: {url}",
-      "mobile-app": "I've shipped production mobile apps with this exact stack — portfolio & case studies: {url}",
-      "web-scraping": "I've built robust scrapers handling millions of records — see examples: {url}",
-      "default": "You can see relevant examples of my work here: {url}"
+      "smma": "I've built AI-powered lead generation and social media automation systems for agencies just like yours — see exactly what I've delivered and how it could transform your workflow: {url}",
+      "ecommerce": "I've built automated product pipelines, AI ad platforms, and e-commerce integrations — here's a tailored look at how I'd approach your project: {url}",
+      "content": "I've shipped AI video creation pipelines, automated content workflows, and creator tools — see the exact systems I've built: {url}",
+      "iot": "I've designed and shipped real hardware projects — from custom PCBs to IoT sensor networks. Here's proof of exactly this kind of work: {url}",
+      "saas": "I've built full-stack SaaS products from zero to production — here's a portfolio tailored to your tech stack showing what your product could look like: {url}",
+      "government": "I've built government tender tracking and enterprise compliance tools — here's how I've solved problems exactly like yours: {url}",
+      "realestate": "I've built CRM systems, lead gen automation, and local business tools — see how these solutions could work for your business: {url}",
+      "research": "I've shipped MATLAB simulations, GPU-accelerated solvers, and scientific data pipelines — here's relevant engineering work I've delivered: {url}",
+      "default": "I put together a tailored portfolio page showing projects relevant to your needs — take a look at what your project could look like: {url}"
     }
   },
   "github": {
@@ -211,6 +226,141 @@
       }
     }
   },
+  "showcaseProjects": [
+    {
+      "name": "Voice AI Agent",
+      "description": "Production voice AI agent with real-time speech-to-text, intent detection, and natural voice responses. Live demo you can talk to right now.",
+      "liveUrl": "https://voice-ai-agent-roan.vercel.app",
+      "keywords": ["voice", "ai agent", "speech", "tts", "vapi", "elevenlabs", "conversational", "call center", "phone"],
+      "niche": "smma",
+      "featured": true
+    },
+    {
+      "name": "RAG Chatbot Starter",
+      "description": "AI chatbot with retrieval-augmented generation — upload docs, ask questions, get accurate answers with source citations. Production-ready with auth and rate limiting.",
+      "liveUrl": "https://rag-chatbot-starter.vercel.app",
+      "keywords": ["chatbot", "rag", "ai", "knowledge base", "document", "qa", "customer support", "openai", "embeddings"],
+      "niche": "saas",
+      "featured": true
+    },
+    {
+      "name": "SaaS MVP Full-Stack",
+      "description": "Complete SaaS starter with auth, billing (Stripe), dashboard, API, and admin panel. Ships in days, not months. Live demo with full Stripe integration.",
+      "liveUrl": "https://saas-mvp-fullstack.vercel.app",
+      "keywords": ["saas", "mvp", "stripe", "billing", "dashboard", "auth", "full stack", "next", "react", "startup", "web app"],
+      "niche": "saas",
+      "featured": true
+    },
+    {
+      "name": "Content AI Pipeline",
+      "description": "End-to-end content automation: research, write, edit, publish. Generates blog posts, social captions, and video scripts with AI — then publishes to CMS automatically.",
+      "liveUrl": "https://content-ai-pipeline-isaiahduprees-projects.vercel.app",
+      "keywords": ["content", "blog", "writing", "ai content", "cms", "publishing", "social media", "copywriting", "seo"],
+      "niche": "content",
+      "featured": true
+    },
+    {
+      "name": "AgentLite",
+      "description": "Lightweight AI agent framework — build custom agents with tool use, memory, and multi-step reasoning. Production-deployed with monitoring dashboard.",
+      "liveUrl": "https://agentlite.vercel.app",
+      "keywords": ["ai agent", "agent", "tool use", "claude", "openai", "multi-step", "reasoning", "automation", "framework"],
+      "niche": "saas"
+    },
+    {
+      "name": "CRMLite",
+      "description": "Full CRM with contact management, deal pipeline, email tracking, and AI-powered lead scoring. Mobile-responsive with real-time updates.",
+      "liveUrl": "https://crmlite-black.vercel.app",
+      "keywords": ["crm", "lead", "pipeline", "contact", "sales", "deal", "email", "lead scoring", "customer"],
+      "niche": "saas"
+    },
+    {
+      "name": "CRM Lead Gen",
+      "description": "Automated lead generation system with prospecting, scoring, and outreach sequences. Finds and qualifies leads on autopilot.",
+      "liveUrl": "https://crm-lead-gen.vercel.app",
+      "keywords": ["lead gen", "lead generation", "prospecting", "outreach", "scoring", "crm", "automation", "sales", "b2b"],
+      "niche": "smma"
+    },
+    {
+      "name": "Workflow Engine",
+      "description": "Visual workflow builder — drag-and-drop automation with conditional logic, API integrations, and scheduled triggers. Like n8n but custom-built.",
+      "liveUrl": "https://workflow-engine-blush.vercel.app",
+      "keywords": ["workflow", "automation", "n8n", "zapier", "integration", "api", "trigger", "pipeline", "no-code"],
+      "niche": "saas"
+    },
+    {
+      "name": "VAPI Voice Demo",
+      "description": "Interactive voice AI demo using VAPI — call the AI, have a conversation, see real-time transcription. Production telephony integration.",
+      "liveUrl": "https://vapi-demo-psi.vercel.app",
+      "keywords": ["voice", "vapi", "telephony", "phone", "call", "speech", "ai", "demo", "real-time"],
+      "niche": "smma"
+    },
+    {
+      "name": "MatrixLoop",
+      "description": "Analytics and coaching layer for social platforms. Track growth, analyze engagement patterns, and get AI-powered recommendations for content strategy.",
+      "liveUrl": "https://matrixloop.app",
+      "keywords": ["analytics", "social media", "growth", "engagement", "coaching", "instagram", "tiktok", "metrics"],
+      "niche": "smma"
+    },
+    {
+      "name": "Authority OS",
+      "description": "Personal branding and authority-building platform. Content calendar, audience analytics, and automated publishing across LinkedIn, Twitter, and newsletters.",
+      "liveUrl": "https://authority-os-iota.vercel.app",
+      "keywords": ["personal brand", "authority", "linkedin", "twitter", "newsletter", "content calendar", "publishing"],
+      "niche": "content"
+    },
+    {
+      "name": "iOS App Showcase",
+      "description": "Native iOS app with SwiftUI, push notifications, and App Store deployment. Production app with real users.",
+      "liveUrl": "https://ios-app-lac.vercel.app",
+      "keywords": ["ios", "mobile", "swift", "app store", "iphone", "apple", "react native", "mobile app"],
+      "niche": "saas"
+    },
+    {
+      "name": "Touch-to-Speech Device",
+      "description": "Arduino-based accessibility device with large tactile buttons for individuals with PSP. Plays custom audio messages through speakers.",
+      "keywords": ["arduino", "hardware", "accessibility", "speech", "iot", "embedded", "pcb", "firmware"],
+      "niche": "iot"
+    },
+    {
+      "name": "CAN Bus Signal Controller",
+      "description": "WiFi-enabled automotive CAN bus controller. Manage brake lights, turn signals, and hazards via web interface. Real hardware-to-cloud integration.",
+      "keywords": ["can bus", "automotive", "wifi", "controller", "hardware", "iot", "embedded"],
+      "niche": "iot"
+    },
+    {
+      "name": "Austender Gov Tracker",
+      "description": "AI-powered government tender tracker scraping Austender, ANI, ICN, and US SAM. Advanced filtering, email alerts, and interactive dashboard.",
+      "keywords": ["government", "tender", "scraping", "dashboard", "compliance", "procurement", "rfp", "react"],
+      "niche": "government"
+    },
+    {
+      "name": "Schumann Resonance Analyzer",
+      "description": "Scientific data pipeline fetching from Tomsk State University, OCR extraction from instrument images, statistical analysis, and interactive web visualization.",
+      "keywords": ["science", "data", "ocr", "analysis", "visualization", "research", "pipeline", "python"],
+      "niche": "research"
+    },
+    {
+      "name": "AdLite",
+      "description": "AI-powered ad creative generator and campaign manager. Generates copy, images, and A/B test variations for Meta and Google Ads.",
+      "liveUrl": "https://adlite-isaiahduprees-projects.vercel.app",
+      "keywords": ["ads", "meta", "google ads", "ad creative", "campaign", "marketing", "a/b test", "copywriting"],
+      "niche": "smma"
+    },
+    {
+      "name": "ResearchLite",
+      "description": "AI research assistant — deep web research, source synthesis, and formatted reports. Perplexity-style research with custom prompts.",
+      "liveUrl": "https://researchlite.vercel.app",
+      "keywords": ["research", "analysis", "perplexity", "web search", "report", "synthesis", "data", "ai"],
+      "niche": "research"
+    },
+    {
+      "name": "BlankLogo",
+      "description": "AI logo and brand identity generator. Creates logos, color palettes, and brand guidelines from a text description.",
+      "liveUrl": "https://www.blanklogo.app",
+      "keywords": ["logo", "branding", "design", "ai", "brand identity", "graphic design", "creative"],
+      "niche": "content"
+    }
+  ],
   "winningExamples": [
     {
       "style": "proof-first",

@@ -519,24 +519,149 @@ async function scrapeCurrentPage(page: Page, limit: number): Promise<ScrapedJob[
 }
 
 let _loggedIn = false;
+let _lastSessionCheck = 0;
+const SESSION_CHECK_INTERVAL_MS = 10 * 60 * 1000; // Re-verify session every 10 minutes
+
+/** Reset the login flag — forces ensureLoggedIn to re-check on next call */
+export function invalidateSession(): void {
+  _loggedIn = false;
+  _lastSessionCheck = 0;
+  logger.info("[Browser/Upwork] Session invalidated — will re-check login on next operation");
+}
+
+/**
+ * Check if the current Upwork session is still valid.
+ * Navigates to a lightweight API endpoint and checks for login redirect.
+ * Returns true if session is alive, false if signed out.
+ */
+export async function checkSessionHealth(): Promise<{ valid: boolean; detail: string }> {
+  try {
+    const b = await launch();
+    const pages = await b.pages();
+    const page = pages.find(p => p.url().includes("upwork.com") && !p.url().includes("login")) || pages[0];
+    if (!page) return { valid: false, detail: "No browser page available" };
+
+    // Check the current page for login indicators without navigating
+    const checks = await page.evaluate(() => {
+      const url = window.location.href;
+      const body = document.body?.innerText?.slice(0, 3000) || "";
+      const hasLoginLink = !!document.querySelector('a[href*="login"], a[href*="account-security/login"]');
+      const hasSignupLink = !!document.querySelector('a[href*="signup"], a[href*="sign-up"]');
+      const hasLoginText = body.includes("Log in to Upwork") || body.includes("Log In");
+      const hasSignupText = body.includes("Sign up") || body.includes("Sign Up");
+      const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar, img[alt*="avatar"]');
+      const hasNavMenu = !!document.querySelector('[data-test="nav-dropdown"], .nav-d-account, .dropdown-toggle, .fe-navbar-user');
+      const isOnLoginPage = url.includes("/login") || url.includes("account-security");
+      const isOnCF = document.title.includes("Just a moment") || document.title.includes("Checking");
+      return { url, hasLoginLink, hasSignupLink, hasLoginText, hasSignupText, hasAvatar, hasNavMenu, isOnLoginPage, isOnCF, title: document.title };
+    }).catch(() => null);
+
+    if (!checks) return { valid: false, detail: "Could not evaluate page state" };
+
+    // Definitely signed out
+    if (checks.isOnLoginPage) {
+      _loggedIn = false;
+      return { valid: false, detail: `On login page: ${checks.url.slice(0, 80)}` };
+    }
+    if (checks.isOnCF) {
+      return { valid: false, detail: "Stuck on Cloudflare challenge" };
+    }
+    if ((checks.hasLoginText || checks.hasSignupText || checks.hasSignupLink || checks.hasLoginLink) && !checks.hasAvatar && !checks.hasNavMenu) {
+      _loggedIn = false;
+      return { valid: false, detail: `Signed out — login=${checks.hasLoginLink}, signup=${checks.hasSignupLink}, no avatar/nav` };
+    }
+
+    // Definitely signed in
+    if (checks.hasAvatar || checks.hasNavMenu) {
+      _loggedIn = true; _lastSessionCheck = Date.now();
+      _lastSessionCheck = Date.now();
+      return { valid: true, detail: "Session valid — avatar/nav menu present" };
+    }
+
+    // Ambiguous — do a lightweight navigation check
+    // Hit the /my-stats/ page which redirects to login if not authenticated
+    const testUrl = "https://www.upwork.com/nx/find-work/";
+    await page.goto(testUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await new Promise(r => setTimeout(r, 2000));
+
+    const afterUrl = page.url();
+    if (afterUrl.includes("login") || afterUrl.includes("account-security")) {
+      _loggedIn = false;
+      return { valid: false, detail: `Redirected to login: ${afterUrl.slice(0, 80)}` };
+    }
+
+    // Check for avatar after navigation
+    const hasAvatar = await page.$('[data-test="avatar"], .nav-avatar, .user-avatar').catch(() => null);
+    if (hasAvatar) {
+      _loggedIn = true; _lastSessionCheck = Date.now();
+      _lastSessionCheck = Date.now();
+      return { valid: true, detail: "Session valid after navigation check" };
+    }
+
+    _loggedIn = false;
+    return { valid: false, detail: `No clear login indicators on ${afterUrl.slice(0, 80)}` };
+  } catch (e) {
+    return { valid: false, detail: `Session check error: ${(e as Error).message}` };
+  }
+}
 
 /**
  * Ensure we're logged into Upwork. Navigates to login page if needed.
+ * Now also periodically re-validates the session (every 10 min).
  */
 async function ensureLoggedIn(page: Page): Promise<boolean> {
-  if (_loggedIn) return true;
+  // If session was validated recently, trust it
+  if (_loggedIn && (Date.now() - _lastSessionCheck) < SESSION_CHECK_INTERVAL_MS) return true;
 
-  // Check if already logged in by looking for "Log in" link
-  const loginLink = await page.$('a[href*="login"][data-test], a.nav-right-item[href*="login"]');
-  const loginText = await page.evaluate(() => {
-    const el = document.querySelector('a[href*="login"]');
-    return el?.textContent?.trim() || "";
-  }).catch(() => "");
+  // If _loggedIn is true but stale, do a quick page check
+  if (_loggedIn) {
+    const quickCheck = await page.evaluate(() => {
+      const hasSignup = !!document.querySelector('a[href*="signup"]');
+      const hasLogin = !!document.querySelector('a[href*="login"]');
+      const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar');
+      const hasUserMenu = !!document.querySelector('.nav-d-account, [data-test="nav-dropdown"], .fe-navbar-user');
+      return { signedOut: hasSignup || hasLogin, signedIn: hasAvatar || hasUserMenu };
+    }).catch(() => ({ signedOut: false, signedIn: false }));
 
-  if (!loginLink && !loginText.toLowerCase().includes("log in")) {
-    _loggedIn = true;
+    if (quickCheck.signedIn && !quickCheck.signedOut) {
+      _lastSessionCheck = Date.now();
+      return true;
+    }
+    // Session expired — reset and fall through to full login
+    logger.warn("[Browser/Upwork] Session appears expired — re-authenticating");
+    _loggedIn = false;
+  }
+
+  // Check if already logged in — look for BOTH "Log in" AND "Sign up" indicators
+  // Upwork shows "Sign up" (not "Log in") when fully signed out
+  const signedOutIndicator = await page.evaluate(() => {
+    const signupLink = document.querySelector('a[href*="signup"], a[href*="sign-up"]');
+    const loginLink = document.querySelector('a[href*="login"], a[href*="account-security"]');
+    const bodyText = document.body?.innerText?.slice(0, 1000) || "";
+    const hasSignUp = !!signupLink || bodyText.includes("Sign up") || bodyText.includes("Sign Up");
+    const hasLogIn = !!loginLink || bodyText.includes("Log in") || bodyText.includes("Log In");
+    // Positive signals: avatar or user nav menu = definitely logged in
+    const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar, img[alt*="avatar"]');
+    const hasUserMenu = !!document.querySelector('.nav-d-account, [data-test="nav-dropdown"], .fe-navbar-user');
+    return { hasSignUp, hasLogIn, hasAvatar, hasUserMenu };
+  }).catch(() => ({ hasSignUp: false, hasLogIn: false, hasAvatar: false, hasUserMenu: false }));
+
+  // If we see avatar or user menu, we're definitely logged in
+  if (signedOutIndicator.hasAvatar || signedOutIndicator.hasUserMenu) {
+    _loggedIn = true; _lastSessionCheck = Date.now();
     return true;
   }
+
+  // If no sign-out indicators and no positive indicators, check URL
+  if (!signedOutIndicator.hasSignUp && !signedOutIndicator.hasLogIn) {
+    // Ambiguous — might be a non-nav page. Trust it cautiously.
+    _loggedIn = true; _lastSessionCheck = Date.now();
+    return true;
+  }
+
+  // We see "Sign up" or "Log in" without avatar — we're signed out
+  logger.info(`[Browser/Upwork] Signed out detected (signup=${signedOutIndicator.hasSignUp}, login=${signedOutIndicator.hasLogIn})`);
+
 
   // Try restoring saved cookies before doing a full login
   if (hasSavedCookies()) {
@@ -546,14 +671,19 @@ async function ensureLoggedIn(page: Page): Promise<boolean> {
       // Reload page to apply cookies
       await page.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
       await humanDelay(1500, 2500);
-      // Check login state again
+      // Check login state again — look for Sign up AND Log in (Upwork shows "Sign up" when signed out)
       const stillNeedsLogin = await page.evaluate(() => {
-        const el = document.querySelector('a[href*="login"]');
-        return el?.textContent?.trim().toLowerCase().includes("log in") || false;
+        const hasSignup = !!document.querySelector('a[href*="signup"]');
+        const hasLogin = !!document.querySelector('a[href*="login"]');
+        const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar');
+        const hasUserMenu = !!document.querySelector('.nav-d-account, [data-test="nav-dropdown"], .fe-navbar-user');
+        // Signed in if we have avatar/menu, signed out if we see signup/login links
+        if (hasAvatar || hasUserMenu) return false; // not needs login
+        return hasSignup || hasLogin;
       }).catch(() => true);
       if (!stillNeedsLogin) {
         logger.info("[Browser/Upwork] Session restored from cookies — no login needed!");
-        _loggedIn = true;
+        _loggedIn = true; _lastSessionCheck = Date.now();
         return true;
       }
       logger.info("[Browser/Upwork] Saved cookies expired — proceeding with full login");
@@ -588,7 +718,7 @@ async function ensureLoggedIn(page: Page): Promise<boolean> {
 
   const ok = await handleLogin(loginPage);
   if (ok) {
-    _loggedIn = true;
+    _loggedIn = true; _lastSessionCheck = Date.now();
     logger.info("[Browser/Upwork] Login confirmed");
     // Save cookies for future sessions
     const b3 = await launch();
@@ -737,8 +867,9 @@ export async function searchJobs(
     // Check for "can't complete" / "Log in" / empty results
     const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => "");
     // Log abbreviated page text for debugging
-    if (pageText.includes("can't complete") || pageText.includes("Log in to Upwork")) {
+    if (pageText.includes("can't complete") || pageText.includes("Log in to Upwork") || (pageText.includes("Sign up") && !pageText.includes("My Stats"))) {
       logger.warn(`[Browser/Upwork] Page shows error or login required for "${keyword}"`);
+      _loggedIn = false; _lastSessionCheck = 0; // Invalidate session
       // Try logging in
       const loginLink = await page.$('a[href*="login"], button:has-text("Log In")');
       if (loginLink) {

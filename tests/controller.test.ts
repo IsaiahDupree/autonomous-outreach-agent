@@ -95,12 +95,14 @@ describe("Controller Tools", () => {
     expect(names).toContain("pause_agent");
     expect(names).toContain("resume_agent");
     expect(names).toContain("send_notification");
-    expect(names.length).toBe(9);
+    expect(names).toContain("get_daily_plan");
+    expect(names).toContain("generate_proof");
+    expect(names.length).toBe(11);
   });
 
   it("should convert tools to Claude API format", () => {
     const claudeTools = toClaudeTools();
-    expect(claudeTools.length).toBe(9);
+    expect(claudeTools.length).toBe(11);
     for (const tool of claudeTools) {
       expect(tool).toHaveProperty("name");
       expect(tool).toHaveProperty("description");

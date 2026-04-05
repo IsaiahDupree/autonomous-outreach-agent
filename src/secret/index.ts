@@ -34,3 +34,5 @@ export const BROWSER_HEADLESS = process.env.BROWSER_HEADLESS !== "false";
 export const AUTO_SEND = process.env.AUTO_SEND === "true";
 export const AUTO_SEND_MIN_SCORE = parseInt(process.env.AUTO_SEND_MIN_SCORE || "7");
 export const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY || "";
+export const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
+export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";

@@ -23,7 +23,9 @@ export type OpType =
   | "content_brief"
   | "snapshot"
   | "expire_stale"
-  | "requeue_errors";
+  | "requeue_errors"
+  | "daily_plan"
+  | "proof_generation";
 
 export type OpStatus = "pending" | "running" | "success" | "failed" | "cancelled";
 

@@ -213,6 +213,26 @@ export async function proposalExists(jobId: string): Promise<boolean> {
   }
 }
 
+/**
+ * Batch check which job IDs already exist in proposals.
+ * Returns a Set of IDs that exist. Single query instead of N+1.
+ */
+export async function proposalExistsBatch(jobIds: string[]): Promise<Set<string>> {
+  if (jobIds.length === 0) return new Set();
+  try {
+    const ids = jobIds.map(id => encodeURIComponent(id)).join(",");
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=in.(${ids})&select=job_id`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return new Set();
+    const data = await res.json() as Array<{ job_id: string }>;
+    return new Set(data.map(r => r.job_id));
+  } catch {
+    return new Set();
+  }
+}
+
 export async function saveProspect(prospect: {
   platform: string; username: string; displayName?: string;
   bio?: string; followers?: number; icpScore?: number; url?: string;
@@ -511,6 +531,59 @@ export async function updateProposalBid(jobId: string, bid: number): Promise<voi
     }
   } catch (e) {
     logger.error(`[Cloud] updateProposalBid error for ${jobId}: ${(e as Error).message}`);
+  }
+}
+
+// ── Proof-of-Work Artifact CRUD ──
+
+export async function saveProofArtifact(jobId: string, artifact: {
+  type: string;
+  url?: string;
+  brief: { analysis: string; architectureDiagram: string; codeSnippets: unknown[]; implementationPlan: string };
+  generatedAt: string;
+}): Promise<boolean> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}`,
+      {
+        method: "PATCH",
+        headers: supabaseHeaders(),
+        body: JSON.stringify({
+          proof_artifact_url: artifact.url || null,
+          proof_artifact_json: artifact,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] saveProofArtifact failed (${res.status}) for ${jobId}`);
+    }
+    return res.ok;
+  } catch (e) {
+    logger.error(`[Cloud] saveProofArtifact error: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+export async function getProofArtifact(jobId: string): Promise<{
+  url?: string;
+  brief: { analysis: string };
+} | null> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}&select=proof_artifact_url,proof_artifact_json`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return null;
+    const rows = (await res.json()) as Array<{ proof_artifact_url?: string; proof_artifact_json?: Record<string, unknown> }>;
+    if (!rows[0]?.proof_artifact_json) return null;
+    const artifact = rows[0].proof_artifact_json as { url?: string; brief: { analysis: string } };
+    return {
+      url: rows[0].proof_artifact_url || artifact.url,
+      brief: artifact.brief,
+    };
+  } catch {
+    return null;
   }
 }
 

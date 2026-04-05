@@ -299,6 +299,51 @@ const sendNotification: ControllerTool = {
   },
 };
 
+const getDailyPlan: ControllerTool = {
+  name: "get_daily_plan",
+  description: "Get today's daily submission plan: selected top-5 jobs, their composite scores, scheduled slots, submission status, and proof-of-work eligibility.",
+  parameters: {},
+  execute: async () => {
+    try {
+      const { getPlanSummary } = await import("../services/daily-strategy");
+      const plan = getPlanSummary();
+      if (!plan) return { ok: true, data: { message: "No daily plan built yet. Plan is created at 6:30 AM UTC." } };
+      return { ok: true, data: plan };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  },
+};
+
+const generateProof: ControllerTool = {
+  name: "generate_proof",
+  description: "Generate a proof-of-work technical brief for a high-value job. Creates a GitHub Gist with architecture diagram and code samples. Only use for jobs scoring 8+ or important invites.",
+  parameters: {
+    job_id: { type: "string", description: "The job ID to generate proof for", required: true },
+  },
+  execute: async (params) => {
+    const jobId = params.job_id as string;
+    if (!jobId) return { ok: false, error: "job_id is required" };
+    try {
+      const rows = await cloud.getProposalsByFilter({ jobId, limit: 1 });
+      if (rows.length === 0) return { ok: false, error: "Job not found" };
+      const row = rows[0];
+      const { generateProofArtifact } = await import("../services/proof-of-work");
+      const artifact = await generateProofArtifact({
+        jobId,
+        title: (row.job_title as string) || "Untitled",
+        description: (row.job_description as string) || "",
+        budget: row.budget as string | undefined,
+        tags: row.tags as string[] | undefined,
+      });
+      if (!artifact) return { ok: false, error: "Proof generation failed" };
+      return { ok: true, data: { type: artifact.type, url: artifact.url, generatedAt: artifact.generatedAt } };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  },
+};
+
 // ── Export all tools ──
 
 export const CONTROLLER_TOOLS: ControllerTool[] = [
@@ -311,6 +356,8 @@ export const CONTROLLER_TOOLS: ControllerTool[] = [
   pauseAgent,
   resumeAgent,
   sendNotification,
+  getDailyPlan,
+  generateProof,
 ];
 
 /**

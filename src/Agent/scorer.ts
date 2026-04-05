@@ -4,7 +4,7 @@
  * Stage 2: Claude AI scoring for fit assessment (only for jobs that pass Stage 1)
  */
 import logger from "../config/logger";
-import { getCharacter, getClientAsync } from "./index";
+import { getCharacter } from "./index";
 
 // ── Hard exclude keywords — instant drop if title or description matches ──
 const HARD_EXCLUDES = [
@@ -358,8 +358,8 @@ export async function scoreJob(job: {
   const persona = character?.persona || "AI automation consultant";
 
   try {
-    const client = await getClientAsync();
-    const msg = await client.messages.create({
+    const { aiComplete } = await import("../services/ai-fallback");
+    const result = await aiComplete({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 200,
       messages: [{
@@ -396,9 +396,10 @@ Example: A "React Native bug fix" at $250 = 2/10`,
       }],
     });
 
-    const block = msg.content?.[0];
-    if (!block || !("text" in block)) throw new Error("Empty Claude response");
-    let text = block.text.trim();
+    if (result.provider === "openai") {
+      logger.info("[Scorer] Job scored via OpenAI fallback");
+    }
+    let text = result.text.trim();
     text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error("No JSON found in response");

@@ -20,6 +20,8 @@ import cron from "node-cron";
 import * as control from "./services/process-control";
 import * as ops from "./services/operations";
 import { startController, stopController } from "./controller";
+import { buildDailyPlan, executeSlot } from "./services/daily-strategy";
+import { enrichWithProofs } from "./services/proof-of-work";
 
 // Upwork search keywords — consolidated to ~30 high-signal terms (reduced from 55)
 const UPWORK_KEYWORDS = [
@@ -255,15 +257,54 @@ async function startServer() {
   //   await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
   // });
 
-  // Auto-submit top queued proposals every 8 hours to meet daily minimum (8/day)
-  // Runs at 8 AM, 2 PM, and 8 PM UTC — picks highest-scoring queued jobs
-  const DAILY_SUBMIT_TARGET = 8;
-  cron.schedule("0 8,14,20 * * *", async () => {
-    if (!control.isActive()) { logger.info("[cron] Skipped auto-submit (agent paused/stopped)"); return; }
-    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped auto-submit (submitting paused)"); return; }
-    logger.info("[cron] Auto-submit top queued (daily minimum)");
-    await ops.trackedSafe("auto_submit", { source: "cron", target: DAILY_SUBMIT_TARGET }, async () => {
-      await submitTopQueued(DAILY_SUBMIT_TARGET);
+  // ── Daily Strategy: Top-5 quality submissions with staggered timing ──
+  const DAILY_SUBMIT_TARGET = 5;
+
+  // 6:30 AM UTC — Build daily plan: rank queue, select top 5, kick off proof generation
+  cron.schedule("30 6 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped daily plan (agent paused/stopped)"); return; }
+    logger.info("[cron] Building daily submission plan");
+    await ops.trackedSafe("daily_plan", { source: "cron" }, async () => {
+      const plan = await buildDailyPlan();
+      // Kick off proof-of-work generation for eligible jobs (async, non-blocking)
+      if (plan.proofJobs.length > 0) {
+        logger.info(`[cron] Generating proofs for ${plan.proofJobs.length} top jobs`);
+        enrichWithProofs(plan.proofJobs.map(j => ({
+          jobId: j.jobId, title: j.title, description: j.description,
+          budget: j.budget, tags: j.tags,
+        }))).catch(e => logger.error(`[cron] Proof enrichment error: ${(e as Error).message}`));
+      }
+    });
+  });
+
+  // Staggered submission slots — spread across the day for optimal client visibility
+  // Morning (8 AM UTC): 2 jobs — catches US West Coast evening / EU morning
+  cron.schedule("0 8 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped morning slot (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped morning slot (submitting paused)"); return; }
+    logger.info("[cron] Morning submission slot");
+    await ops.trackedSafe("auto_submit", { source: "cron", slot: "morning" }, async () => {
+      await executeSlot("morning", submitByJobId);
+    });
+  });
+
+  // Midday (1 PM UTC): 2 jobs — catches US East Coast morning / EU afternoon
+  cron.schedule("0 13 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped midday slot (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped midday slot (submitting paused)"); return; }
+    logger.info("[cron] Midday submission slot");
+    await ops.trackedSafe("auto_submit", { source: "cron", slot: "midday" }, async () => {
+      await executeSlot("midday", submitByJobId);
+    });
+  });
+
+  // Evening (6 PM UTC): 1 job — catches US West Coast morning
+  cron.schedule("0 18 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped evening slot (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped evening slot (submitting paused)"); return; }
+    logger.info("[cron] Evening submission slot");
+    await ops.trackedSafe("auto_submit", { source: "cron", slot: "evening" }, async () => {
+      await executeSlot("evening", submitByJobId);
     });
   });
 
@@ -299,6 +340,25 @@ async function startServer() {
     });
   });
 
+  // Session health check every 15 minutes — detect signed-out state early
+  cron.schedule("*/15 * * * *", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    if (control.isSystemPaused("scanning")) return; // don't check when scanning is paused
+    try {
+      const { checkSessionHealth, invalidateSession } = await import("./browser/upwork");
+      const health = await checkSessionHealth();
+      if (!health.valid) {
+        logger.warn(`[cron] Session health check FAILED: ${health.detail}`);
+        invalidateSession();
+        await notify(`⚠️ *Upwork session expired*\n${health.detail}\nWill re-login on next scan cycle.`);
+      } else {
+        logger.info(`[cron] Session health: OK — ${health.detail}`);
+      }
+    } catch (e) {
+      logger.warn(`[cron] Session health check error: ${(e as Error).message}`);
+    }
+  });
+
   // Proactive OAuth token refresh every 4 hours — keeps token fresh during quiet periods
   cron.schedule("0 */4 * * *", async () => {
     if (control.getState() === "stopped" || control.getState() === "stopping") return;
@@ -318,6 +378,12 @@ async function startServer() {
     });
   });
 
+  // Helper: submit a specific job by ID (used by daily strategy slots)
+  async function submitByJobId(jobId: string): Promise<boolean> {
+    const { submitProposalById } = await import("./client/Upwork");
+    return submitProposalById(jobId);
+  }
+
   // Start the autonomous controller (Claude-powered decision loop)
   try {
     const { getClient } = await import("./Agent");
@@ -335,7 +401,7 @@ async function startServer() {
     shutdown(server);
   });
 
-  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 20min | Best Matches: every 20min (offset)\nNotifications: every 1h | Auto-submit: ${DAILY_SUBMIT_TARGET}/day\nMetrics: daily 9 AM\n\n⏸️ /pause — pause all  |  🛑 /stop — shutdown`);
+  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 20min | Best Matches: every 20min (offset)\nNotifications: every 1h\nDaily strategy: top ${DAILY_SUBMIT_TARGET} at 8AM/1PM/6PM UTC + fast-apply\nProof-of-work: auto for score 8+ jobs\nMetrics: daily 9 AM\n\n⏸️ /pause ��� pause all  |  🛑 /stop — shutdown`);
   logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
 
   // Start listening for Telegram control commands (/pause, /resume, /stop, /status)

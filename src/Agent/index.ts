@@ -166,6 +166,7 @@ export interface CharacterConfig {
     url: string;
     label?: string;
     templates?: Record<string, string>;
+    nicheAnchors?: Record<string, { anchor: string; keywords: string[] }>;
   };
   github?: {
     username: string;
@@ -183,6 +184,14 @@ export interface CharacterConfig {
       keywords: string[];
     }>;
   };
+  showcaseProjects?: Array<{
+    name: string;
+    description: string;
+    keywords: string[];
+    niche: string;
+    featured?: boolean;
+    liveUrl?: string;
+  }>;
   winningExamples?: Array<{
     style: string;
     description: string;
@@ -212,27 +221,44 @@ export function getCharacter(): CharacterConfig | null {
  * Get a portfolio line to prepend to a cover letter.
  * Picks the best template based on job tags, or uses default.
  */
-export function getPortfolioLine(tags?: string[]): string {
+/**
+ * Generate a personalized portfolio link with UTM tracking and niche anchoring.
+ * Links scroll directly to the relevant industry section and track which job drove the click.
+ */
+export function getPortfolioLine(tags?: string[], jobId?: string): string {
   const portfolio = characterConfig?.portfolio;
   if (!portfolio?.url) return "";
   const templates = portfolio.templates || {};
-  const url = portfolio.url;
+  const nicheAnchors = portfolio.nicheAnchors || {};
+  const baseUrl = portfolio.url;
 
-  // Try to match a template based on job tags
+  // Find the best niche match from job tags
+  let bestNiche = "default";
+  let bestScore = 0;
+
   if (tags?.length) {
     const tagStr = tags.join(" ").toLowerCase();
-    for (const [key, tmpl] of Object.entries(templates)) {
-      if (key === "default") continue;
-      // Match template key against tags (e.g. "ai-automation" matches "ai automation")
-      const keyWords = key.replace(/-/g, " ");
-      if (tagStr.includes(keyWords) || keyWords.split(" ").some(w => tagStr.includes(w))) {
-        return tmpl.replace("{url}", url);
+    for (const [niche, config] of Object.entries(nicheAnchors)) {
+      const keywords = (config as { keywords: string[] }).keywords || [];
+      const score = keywords.filter(kw => tagStr.includes(kw.toLowerCase())).length;
+      if (score > bestScore) {
+        bestScore = score;
+        bestNiche = niche;
       }
     }
   }
 
-  // Fall back to default template
-  return (templates.default || `${portfolio.label || "See my relevant work"}: ${url}`).replace("{url}", url);
+  // Build the URL with anchor + UTM params
+  const anchor = bestNiche !== "default" && nicheAnchors[bestNiche]
+    ? (nicheAnchors[bestNiche] as { anchor: string }).anchor
+    : "";
+  const campaign = bestNiche !== "default" ? bestNiche : "general";
+  const utmParams = `utm_source=upwork&utm_medium=proposal&utm_campaign=${campaign}${jobId ? `&utm_content=${jobId}` : ""}`;
+  const fullUrl = `${baseUrl}${anchor}?${utmParams}`;
+
+  // Select the matching template
+  const template = templates[bestNiche] || templates.default || `See my relevant work: {url}`;
+  return template.replace("{url}", fullUrl);
 }
 
 /**
@@ -278,6 +304,34 @@ export function getMatchingYouTubeVideos(job: { title: string; description: stri
 }
 
 /**
+ * Find showcase projects from the portfolio that match the job.
+ * Returns up to 2 best-matching projects with names and descriptions
+ * that Claude can reference in the cover letter.
+ */
+export function getMatchingShowcaseProjects(job: { title: string; description: string; tags?: string[] }): string {
+  const projects = characterConfig?.showcaseProjects;
+  if (!projects || projects.length === 0) return "";
+  const jobText = `${job.title} ${job.description} ${(job.tags || []).join(" ")}`.toLowerCase();
+
+  const scored = projects.map(p => {
+    const matchCount = p.keywords.filter(kw => jobText.includes(kw.toLowerCase())).length;
+    const bonus = p.featured ? 1 : 0;
+    return { ...p, matchCount, score: matchCount + bonus };
+  }).filter(p => p.matchCount >= 2); // need at least 2 actual keyword matches (featured bonus doesn't count)
+
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, 2);
+  if (top.length === 0) return "";
+
+  const lines = top.map(p =>
+    p.liveUrl
+      ? `• ${p.name} — ${p.description}\n  Live demo: ${p.liveUrl}`
+      : `• ${p.name} — ${p.description}`
+  );
+  return `\n\nHere are specific projects from my portfolio that are directly relevant:\n${lines.join("\n")}`;
+}
+
+/**
  * Generate an Upwork cover letter for a job posting
  * Style modeled after Isaiah's winning proposals: warm, proof-driven, structured.
  */
@@ -286,11 +340,16 @@ export async function generateCoverLetter(job: {
   description: string;
   budget?: string;
   researchBrief?: string;
+  proofArtifact?: { url?: string; brief: { analysis: string } };
+  tags?: string[];
+  jobId?: string;
 }): Promise<string> {
   const persona = characterConfig?.persona || "a professional AI automation consultant";
   const signoff = characterConfig?.name_signoff || "";
   const githubProof = getMatchingGithubRepo(job);
   const youtubeProof = getMatchingYouTubeVideos(job);
+  const portfolioLine = getPortfolioLine(job.tags, job.jobId);
+  const showcaseProjects = getMatchingShowcaseProjects(job);
 
   const prompt = `You are ${persona}.
 
@@ -300,7 +359,13 @@ Budget: ${job.budget || "not specified"}
 Description: ${job.description.slice(0, 600)}
 ${githubProof ? `\nYou have this relevant GitHub repo to reference:${githubProof}` : ""}
 ${youtubeProof ? `\nYou have these relevant YouTube videos showing your work:${youtubeProof}` : ""}
+${portfolioLine ? `\nYou have a TAILORED PORTFOLIO PAGE for this client's industry — include this link naturally in your proposal:\n${portfolioLine}` : ""}
+${showcaseProjects ? `\nYou have these SPECIFIC PAST PROJECTS that are directly relevant to this job — reference them by name to show you've done exactly this kind of work before:${showcaseProjects}\nHighlight 1-2 of these in your proposal to show the client you have hands-on experience with their exact problem.` : ""}
 ${job.researchBrief ? `\nTECHNICAL RESEARCH (use these insights to sound knowledgeable — reference specific tools/versions):\n${job.researchBrief}` : ""}
+${job.proofArtifact ? `\nPROOF-OF-WORK ARTIFACT — You have prepared a technical brief for this client. This is VERY powerful, LEAD with it:
+${job.proofArtifact.url ? `Technical brief URL: ${job.proofArtifact.url}` : ""}
+Analysis preview: ${job.proofArtifact.brief.analysis.slice(0, 300)}
+Mention that you've already started analyzing their project and include the link to the technical brief. This shows the client you're serious and have relevant expertise.` : ""}
 
 STYLE — model these winning proposals that got hired:
 
@@ -329,6 +394,8 @@ RULES:
 - If you have a GitHub repo, lead with it as proof
 - If you have YouTube videos, you MUST include ALL provided YouTube video links as proof of capability (shows you actually build and ship). List each on its own line with the 🎥 emoji and title.
 - Include 1 concrete similar project with specific results (numbers, timelines)
+- IMPORTANT: Paint a 2-3 sentence VISION of what their business looks like AFTER you deliver. Be specific to their project. Example: "Once deployed, your team won't spend 4 hours/day on manual data entry — the pipeline runs 24/7, automatically processing new orders and syncing to your CRM. You'll have a real-time dashboard showing exactly where every lead is in your funnel."
+- If you have a portfolio URL, include it naturally as "I put together a tailored page showing exactly this kind of work: [url]" — this links to our capabilities showcase with projects relevant to their industry
 - End with a structured deliverable plan OR a soft CTA
 - Sign off with: "Best,\\n${signoff || "Isaiah"}"
 - Sound like a real engineer excited about the work, not a template
@@ -338,15 +405,17 @@ RULES:
   - Use plain dashes (-) or bullet chars (•) for lists, NOT markdown syntax
 - Return ONLY the cover letter text, no preamble`;
 
-  const msg = await (await getClientAsync()).messages.create({
+  const { aiComplete } = await import("../services/ai-fallback");
+  const result = await aiComplete({
     model: "claude-sonnet-4-20250514",
     max_tokens: 800,
     messages: [{ role: "user", content: prompt }],
   });
 
-  const block = msg.content?.[0];
-  if (!block || !("text" in block)) throw new Error("Empty Claude response");
-  return stripMarkdown(block.text);
+  if (result.provider === "openai") {
+    logger.info("[Agent] Cover letter generated via OpenAI fallback");
+  }
+  return stripMarkdown(result.text);
 }
 
 // ── Proposal Quality Gate ─────────────────────────────────────────────────
@@ -422,7 +491,8 @@ export function qualityCheckCoverLetter(
   const hasPortfolio = /portfolio|isaiah-portfolio/i.test(text);
   const hasProofProject = /i('ve| have) (built|created|developed|shipped|delivered|implemented|deployed)/i.test(text);
   const hasConcreteResult = /\d+\s*(user|client|project|request|record|%|hour|day|week)/i.test(text);
-  const proofScore = (hasGithub ? 1 : 0) + (hasYouTube ? 1 : 0) + (hasPortfolio ? 1 : 0) + (hasProofProject ? 1 : 0) + (hasConcreteResult ? 1 : 0);
+  const hasProofArtifact = /gist\.github\.com|technical.?brief/i.test(text);
+  const proofScore = (hasGithub ? 1 : 0) + (hasYouTube ? 1 : 0) + (hasPortfolio ? 1 : 0) + (hasProofProject ? 1 : 0) + (hasConcreteResult ? 1 : 0) + (hasProofArtifact ? 2 : 0);
   checks.push({
     name: "proof_element",
     passed: proofScore >= 1,
@@ -576,7 +646,8 @@ export async function refineCoverLetter(
   const signoff = characterConfig?.name_signoff || "Isaiah";
   const githubProof = getMatchingGithubRepo(job);
 
-  const msg = await (await getClientAsync()).messages.create({
+  const { aiComplete } = await import("../services/ai-fallback");
+  const result = await aiComplete({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 600,
     messages: [{
@@ -610,9 +681,7 @@ RULES:
     }],
   });
 
-  const block = msg.content?.[0];
-  if (!block || !("text" in block)) return coverLetter;
-  return stripMarkdown(block.text);
+  return stripMarkdown(result.text);
 }
 
 /**
