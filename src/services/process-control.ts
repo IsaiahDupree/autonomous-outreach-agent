@@ -134,13 +134,20 @@ export async function requestChromeRestart(reason: string): Promise<boolean> {
   }
   _lastChromeRestartAt = now;
   _chromeRestartCount++;
-  logger.warn(`[control] Restarting Chrome (count=${_chromeRestartCount}): ${reason}`);
+  // Structured log key (cloudflare-recover-001): downstream log-analysis greps
+  // for restart_reason="cf_timeout" so the field name is part of the contract.
+  const restart_reason = /cloudflare/i.test(reason) ? "cf_timeout" : "other";
+  logger.warn(`[control] Restarting Chrome (count=${_chromeRestartCount}): ${reason}`, {
+    restart_reason,
+    restart_count: _chromeRestartCount,
+    reason,
+  });
   try {
     await _chromeRestartImpl();
-    logger.info("[control] Chrome restart complete");
+    logger.info("[control] Chrome restart complete", { restart_reason });
     return true;
   } catch (e) {
-    logger.error(`[control] Chrome restart failed: ${(e as Error).message}`);
+    logger.error(`[control] Chrome restart failed: ${(e as Error).message}`, { restart_reason });
     return false;
   }
 }
