@@ -5,6 +5,14 @@
 import Anthropic from "@anthropic-ai/sdk";
 import logger from "../config/logger";
 import { ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN } from "../secret";
+import { createTrackedLink } from "../services/tracking";
+import { parseProposalSlots, SLOT_PROMPT_INSTRUCTIONS, type ProposalSlots } from "./slots";
+import { getAllNichePerformance, pickNicheForJob, type NichePerformance } from "../services/reinforcement";
+import { resolveCustomContextForTags } from "./custom-context";
+import { pickVariantForTags } from "./prompt-variants";
+import { getCachedScreeningAnswer, setCachedScreeningAnswer } from "../services/screening-cache";
+
+export type { ProposalSlots } from "./slots";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -225,17 +233,15 @@ export function getCharacter(): CharacterConfig | null {
  * Generate a personalized portfolio link with UTM tracking and niche anchoring.
  * Links scroll directly to the relevant industry section and track which job drove the click.
  */
-export function getPortfolioLine(tags?: string[], jobId?: string): string {
+function buildPortfolioParts(tags?: string[], jobId?: string): { url: string; niche: string; template: string } | null {
   const portfolio = characterConfig?.portfolio;
-  if (!portfolio?.url) return "";
+  if (!portfolio?.url) return null;
   const templates = portfolio.templates || {};
   const nicheAnchors = portfolio.nicheAnchors || {};
   const baseUrl = portfolio.url;
 
-  // Find the best niche match from job tags
   let bestNiche = "default";
   let bestScore = 0;
-
   if (tags?.length) {
     const tagStr = tags.join(" ").toLowerCase();
     for (const [niche, config] of Object.entries(nicheAnchors)) {
@@ -248,17 +254,35 @@ export function getPortfolioLine(tags?: string[], jobId?: string): string {
     }
   }
 
-  // Build the URL with anchor + UTM params
   const anchor = bestNiche !== "default" && nicheAnchors[bestNiche]
     ? (nicheAnchors[bestNiche] as { anchor: string }).anchor
     : "";
   const campaign = bestNiche !== "default" ? bestNiche : "general";
   const utmParams = `utm_source=upwork&utm_medium=proposal&utm_campaign=${campaign}${jobId ? `&utm_content=${jobId}` : ""}`;
-  const fullUrl = `${baseUrl}${anchor}?${utmParams}`;
-
-  // Select the matching template
+  const url = `${baseUrl}${anchor}?${utmParams}`;
   const template = templates[bestNiche] || templates.default || `See my relevant work: {url}`;
-  return template.replace("{url}", fullUrl);
+  return { url, niche: bestNiche, template };
+}
+
+export function getPortfolioLine(tags?: string[], jobId?: string): string {
+  const parts = buildPortfolioParts(tags, jobId);
+  if (!parts) return "";
+  return parts.template.replace("{url}", parts.url);
+}
+
+/**
+ * Tracked variant of getPortfolioLine — wraps the destination in a /r/<slug> short link
+ * so each click is logged to Supabase (link_clicks). Falls back to the raw URL if tracking fails.
+ */
+export async function getPortfolioLineTracked(tags?: string[], jobId?: string): Promise<string> {
+  const parts = buildPortfolioParts(tags, jobId);
+  if (!parts) return "";
+  const trackedUrl = await createTrackedLink(parts.url, {
+    jobId,
+    niche: parts.niche,
+    label: "portfolio",
+  }, "portfolio");
+  return parts.template.replace("{url}", trackedUrl);
 }
 
 /**
@@ -308,34 +332,61 @@ export function getMatchingYouTubeVideos(job: { title: string; description: stri
  * Returns up to 2 best-matching projects with names and descriptions
  * that Claude can reference in the cover letter.
  */
-export function getMatchingShowcaseProjects(job: { title: string; description: string; tags?: string[] }): string {
-  const projects = characterConfig?.showcaseProjects;
-  if (!projects || projects.length === 0) return "";
-  const jobText = `${job.title} ${job.description} ${(job.tags || []).join(" ")}`.toLowerCase();
+interface ShowcaseProjectScored {
+  name: string;
+  description: string;
+  liveUrl?: string;
+  keywords: string[];
+  featured?: boolean;
+  matchCount: number;
+  score: number;
+}
 
+function buildShowcaseProjects(job: { title: string; description: string; tags?: string[] }): ShowcaseProjectScored[] {
+  const projects = characterConfig?.showcaseProjects;
+  if (!projects || projects.length === 0) return [];
+  const jobText = `${job.title} ${job.description} ${(job.tags || []).join(" ")}`.toLowerCase();
   const scored = projects.map(p => {
     const matchCount = p.keywords.filter(kw => jobText.includes(kw.toLowerCase())).length;
     const bonus = p.featured ? 1 : 0;
     return { ...p, matchCount, score: matchCount + bonus };
-  }).filter(p => p.matchCount >= 2); // need at least 2 actual keyword matches (featured bonus doesn't count)
-
+  }).filter(p => p.matchCount >= 2);
   scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, 2);
-  if (top.length === 0) return "";
+  return scored.slice(0, 2);
+}
 
-  const lines = top.map(p =>
+function renderShowcaseLines(top: ShowcaseProjectScored[], liveUrls: string[]): string {
+  if (top.length === 0) return "";
+  const lines = top.map((p, i) =>
     p.liveUrl
-      ? `• ${p.name} — ${p.description}\n  Live demo: ${p.liveUrl}`
+      ? `• ${p.name} — ${p.description}\n  Live demo: ${liveUrls[i] || p.liveUrl}`
       : `• ${p.name} — ${p.description}`
   );
   return `\n\nHere are specific projects from my portfolio that are directly relevant:\n${lines.join("\n")}`;
 }
 
+export function getMatchingShowcaseProjects(job: { title: string; description: string; tags?: string[] }): string {
+  const top = buildShowcaseProjects(job);
+  return renderShowcaseLines(top, top.map(p => p.liveUrl || ""));
+}
+
 /**
- * Generate an Upwork cover letter for a job posting
- * Style modeled after Isaiah's winning proposals: warm, proof-driven, structured.
+ * Tracked variant of getMatchingShowcaseProjects — wraps each liveUrl in a /r/<slug> short link.
  */
-export async function generateCoverLetter(job: {
+export async function getMatchingShowcaseProjectsTracked(
+  job: { title: string; description: string; tags?: string[]; jobId?: string; niche?: string }
+): Promise<string> {
+  const top = buildShowcaseProjects(job);
+  if (top.length === 0) return "";
+  const tracked = await Promise.all(top.map(p =>
+    p.liveUrl
+      ? createTrackedLink(p.liveUrl, { jobId: job.jobId, niche: job.niche, label: p.name }, "showcase")
+      : Promise.resolve("")
+  ));
+  return renderShowcaseLines(top, tracked);
+}
+
+export interface ProposalPromptInput {
   title: string;
   description: string;
   budget?: string;
@@ -343,13 +394,82 @@ export async function generateCoverLetter(job: {
   proofArtifact?: { url?: string; brief: { analysis: string } };
   tags?: string[];
   jobId?: string;
-}): Promise<string> {
+}
+
+/**
+ * Build the full cover-letter prompt without calling the LLM. Used by:
+ *   - generateCoverLetter (then immediately fed to aiComplete)
+ *   - GET /api/character/preview-prompt (transparency view in the Templates page)
+ *
+ * `preview: true` skips the tracked-link side effects (no Supabase writes) and uses raw URLs
+ * so the dashboard can render the prompt without polluting the link_clicks table.
+ */
+export async function buildProposalPrompt(job: ProposalPromptInput, opts?: { preview?: boolean }): Promise<string> {
   const persona = characterConfig?.persona || "a professional AI automation consultant";
   const signoff = characterConfig?.name_signoff || "";
   const githubProof = getMatchingGithubRepo(job);
   const youtubeProof = getMatchingYouTubeVideos(job);
-  const portfolioLine = getPortfolioLine(job.tags, job.jobId);
-  const showcaseProjects = getMatchingShowcaseProjects(job);
+
+  let portfolioLine: string;
+  let showcaseProjects: string;
+  let proofArtifactUrl: string | undefined;
+  if (opts?.preview) {
+    // Preview path: use the synchronous, untracked variants. No Supabase writes.
+    portfolioLine = getPortfolioLine(job.tags, job.jobId);
+    showcaseProjects = getMatchingShowcaseProjects(job);
+    proofArtifactUrl = job.proofArtifact?.url;
+  } else {
+    portfolioLine = await getPortfolioLineTracked(job.tags, job.jobId);
+    showcaseProjects = await getMatchingShowcaseProjectsTracked({ ...job, jobId: job.jobId });
+    proofArtifactUrl = job.proofArtifact?.url
+      ? await createTrackedLink(job.proofArtifact.url, { jobId: job.jobId, label: "proof-of-work" }, "proof")
+      : undefined;
+  }
+
+  // Reinforcement loop: pull recent winning patterns for this niche if we have enough samples.
+  let winningPatternsBlock = "";
+  try {
+    const allStats = await getAllNichePerformance();
+    const stats = pickNicheForJob(job.tags, allStats);
+    if (stats?.winning_patterns) {
+      winningPatternsBlock = `\nRECENT WINS IN THIS NICHE (${stats.niche}, ${stats.sample_count} outcomes, ${Math.round((stats.win_rate || 0) * 100)}% win rate) — write the proposal in the style and structure that has been winning:\n${stats.winning_patterns}`;
+    }
+  } catch (e) {
+    logger.warn(`[Agent] Niche performance lookup failed: ${(e as Error).message}`);
+  }
+
+  // Custom-context blocks: per-niche free-text the user added on the Templates page. Used
+  // to drop in ad-hoc links, case studies, or "always mention X" snippets without rebuilding
+  // the character file. We append a clearly labeled section so the model treats it as
+  // additional grounding rather than overriding the main prompt.
+  let customContextBlock = "";
+  try {
+    const matches = resolveCustomContextForTags(job.tags);
+    const meaningful = matches.filter(m => m.text.trim().length > 0);
+    if (meaningful.length > 0) {
+      customContextBlock = "\nADDITIONAL CONTEXT FOR THIS NICHE — incorporate the relevant bits naturally where they fit:\n"
+        + meaningful.map(m => `[${m.key}] ${m.text.trim()}`).join("\n\n");
+    }
+  } catch (e) {
+    logger.warn(`[Agent] Custom-context lookup failed: ${(e as Error).message}`);
+  }
+
+  // A/B variant block: if the user defined alternative prompt fragments for this niche, pick
+  // one via weighted random and append it. Selection is sticky per call (recorded for the
+  // submission so reinforcement can correlate variant → win rate later).
+  let variantBlock = "";
+  try {
+    const picked = pickVariantForTags(job.tags);
+    if (picked && picked.variant.fragment.trim().length > 0) {
+      variantBlock = `\nVARIANT: ${picked.niche}/${picked.variant.name} —\n${picked.variant.fragment.trim()}`;
+      _lastVariantPicked = picked;
+    } else {
+      _lastVariantPicked = null;
+    }
+  } catch (e) {
+    logger.warn(`[Agent] Prompt-variant lookup failed: ${(e as Error).message}`);
+    _lastVariantPicked = null;
+  }
 
   const prompt = `You are ${persona}.
 
@@ -363,9 +483,12 @@ ${portfolioLine ? `\nYou have a TAILORED PORTFOLIO PAGE for this client's indust
 ${showcaseProjects ? `\nYou have these SPECIFIC PAST PROJECTS that are directly relevant to this job — reference them by name to show you've done exactly this kind of work before:${showcaseProjects}\nHighlight 1-2 of these in your proposal to show the client you have hands-on experience with their exact problem.` : ""}
 ${job.researchBrief ? `\nTECHNICAL RESEARCH (use these insights to sound knowledgeable — reference specific tools/versions):\n${job.researchBrief}` : ""}
 ${job.proofArtifact ? `\nPROOF-OF-WORK ARTIFACT — You have prepared a technical brief for this client. This is VERY powerful, LEAD with it:
-${job.proofArtifact.url ? `Technical brief URL: ${job.proofArtifact.url}` : ""}
+${proofArtifactUrl ? `Technical brief URL: ${proofArtifactUrl}` : ""}
 Analysis preview: ${job.proofArtifact.brief.analysis.slice(0, 300)}
 Mention that you've already started analyzing their project and include the link to the technical brief. This shows the client you're serious and have relevant expertise.` : ""}
+${winningPatternsBlock}
+${customContextBlock}
+${variantBlock}
 
 STYLE — model these winning proposals that got hired:
 
@@ -403,19 +526,58 @@ RULES:
 - CRITICAL: NO markdown formatting. No **bold**, no *italic*, no [links](url), no \`code\`. Upwork renders plain text only.
   - Write URLs as plain text: https://github.com/... NOT [text](url)
   - Use plain dashes (-) or bullet chars (•) for lists, NOT markdown syntax
-- Return ONLY the cover letter text, no preamble`;
+- Return ONLY the cover letter text, no preamble
+
+${SLOT_PROMPT_INSTRUCTIONS}`;
+
+  return prompt;
+}
+
+/**
+ * Generate an Upwork cover letter for a job posting.
+ * Style modeled after Isaiah's winning proposals: warm, proof-driven, structured.
+ */
+export async function generateCoverLetter(job: ProposalPromptInput): Promise<string> {
+  const prompt = await buildProposalPrompt(job);
 
   const { aiComplete } = await import("../services/ai-fallback");
   const result = await aiComplete({
     model: "claude-sonnet-4-20250514",
-    max_tokens: 800,
+    max_tokens: 900,
     messages: [{ role: "user", content: prompt }],
   });
 
   if (result.provider === "openai") {
     logger.info("[Agent] Cover letter generated via OpenAI fallback");
   }
-  return stripMarkdown(result.text);
+  const cleaned = stripMarkdown(result.text);
+  const { text, slots } = parseProposalSlots(cleaned);
+  // Stash the most recently generated slots so callers that only consume the legacy
+  // string return type can still reach them via getLastProposalSlots() if needed.
+  lastProposalSlots = slots;
+  return text;
+}
+
+let lastProposalSlots: ProposalSlots = {};
+let _lastVariantPicked: { niche: string; variant: { name: string; fragment: string } } | null = null;
+
+/** Returns the slots from the most recent generateCoverLetter call. */
+export function getLastProposalSlots(): ProposalSlots {
+  return lastProposalSlots;
+}
+
+/** Returns which prompt variant (if any) was used for the most recent generateCoverLetter call. */
+export function getLastVariantPicked(): { niche: string; variant: { name: string; fragment: string } } | null {
+  return _lastVariantPicked;
+}
+
+/**
+ * Same as generateCoverLetter but returns both the rendered text and the structured slots.
+ * Prefer this over generateCoverLetter for new code — the dashboard needs the slots.
+ */
+export async function generateProposalContent(job: Parameters<typeof generateCoverLetter>[0]): Promise<{ text: string; slots: ProposalSlots }> {
+  const text = await generateCoverLetter(job);
+  return { text, slots: lastProposalSlots };
 }
 
 // ── Proposal Quality Gate ─────────────────────────────────────────────────
@@ -425,6 +587,56 @@ export interface QualityCheckResult {
   score: number;
   checks: Array<{ name: string; passed: boolean; detail: string }>;
   suggestions: string[];
+  /** Per-beat coverage when slots are available — used by the dashboard to show what's missing. */
+  slotCoverage?: Array<{ name: string; present: boolean; chars: number }>;
+}
+
+const REQUIRED_SLOTS: Array<{ name: import("./slots").SlotName; minChars: number }> = [
+  { name: "problem", minChars: 30 },
+  { name: "solution", minChars: 80 },
+  { name: "portfolio", minChars: 20 },
+  { name: "prior_results", minChars: 40 },
+  { name: "cta", minChars: 15 },
+  // `proof` is optional — only required if a proof artifact / repo was available.
+];
+
+/**
+ * Validates structured slots produced by parseProposalSlots().
+ * Returns the same QualityCheckResult shape so callers can feed it into refineCoverLetter().
+ */
+export function qualityCheckSlots(slots: import("./slots").ProposalSlots): QualityCheckResult {
+  const checks: Array<{ name: string; passed: boolean; detail: string }> = [];
+  const suggestions: string[] = [];
+  const slotCoverage: Array<{ name: string; present: boolean; chars: number }> = [];
+
+  for (const { name, minChars } of REQUIRED_SLOTS) {
+    const value = (slots[name] || "").trim();
+    const chars = value.length;
+    const present = chars >= minChars;
+    slotCoverage.push({ name, present, chars });
+    checks.push({
+      name: `slot_${name}`,
+      passed: present,
+      detail: present ? `${chars} chars` : value ? `Too short (${chars} chars, need ${minChars})` : "Missing",
+    });
+    if (!present) {
+      suggestions.push(
+        value
+          ? `<${name}> beat is too short — expand to at least ${minChars} chars with concrete specifics`
+          : `<${name}> beat is missing — add this section to the proposal`
+      );
+    }
+  }
+
+  // Optional `proof` slot: report presence but don't block.
+  const proof = (slots.proof || "").trim();
+  slotCoverage.push({ name: "proof", present: proof.length >= 20, chars: proof.length });
+
+  const total = checks.length || 1;
+  const passedCount = checks.filter(c => c.passed).length;
+  const score = Math.round((passedCount / total) * 100);
+  const passed = checks.every(c => c.passed);
+  return { passed, score, checks, suggestions, slotCoverage };
 }
 
 /**
@@ -685,13 +897,20 @@ RULES:
 }
 
 /**
- * Generate a specific answer to an Upwork screening question
+ * Generate a specific answer to an Upwork screening question.
+ *
+ * Repeats are common (boilerplate "tell me about your AI experience" / "are you available
+ * X hrs/week"), so answers are cached per (persona, normalized question) and reused for ~7d.
+ * That skips the Claude call entirely on cache hits — faster proposals + lower spend.
  */
 export async function answerScreeningQuestion(
   question: string,
   job: { title: string; description: string },
 ): Promise<string> {
   const persona = characterConfig?.persona || "a professional AI automation consultant";
+  const cached = getCachedScreeningAnswer(persona, question);
+  if (cached) return cached;
+
   const msg = await (await getClientAsync()).messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 200,
@@ -710,6 +929,7 @@ Return ONLY the answer text.`,
   });
   const block = msg.content?.[0];
   if (!block || !("text" in block)) throw new Error("Empty Claude response");
+  setCachedScreeningAnswer(persona, question, block.text);
   return block.text;
 }
 
