@@ -342,15 +342,67 @@ interface ShowcaseProjectScored {
   score: number;
 }
 
+// Stop-words that add noise to overlap scoring (too generic to discriminate).
+const SHOWCASE_STOPWORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "for", "with", "to", "of", "in", "on", "at",
+  "build", "need", "want", "looking", "developer", "project", "system", "tool", "app",
+  "create", "make", "use", "using", "your", "our", "my", "we", "you", "i", "is", "are",
+  "be", "have", "has", "will", "this", "that", "it", "as", "by", "from",
+]);
+
+function tokenizeForOverlap(text: string): Set<string> {
+  const out = new Set<string>();
+  const words = text.toLowerCase().match(/[a-z0-9][a-z0-9+#.-]*/g) || [];
+  for (const w of words) {
+    if (w.length < 3 || SHOWCASE_STOPWORDS.has(w)) continue;
+    out.add(w);
+  }
+  return out;
+}
+
+/**
+ * Score a showcase project against a job using weighted semantic overlap:
+ *   - keyword hits in title weigh 3x (strongest signal of job intent)
+ *   - keyword hits in tags weigh 2x
+ *   - keyword hits in description weigh 1x
+ *   - additional Jaccard-style overlap between project description tokens
+ *     and job text tokens, so a project whose description echoes the job
+ *     beats one that only matches a single generic keyword
+ *   - featured projects keep their tie-breaker bonus
+ */
 function buildShowcaseProjects(job: { title: string; description: string; tags?: string[] }): ShowcaseProjectScored[] {
   const projects = characterConfig?.showcaseProjects;
   if (!projects || projects.length === 0) return [];
-  const jobText = `${job.title} ${job.description} ${(job.tags || []).join(" ")}`.toLowerCase();
+
+  const titleText = job.title.toLowerCase();
+  const descText = job.description.toLowerCase();
+  const tagsText = (job.tags || []).join(" ").toLowerCase();
+  const jobTokens = tokenizeForOverlap(`${job.title} ${job.description} ${(job.tags || []).join(" ")}`);
+
   const scored = projects.map(p => {
-    const matchCount = p.keywords.filter(kw => jobText.includes(kw.toLowerCase())).length;
-    const bonus = p.featured ? 1 : 0;
-    return { ...p, matchCount, score: matchCount + bonus };
+    let weighted = 0;
+    let matchCount = 0;
+    for (const kwRaw of p.keywords) {
+      const kw = kwRaw.toLowerCase();
+      let hit = false;
+      if (titleText.includes(kw)) { weighted += 3; hit = true; }
+      if (tagsText.includes(kw)) { weighted += 2; hit = true; }
+      if (descText.includes(kw)) { weighted += 1; hit = true; }
+      if (hit) matchCount++;
+    }
+
+    // Jaccard-ish overlap of project description tokens vs job tokens.
+    const projTokens = tokenizeForOverlap(p.description);
+    let overlap = 0;
+    for (const t of projTokens) if (jobTokens.has(t)) overlap++;
+    const denom = projTokens.size + jobTokens.size - overlap;
+    const jaccard = denom > 0 ? overlap / denom : 0;
+
+    const featuredBonus = p.featured ? 1 : 0;
+    const score = weighted + jaccard * 4 + featuredBonus;
+    return { ...p, matchCount, score };
   }).filter(p => p.matchCount >= 2);
+
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, 2);
 }
