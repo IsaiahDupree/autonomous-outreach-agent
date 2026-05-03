@@ -3614,3 +3614,102 @@ export async function scrapeArchivedProposals(): Promise<ArchivedProposal[]> {
     setBrowserBusy(false);
   }
 }
+
+// ── Active "My Proposals" page (outcome-tracking-001) ─────────────────────
+
+export interface MyProposalRow {
+  proposalId: string;
+  jobTitle: string;
+  jobUrl: string;
+  /** Most-informative status read from the row text. */
+  status: "viewed" | "declined" | "hired" | "messaged" | "submitted" | "unknown";
+  raw: string;
+}
+
+/**
+ * Classify a proposal-row's text into a tracked status. Exported so the
+ * weekly sync test can exercise the keyword logic without spinning a browser.
+ */
+export function classifyMyProposalStatus(rowText: string): MyProposalRow["status"] {
+  const t = rowText.toLowerCase();
+  if (t.includes("messaged") || t.includes("message from") || t.includes("interview")) return "messaged";
+  if (t.includes("hired")) return "hired";
+  if (t.includes("declined") || t.includes("not selected") || t.includes("wasn't selected")) return "declined";
+  if (t.includes("viewed by client")) return "viewed";
+  if (t.includes("submitted") || t.includes("active proposal")) return "submitted";
+  return "unknown";
+}
+
+/**
+ * Scrape the active "My Proposals" page (/nx/proposals/) — distinct from the
+ * archived scraper, which only sees closed jobs. Drives the weekly outcome
+ * sync cron defined in src/index.ts.
+ */
+export async function scrapeMyProposals(): Promise<MyProposalRow[]> {
+  let page: Page | null = null;
+  setBrowserBusy(true);
+  let dedicatedTab = false;
+  try {
+    const b = await launch();
+    page = await b.newPage();
+    dedicatedTab = true;
+    if (hasSavedCookies()) await restoreCookies(page);
+
+    logger.info("[Browser/Upwork] Navigating to /nx/proposals/ (active, dedicated tab)...");
+    await page.goto("https://www.upwork.com/nx/proposals/", { waitUntil: "networkidle2", timeout: 30000 });
+    await humanDelay(2500, 4000);
+
+    if (page.url().includes("login") || page.url().includes("account-security")) {
+      logger.warn("[Browser/Upwork] Session expired during my-proposals scrape — re-authenticating");
+      await ensureLoggedIn(page);
+      await page.goto("https://www.upwork.com/nx/proposals/", { waitUntil: "networkidle2", timeout: 30000 });
+      if (page.url().includes("login")) {
+        logger.error("[Browser/Upwork] Failed to authenticate for /nx/proposals/");
+        return [];
+      }
+    }
+
+    await page.waitForSelector("a[href*='/nx/proposals/'], table, h1", { timeout: 15000 }).catch(() => {});
+
+    let prev = 0;
+    for (let i = 0; i < 20; i++) {
+      const c = await page.evaluate(() => document.querySelectorAll("a[href*='/nx/proposals/']").length);
+      if (c === prev && i > 2) break;
+      prev = c;
+      await page.evaluate(() => window.scrollBy(0, 800));
+      await humanDelay(300, 600);
+    }
+
+    const rows = await page.evaluate(() => {
+      const out: Array<{ proposalId: string; jobTitle: string; jobUrl: string; raw: string }> = [];
+      const links = document.querySelectorAll("a[href*='/nx/proposals/']");
+      for (const link of Array.from(links)) {
+        const href = (link as HTMLAnchorElement).href || "";
+        const m = href.match(/\/proposals\/(\d{10,})/);
+        if (!m) continue;
+        const title = (link.textContent || "").trim();
+        if (title.length < 5) continue;
+        const row = link.closest("tr") || link.parentElement?.parentElement || link.parentElement;
+        const raw = (row?.textContent || title).trim().replace(/\s+/g, " ").slice(0, 600);
+        out.push({ proposalId: m[1], jobTitle: title.slice(0, 200), jobUrl: href, raw });
+      }
+      return out;
+    });
+
+    const seen = new Set<string>();
+    const result: MyProposalRow[] = [];
+    for (const r of rows) {
+      if (seen.has(r.proposalId)) continue;
+      seen.add(r.proposalId);
+      result.push({ ...r, status: classifyMyProposalStatus(r.raw) });
+    }
+    logger.info(`[Browser/Upwork] /nx/proposals/ scraped ${result.length} rows`);
+    return result;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] scrapeMyProposals error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (dedicatedTab && page) await page.close().catch(() => {});
+    setBrowserBusy(false);
+  }
+}

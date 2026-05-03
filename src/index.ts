@@ -14,7 +14,9 @@ import { initAgent, proactiveTokenRefresh } from "./Agent/index";
 import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics, submitTopQueued, checkAndProcessNotifications } from "./client/Upwork";
 import * as cloud from "./services/cloud";
 import { runDiscoveryCycle } from "./client/Chrome";
-import { PORT, BROWSER_MODE } from "./secret";
+import { PORT, BROWSER_MODE, FAST_POLL, assertRequiredEnv } from "./secret";
+
+assertRequiredEnv();
 import { engine } from "./browser";
 import cron from "node-cron";
 import * as control from "./services/process-control";
@@ -218,16 +220,48 @@ async function startServer() {
     logger.info(`Health: http://localhost:${PORT}/api/health`);
   });
 
-  // Run initial scans on startup (tracked)
-  logger.info("[startup] Running initial Upwork scan...");
-  await ops.trackedSafe("scan_keywords", { source: "startup", keywords: UPWORK_KEYWORDS }, async (opId) => {
-    ops.addStep(opId, "search", `Searching ${UPWORK_KEYWORDS.length} keywords`);
-    await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
-  });
-  logger.info("[startup] Running initial Best Matches scan...");
-  await ops.trackedSafe("scan_best_matches", { source: "startup" }, async () => {
-    await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
-  });
+  // Verify (and auto-recover) Upwork login before any work starts. If we're signed out and
+  // UPWORK_EMAIL/PASSWORD are set, this will fill the login form via Puppeteer using the
+  // existing handleLogin flow. Notifies via Telegram on success/failure.
+  try {
+    const { ensureUpworkLoggedIn } = await import("./browser/upwork");
+    const ok = await ensureUpworkLoggedIn(notify);
+    if (!ok) {
+      logger.warn("[startup] Upwork login failed — agent will retry via session-health cron every 15 min. Run `npm run login:upwork` to fix manually.");
+    }
+  } catch (e) {
+    logger.warn(`[startup] Login check error: ${(e as Error).message}`);
+  }
+
+  // Start the fast-poll loop BEFORE the initial scans so the real-time loop kicks in within
+  // seconds of boot. The 29-keyword initial scan can take 30+ minutes and would otherwise
+  // monopolize Chrome before fast-poll ever gets to run.
+  if (FAST_POLL) {
+    try {
+      const { startFastPoll } = await import("./services/fast-poll");
+      startFastPoll();
+    } catch (e) {
+      logger.warn(`[startup] Fast-poll not started: ${(e as Error).message}`);
+    }
+  } else {
+    logger.info("[startup] Fast-poll disabled (set FAST_POLL=true to enable)");
+  }
+
+  // Run initial scans on startup (tracked). Skip when SKIP_INITIAL_SCAN=true so dry-run smoke
+  // tests and other manual flows don't have to fight a 29-keyword scan over the same Chrome tab.
+  if (process.env.SKIP_INITIAL_SCAN === "true") {
+    logger.info("[startup] SKIP_INITIAL_SCAN=true — skipping initial scans");
+  } else {
+    logger.info("[startup] Running initial Upwork scan...");
+    await ops.trackedSafe("scan_keywords", { source: "startup", keywords: UPWORK_KEYWORDS }, async (opId) => {
+      ops.addStep(opId, "search", `Searching ${UPWORK_KEYWORDS.length} keywords`);
+      await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
+    });
+    logger.info("[startup] Running initial Best Matches scan...");
+    await ops.trackedSafe("scan_best_matches", { source: "startup" }, async () => {
+      await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
+    });
+  }
 
   // Cron schedules — all check control.isActive() before running
   // Upwork keyword search every 20 min — catch jobs within 30 min of posting
@@ -340,20 +374,13 @@ async function startServer() {
     });
   });
 
-  // Session health check every 15 minutes — detect signed-out state early
+  // Session health check every 15 minutes — auto-recover if signed out.
   cron.schedule("*/15 * * * *", async () => {
     if (control.getState() === "stopped" || control.getState() === "stopping") return;
-    if (control.isSystemPaused("scanning")) return; // don't check when scanning is paused
+    if (control.isSystemPaused("scanning")) return;
     try {
-      const { checkSessionHealth, invalidateSession } = await import("./browser/upwork");
-      const health = await checkSessionHealth();
-      if (!health.valid) {
-        logger.warn(`[cron] Session health check FAILED: ${health.detail}`);
-        invalidateSession();
-        await notify(`⚠️ *Upwork session expired*\n${health.detail}\nWill re-login on next scan cycle.`);
-      } else {
-        logger.info(`[cron] Session health: OK — ${health.detail}`);
-      }
+      const { ensureUpworkLoggedIn } = await import("./browser/upwork");
+      await ensureUpworkLoggedIn(notify);
     } catch (e) {
       logger.warn(`[cron] Session health check error: ${(e as Error).message}`);
     }
@@ -378,6 +405,33 @@ async function startServer() {
     });
   });
 
+  // outcome-tracking-001: weekly scrape of /nx/proposals/ to catch viewed /
+  // messaged / hired / declined transitions the notification stream missed.
+  // Sunday 4 AM — stays clear of the 2 AM reinforcement job below so we
+  // don't fight for the same Chrome tab.
+  cron.schedule("0 4 * * 0", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Weekly my-proposals outcome sync");
+    await ops.trackedSafe("my_proposals_sync", { source: "cron" }, async () => {
+      const { runWeeklyMyProposalsSync } = await import("./services/my-proposals-sync");
+      const result = await runWeeklyMyProposalsSync();
+      logger.info(`[cron] my-proposals sync: scanned=${result.scanned} updated=${result.updated} skipped=${result.skipped} unmatched=${result.unmatched}`);
+    });
+  });
+
+  // Weekly reinforcement: recompute per-niche win rates + winning patterns from outcomed proposals
+  cron.schedule("0 2 * * 0", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Weekly reinforcement refresh");
+    await ops.trackedSafe("reinforcement_refresh", { source: "cron" }, async () => {
+      const { computeNichePerformance } = await import("./services/reinforcement");
+      const { invalidateNicheCache } = await import("./Agent/scorer");
+      const result = await computeNichePerformance();
+      invalidateNicheCache();
+      logger.info(`[cron] Reinforcement refresh: ${result.updated} niches updated, ${result.skipped} skipped`);
+    });
+  });
+
   // Helper: submit a specific job by ID (used by daily strategy slots)
   async function submitByJobId(jobId: string): Promise<boolean> {
     const { submitProposalById } = await import("./client/Upwork");
@@ -397,6 +451,10 @@ async function startServer() {
   // Register cleanup for graceful stop (via API, Telegram, or signal)
   control.onStop(async () => {
     stopController();
+    try {
+      const { stopFastPoll } = await import("./services/fast-poll");
+      stopFastPoll();
+    } catch { /* noop */ }
     await engine.close();
     shutdown(server);
   });
