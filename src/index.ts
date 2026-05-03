@@ -405,21 +405,6 @@ async function startServer() {
     });
   });
 
-  // analytics-weekly-001: Sunday 18:00 Telegram digest with the past
-  // week's pipeline numbers. Read-only — runs even when paused.
-  cron.schedule("0 18 * * 0", async () => {
-    if (control.getState() === "stopped" || control.getState() === "stopping") return;
-    logger.info("[cron] Weekly Telegram digest");
-    try {
-      const { buildWeeklyDigestMessage } = await import("./services/analytics");
-      const { getConnectsRemaining } = await import("./browser/upwork");
-      const message = await buildWeeklyDigestMessage(getConnectsRemaining() ?? null);
-      await notify(message);
-    } catch (e) {
-      logger.error(`[cron] Weekly digest failed: ${(e as Error).message}`);
-    }
-  });
-
   // outcome-tracking-001: weekly scrape of /nx/proposals/ to catch viewed /
   // messaged / hired / declined transitions the notification stream missed.
   // Sunday 4 AM — stays clear of the 2 AM reinforcement job below so we
