@@ -79,6 +79,17 @@ export async function saveProposal(proposal: {
   // Enhanced insights
   paymentVerified?: boolean;
   screeningQuestionCount?: number;
+  // Structured proposal beats (problem / solution / proof / portfolio / prior_results / cta)
+  slots?: Record<string, string>;
+  // ISO timestamp of when the job was posted on Upwork (parsed from relative "X minutes ago").
+  postedAt?: string | null;
+  // A/B variant tracking: which prompt-variant fragment (if any) was injected at gen time.
+  variantNiche?: string | null;
+  variantName?: string | null;
+  // Raw Stage-2 Claude rating + reasoning (before niche-bias adjustment). Audited
+  // separately from the bias-adjusted `score`/`reasoning` to detect prompt drift.
+  aiScore?: number | null;
+  aiReasoning?: string | null;
 }): Promise<boolean> {
   try {
     const body: Record<string, unknown> = {
@@ -89,6 +100,7 @@ export async function saveProposal(proposal: {
       budget: proposal.budget || null,
       score: proposal.score,
       proposal_text: proposal.coverLetter || null,
+      proposal_slots_json: proposal.slots && Object.keys(proposal.slots).length > 0 ? proposal.slots : null,
       status: proposal.status || "queued",
       offer_type: proposal.offerType || null,
       submitted_bid_amount: proposal.bid || null,
@@ -107,6 +119,14 @@ export async function saveProposal(proposal: {
       // Enhanced insights
       payment_verified: proposal.paymentVerified ?? null,
       screening_question_count: proposal.screeningQuestionCount ?? null,
+      // Speed metrics
+      tags: proposal.tags && proposal.tags.length > 0 ? proposal.tags : null,
+      posted_at: proposal.postedAt ?? null,
+      reasoning: proposal.reasoning ?? null,
+      variant_niche: proposal.variantNiche ?? null,
+      variant_name: proposal.variantName ?? null,
+      ai_score: proposal.aiScore ?? null,
+      ai_reasoning: proposal.aiReasoning ?? null,
     };
 
     // Calculate bid competitiveness: our bid / avg competitive bid
@@ -303,6 +323,71 @@ export async function recordOutcome(jobId: string, outcome: "won" | "rejected" |
   }
 }
 
+/**
+ * Close rate (hires / submitted) over a rolling N-day window. Counts proposals whose
+ * submitted_at (or created_at fallback) falls inside [now - days, now].
+ */
+export async function getCloseRateWindow(days: number): Promise<{ submitted: number; won: number; closeRate: number }> {
+  try {
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(submitted,won,rejected,no_response,interviewed)&or=(submitted_at.gte.${cutoff},and(submitted_at.is.null,created_at.gte.${cutoff}))&select=status`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return { submitted: 0, won: 0, closeRate: 0 };
+    const rows = (await res.json()) as Array<{ status: string }>;
+    const submitted = rows.length;
+    const won = rows.filter(r => r.status === "won").length;
+    const closeRate = submitted > 0 ? Math.round((won / submitted) * 1000) / 10 : 0;
+    return { submitted, won, closeRate };
+  } catch (e) {
+    logger.error(`[Cloud] getCloseRateWindow(${days}d) error: ${(e as Error).message}`);
+    return { submitted: 0, won: 0, closeRate: 0 };
+  }
+}
+
+/**
+ * Reply-rate per A/B prompt variant. Aggregates upwork_proposals by (variant_niche, variant_name)
+ * and counts how many submitted proposals received a client response (won/rejected/interviewed).
+ * Rows missing a variant are bucketed under niche="(default)", name="(default)" so the default
+ * prompt path is comparable to variants.
+ */
+export async function getVariantMetrics(): Promise<Array<{
+  variant_niche: string;
+  variant_name: string;
+  submitted: number;
+  replies: number;
+  won: number;
+  reply_rate: number;
+}>> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(submitted,won,rejected,no_response,interviewed)&select=variant_niche,variant_name,status`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return [];
+    const rows = (await res.json()) as Array<{ variant_niche: string | null; variant_name: string | null; status: string }>;
+    const buckets = new Map<string, { variant_niche: string; variant_name: string; submitted: number; replies: number; won: number }>();
+    for (const r of rows) {
+      const niche = r.variant_niche || "(default)";
+      const name = r.variant_name || "(default)";
+      const key = `${niche}::${name}`;
+      let b = buckets.get(key);
+      if (!b) { b = { variant_niche: niche, variant_name: name, submitted: 0, replies: 0, won: 0 }; buckets.set(key, b); }
+      b.submitted += 1;
+      if (r.status === "won" || r.status === "rejected" || r.status === "interviewed") b.replies += 1;
+      if (r.status === "won") b.won += 1;
+    }
+    return Array.from(buckets.values()).map(b => ({
+      ...b,
+      reply_rate: b.submitted > 0 ? Math.round((b.replies / b.submitted) * 1000) / 10 : 0,
+    })).sort((a, b) => b.submitted - a.submitted);
+  } catch (e) {
+    logger.error(`[Cloud] getVariantMetrics error: ${(e as Error).message}`);
+    return [];
+  }
+}
+
 export async function checkService(port: number): Promise<boolean> {
   try {
     const res = await fetch(`http://localhost:${port}/health`, { signal: AbortSignal.timeout(2000) });
@@ -366,7 +451,7 @@ export async function saveAnalyticsSnapshot(analytics: {
       proposal_count: overview.totalJobs,
     };
 
-    const res = await safeFetch(`${SUPABASE_URL}/rest/v1/analytics_snapshots`, {
+    const res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_analytics_snapshots`, {
       method: "POST",
       headers: { ...supabaseHeaders(), Prefer: "return=representation" },
       body: JSON.stringify(body),
@@ -432,7 +517,7 @@ export async function saveContentBrief(brief: {
 export async function getLatestSnapshot(): Promise<Record<string, unknown> | null> {
   try {
     const res = await safeFetch(
-      `${SUPABASE_URL}/rest/v1/analytics_snapshots?snapshot_type=eq.full&order=created_at.desc&limit=1`,
+      `${SUPABASE_URL}/rest/v1/upwork_analytics_snapshots?snapshot_type=eq.full&order=created_at.desc&limit=1`,
       { headers: supabaseHeaders() }
     );
     if (!res.ok) return null;

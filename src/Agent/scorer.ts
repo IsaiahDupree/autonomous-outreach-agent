@@ -164,9 +164,13 @@ export interface ScoredJob {
   score: number;        // 0-10 overall fit (final combined)
   preScore: number;     // 0-100 deterministic pre-score
   bidRange: string;     // suggested bid range
-  reasoning: string;    // 1-line reason
+  reasoning: string;    // 1-line reason (final, with bias note)
   tags: string[];       // matched skill tags
   excluded?: string;    // if excluded, the reason
+  // Raw Stage-2 Claude output before niche bias is applied. Persisted separately
+  // for audit so prompt drift and bias impact can be measured.
+  aiScore?: number;     // 0-10 raw Claude rating
+  aiReasoning?: string; // raw Claude reasoning
 }
 
 export interface PreScoreResult {
@@ -470,12 +474,15 @@ Example: A "React Native bug fix" at $250 = 2/10`,
     const stats = await getCachedNicheStats();
     const { score: biasedScore, note: biasNote } = applyNicheBias(aiScore, tags, stats);
 
+    const rawReasoning = parsed.reasoning || "";
     return {
       score: biasedScore,
       preScore: pre.score,
       bidRange: parsed.bidRange || "TBD",
-      reasoning: (parsed.reasoning || "") + biasNote,
+      reasoning: rawReasoning + biasNote,
       tags,
+      aiScore,
+      aiReasoning: rawReasoning,
     };
   } catch (e) {
     logger.error(`[Scorer] AI scoreJob error: ${(e as Error).message}`);

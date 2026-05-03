@@ -9,12 +9,12 @@ import { SAFARI_UPWORK_PORT, BROWSER_MODE } from "../secret";
 import * as cloud from "../services/cloud";
 import * as obsidian from "../services/obsidian";
 import * as tg from "../services/telegram";
-import { generateCoverLetter, getPortfolioLine, qualityCheckCoverLetter, refineCoverLetter } from "../Agent";
+import { generateProposalContent, getLastVariantPicked, getPortfolioLineTracked, qualityCheckCoverLetter, qualityCheckSlots, refineCoverLetter, type ProposalSlots } from "../Agent";
 import { researchJob, formatResearchBrief } from "../services/research";
 import { scoreJob } from "../Agent/scorer";
 import * as upworkBrowser from "../browser/upwork";
 import type { SearchFilters, UpworkNotification, ArchivedProposal } from "../browser/upwork";
-import { AUTO_SEND, AUTO_SEND_MIN_SCORE } from "../secret";
+import { AUTO_SEND, AUTO_SEND_MIN_SCORE, AUTO_SEND_MIN_CONNECTS } from "../secret";
 import { getConnectsRemaining } from "../browser/upwork";
 
 const SAFARI_BASE = `http://localhost:${SAFARI_UPWORK_PORT}`;
@@ -60,6 +60,11 @@ export interface UpworkJob {
   // Enhanced insights
   paymentVerified?: boolean;
   screeningQuestionCount?: number;
+  // Structured proposal beats — populated by buildProposal()
+  proposalSlots?: ProposalSlots;
+  // A/B variant picked at gen time (read from getLastVariantPicked after buildProposal).
+  variantNiche?: string | null;
+  variantName?: string | null;
 }
 
 let safariUp: boolean | null = null;
@@ -147,7 +152,7 @@ export async function buildProposal(job: UpworkJob): Promise<UpworkJob> {
     }
   } catch { /* proceed without */ }
 
-  let coverLetter = await generateCoverLetter({
+  let { text: coverLetter, slots: proposalSlots } = await generateProposalContent({
     title: job.title,
     description: job.description,
     budget: job.budget,
@@ -156,6 +161,11 @@ export async function buildProposal(job: UpworkJob): Promise<UpworkJob> {
     tags: job.tags,
     jobId: job.id,
   });
+  // Capture which A/B variant (if any) the prompt picked. Read immediately so a parallel
+  // generation can't overwrite the module-level state before we stash it on the job.
+  const pickedVariant = getLastVariantPicked();
+  job.variantNiche = pickedVariant?.niche ?? null;
+  job.variantName = pickedVariant?.variant.name ?? null;
 
   // Quality gate: validate cover letter meets winning proposal standards
   const qualityCheck = qualityCheckCoverLetter(coverLetter, {
@@ -191,27 +201,122 @@ export async function buildProposal(job: UpworkJob): Promise<UpworkJob> {
     logger.info(`[Upwork] Quality gate PASSED (${qualityCheck.score}/100) for "${job.title.slice(0, 50)}"`);
   }
 
-  return { ...job, coverLetter };
+  // Per-beat slot coverage — surfaced for the dashboard, not blocking yet.
+  const slotCheck = qualityCheckSlots(proposalSlots || {});
+  const beats = (slotCheck.slotCoverage || []).map(s => `${s.name}=${s.present ? "✓" : "✗"}`).join(" ");
+  logger.info(`[Upwork] Slot coverage (${slotCheck.score}/100): ${beats}`);
+
+  return { ...job, coverLetter, proposalSlots };
 }
 
 // Connects budget thresholds
 const MIN_CONNECTS_RESERVE = 50;   // warn below this
-const MIN_CONNECTS_CRITICAL = 20;  // refuse to submit below this
+// Hard-stop floor — env-driven via AUTO_SEND_MIN_CONNECTS (default 16). All submission paths
+// (interactive, auto-send, daily plan, fast-poll, controller tools) gate on this single value
+// so a low-connects pause is consistent and the reason surfaces to logs + Telegram + dashboard.
+const MIN_CONNECTS_CRITICAL = AUTO_SEND_MIN_CONNECTS;
+
+// Hard ceiling on a single submission attempt. Successful submissions complete in 15-30s; the
+// fast-poll cycle is 60s. If a submit takes longer than 90s it's hung — usually Cloudflare
+// deadlock, a Puppeteer tab that never resolved, or AI rate-limit retries. We log + return
+// false so the lock releases and the queue moves on instead of cascading the backlog.
+const SUBMIT_TIMEOUT_MS = 90 * 1000;
+
+// Per-job recent-failure cooldown. After a submission fails (timeout, validation, expired,
+// already_applied, etc.) we record the jobId and refuse to retry it for COOLDOWN_MS. Without
+// this, the controller's submit_proposal_for_job tool keeps re-picking the same dead job from
+// the queue and burning the submission lock on it every cycle. Persists in-memory only — a
+// daemon restart clears it, which is fine: a few minutes of grace is enough for transient
+// failures, and after restart we'd want to retry once anyway.
+const RECENT_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;   // 30 min
+const _recentFailures = new Map<string, { reason: string; at: number }>();
+
+export function markJobFailed(jobId: string, reason: string): void {
+  if (!jobId) return;
+  _recentFailures.set(jobId, { reason, at: Date.now() });
+  // Cap map size — drop oldest entries when we exceed a sensible ceiling.
+  if (_recentFailures.size > 500) {
+    const oldest = Array.from(_recentFailures.entries()).sort((a, b) => a[1].at - b[1].at).slice(0, 50);
+    for (const [k] of oldest) _recentFailures.delete(k);
+  }
+}
+
+export function isJobInCooldown(jobId: string): { inCooldown: boolean; reason?: string; ageSec?: number } {
+  const entry = _recentFailures.get(jobId);
+  if (!entry) return { inCooldown: false };
+  const age = Date.now() - entry.at;
+  if (age > RECENT_FAILURE_COOLDOWN_MS) {
+    _recentFailures.delete(jobId);
+    return { inCooldown: false };
+  }
+  return { inCooldown: true, reason: entry.reason, ageSec: Math.round(age / 1000) };
+}
+
+/** Snapshot of all currently-cooled-down jobs for the dashboard / diagnostics. */
+export function getCooldownSnapshot(): { count: number; window_minutes: number; jobs: Array<{ jobId: string; reason: string; age_sec: number }> } {
+  const now = Date.now();
+  const jobs: Array<{ jobId: string; reason: string; age_sec: number }> = [];
+  for (const [jobId, entry] of _recentFailures.entries()) {
+    const age = now - entry.at;
+    if (age > RECENT_FAILURE_COOLDOWN_MS) { _recentFailures.delete(jobId); continue; }
+    jobs.push({ jobId, reason: entry.reason, age_sec: Math.round(age / 1000) });
+  }
+  jobs.sort((a, b) => a.age_sec - b.age_sec);
+  return { count: jobs.length, window_minutes: RECENT_FAILURE_COOLDOWN_MS / 60000, jobs };
+}
 
 export async function submitProposal(job: UpworkJob, opts?: { dryRun?: boolean }): Promise<boolean> {
+  // Cooldown gate — skip jobs that just failed, regardless of caller. Dry runs bypass the
+  // gate so the manual smoke test can still exercise a known-flaky job.
+  if (!opts?.dryRun && job.id) {
+    const cd = isJobInCooldown(job.id);
+    if (cd.inCooldown) {
+      logger.warn(`[Upwork] Skipping ${job.id.slice(0, 10)} — in failure cooldown (${cd.reason}, ${cd.ageSec}s ago, ${Math.round(RECENT_FAILURE_COOLDOWN_MS / 60000)}-min window)`);
+      return false;
+    }
+  }
   // Wrap in submission lock to prevent parallel submissions from overspending connects
-  return withSubmissionLock(async () => {
-    return _submitProposalInner(job, opts);
+  const ok = await withSubmissionLock(async () => {
+    return Promise.race([
+      _submitProposalInner(job, opts),
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => {
+          logger.error(`[Upwork] submitProposal HARD TIMEOUT (${SUBMIT_TIMEOUT_MS / 1000}s) for "${job.title?.slice(0, 60)}" — aborting + freeing lock`);
+          // Mark as timeout-failed so we don't immediately retry it.
+          if (job.id) markJobFailed(job.id, "hard_timeout");
+          resolve(false);
+        }, SUBMIT_TIMEOUT_MS);
+      }),
+    ]);
   });
+  // Failure capture: read the typed reason from the browser layer so cooldown reflects WHY.
+  if (!ok && !opts?.dryRun && job.id) {
+    try {
+      const { getLastSubmitFailure } = await import("../browser/upwork");
+      const failure = getLastSubmitFailure();
+      // Don't double-mark for hard_timeout (already set above) — but otherwise tag with the
+      // typed reason so cooldown messages are useful in the log.
+      if (failure.reason && !_recentFailures.has(job.id)) {
+        markJobFailed(job.id, failure.reason);
+      }
+    } catch { /* ignore */ }
+  }
+  return ok;
 }
 
 async function _submitProposalInner(job: UpworkJob, opts?: { dryRun?: boolean }): Promise<boolean> {
+  // Reset per-submission state so processJobs reads fresh signals after this attempt.
+  const browserMod = await import("../browser/upwork");
+  browserMod.resetLastSubmitConnectsCost();
+  browserMod.resetSubmitFailure();
+  browserMod.resetLastProposalsAtSubmit();
   try {
     // Connects budget check (skip for dry runs)
     if (!opts?.dryRun) {
       const connects = getConnectsRemaining();
       if (connects !== null && connects < MIN_CONNECTS_CRITICAL) {
         logger.warn(`[Upwork] Skipping submission — connects critically low (${connects})`);
+        browserMod.setSubmitFailure("low_connects", `Connects=${connects}, min=${MIN_CONNECTS_CRITICAL}`);
         await tg.notify(`⚠️ *Connects critically low: ${connects}*\nSkipping proposal for "${job.title.slice(0, 50)}"\nBuy more connects to resume submissions.`);
         return false;
       }
@@ -236,11 +341,19 @@ async function _submitProposalInner(job: UpworkJob, opts?: { dryRun?: boolean })
       }
     }
 
-    // Regenerate cover letter if empty (e.g. queued jobs from before the fix)
+    // Regenerate cover letter if empty (e.g. queued jobs from before the fix). Check the
+    // prewarm cache first — if fast-poll or processJobs kicked off generation earlier, we can
+    // unwrap the result instantly instead of paying another 4-10s of Claude latency.
     if (!job.coverLetter || job.coverLetter.trim().length === 0) {
-      logger.info(`[Upwork] Cover letter empty for "${(job.title || "").slice(0, 50)}" — regenerating...`);
-      const rebuilt = await buildProposal(job);
+      const { getPrewarmedProposal } = await import("../services/prewarm");
+      const prewarmed = await getPrewarmedProposal(job.id);
+      const rebuilt = prewarmed || await (async () => {
+        logger.info(`[Upwork] Cover letter empty for "${(job.title || "").slice(0, 50)}" — regenerating...`);
+        return buildProposal(job);
+      })();
       job.coverLetter = rebuilt.coverLetter;
+      job.variantNiche = rebuilt.variantNiche ?? job.variantNiche;
+      job.variantName = rebuilt.variantName ?? job.variantName;
       if (job.coverLetter && job.coverLetter.trim().length > 0) {
         // Save regenerated cover letter back to Supabase
         await cloud.saveProposal({
@@ -248,6 +361,8 @@ async function _submitProposalInner(job: UpworkJob, opts?: { dryRun?: boolean })
           description: job.description, budget: job.budget,
           score: job.score || 0, bid: job.bid || 0,
           coverLetter: job.coverLetter,
+          variantNiche: job.variantNiche,
+          variantName: job.variantName,
         });
         logger.info(`[Upwork] Regenerated cover letter: ${job.coverLetter.length} chars`);
       } else {
@@ -290,7 +405,7 @@ async function _submitProposalInner(job: UpworkJob, opts?: { dryRun?: boolean })
  * Shared scoring + dedup + approval flow for any job list.
  * Used by both keyword search and Best Matches.
  */
-async function processJobs(
+export async function processJobs(
   jobs: UpworkJob[],
   scoreThreshold: number,
   label: string,
@@ -362,11 +477,17 @@ async function processJobs(
       try {
         const built = await buildProposal(job);
         job.coverLetter = built.coverLetter;
+        job.proposalSlots = built.proposalSlots;
         logger.info(`[Upwork] Pre-generated cover letter: ${(job.coverLetter || "").length} chars`);
       } catch (e) {
         logger.warn(`[Upwork] Cover letter pre-gen failed: ${(e as Error).message}`);
       }
     }
+
+    // Snapshot the absolute posted timestamp from the relative string Upwork showed at scrape
+    // time. We do this here (not at scan time) because some scan paths skip the parse step.
+    const { parseRelativePosted } = await import("../services/posted-at");
+    const postedAt = parseRelativePosted(job.posted)?.toISOString() ?? null;
 
     await cloud.saveProposal({
       jobId: job.id, title: job.title, url: job.url,
@@ -374,8 +495,12 @@ async function processJobs(
       score: result.score, preScore: result.preScore,
       status,
       reasoning: result.reasoning,
+      aiScore: result.aiScore,
+      aiReasoning: result.aiReasoning,
       tags: result.tags,
       coverLetter: job.coverLetter,
+      slots: job.proposalSlots,
+      postedAt,
       // Freelancer Plus insights
       clientHireRate: job.clientHireRate,
       clientHires: job.clientHires,
@@ -386,6 +511,8 @@ async function processJobs(
       // Enhanced insights
       paymentVerified: job.paymentVerified,
       screeningQuestionCount: job.screeningQuestionCount,
+      variantNiche: job.variantNiche,
+      variantName: job.variantName,
     }).catch((e) => logger.warn(`[Upwork] Failed to save: ${(e as Error).message}`));
 
     if (result.score >= scoreThreshold) {
@@ -416,9 +543,9 @@ async function processJobs(
   for (const job of scoredJobs) {
     // Check connects budget before submitting
     const connects = getConnectsRemaining();
-    if (connects !== null && connects < 16) {
-      logger.warn(`[Upwork] Low connects: ${connects} remaining — pausing auto-submissions`);
-      await tg.notify(`⚠️ Low connects: ${connects} remaining. Pausing auto-submissions.`);
+    if (connects !== null && connects < MIN_CONNECTS_CRITICAL) {
+      logger.warn(`[Upwork] Hard-stop: ${connects} connects < AUTO_SEND_MIN_CONNECTS (${MIN_CONNECTS_CRITICAL}) — pausing auto-submissions`);
+      await tg.notify(`⚠️ Hard-stop: ${connects} connects < min ${MIN_CONNECTS_CRITICAL}. Pausing auto-submissions.`);
       break;
     }
 
@@ -427,7 +554,7 @@ async function processJobs(
     // Add portfolio line in auto-send mode (only if not already present)
     const autoSendEligible = AUTO_SEND && (proposal.score || 0) >= AUTO_SEND_MIN_SCORE;
     if (autoSendEligible) {
-      const portfolioLine = getPortfolioLine(proposal.tags, proposal.id);
+      const portfolioLine = await getPortfolioLineTracked(proposal.tags, proposal.id);
       if (portfolioLine && !(proposal.coverLetter || "").includes(portfolioLine)) {
         proposal.coverLetter = `${portfolioLine}\n\n${proposal.coverLetter || ""}`;
       }
@@ -438,6 +565,7 @@ async function processJobs(
       description: proposal.description, budget: proposal.budget,
       score: proposal.score || 0, bid: proposal.bid || 0,
       coverLetter: proposal.coverLetter || "", status: autoSendEligible ? "auto_sending" : "pending",
+      slots: proposal.proposalSlots,
     });
     obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, "pending");
 
@@ -465,9 +593,9 @@ async function processJobs(
       // ── AUTO-SEND: no human approval needed ──
       // Re-check connects right before submission (may have changed since loop start)
       const connectsNow = getConnectsRemaining();
-      if (connectsNow !== null && connectsNow < 16) {
-        logger.warn(`[Upwork] AUTO-SEND skipped: only ${connectsNow} connects remaining`);
-        await tg.notify(`⚠️ Auto-send skipped for "${proposal.title.slice(0, 40)}" — only ${connectsNow} connects left`);
+      if (connectsNow !== null && connectsNow < MIN_CONNECTS_CRITICAL) {
+        logger.warn(`[Upwork] AUTO-SEND skipped: ${connectsNow} connects < AUTO_SEND_MIN_CONNECTS (${MIN_CONNECTS_CRITICAL})`);
+        await tg.notify(`⚠️ Auto-send skipped for "${proposal.title.slice(0, 40)}" — ${connectsNow} connects < min ${MIN_CONNECTS_CRITICAL}`);
         await cloud.updateProposalStatus(proposal.id, "queued");
         continue;
       }
@@ -477,14 +605,45 @@ async function processJobs(
       const submitStart = Date.now();
       const ok = await submitProposal(proposal);
       const submitSec = ((Date.now() - submitStart) / 1000).toFixed(0);
-      const status = ok ? "submitted" : "error";
-      await cloud.updateProposalStatus(proposal.id, status);
+
+      // Pull connect cost + typed failure reason + proposals-at-submit from the browser layer.
+      const { getLastSubmitConnectsCost, getLastSubmitFailure, getLastProposalsAtSubmit } = await import("../browser/upwork");
+      const connectsCost = getLastSubmitConnectsCost();
+      const connectsRemaining = getConnectsRemaining();
+      const failure = getLastSubmitFailure();
+      const proposalsAtSubmit = getLastProposalsAtSubmit();
+
+      // Map the typed reason to a specific status so the queue / dashboard / reinforcement loop
+      // can distinguish stale-job churn from real bugs. Generic "error" was hiding all of it.
+      const FAILURE_TO_STATUS: Record<string, string> = {
+        job_not_found: "expired",
+        apply_disabled: "already_applied",
+        cloudflare: "cloudflare_blocked",
+        validation_error: "validation_error",
+        no_cover_letter: "error_no_cover_letter",
+        low_connects: "error_low_connects",
+        bid_out_of_range: "error_bid",
+        puppeteer_error: "error_puppeteer",
+        unknown: "error",
+      };
+      const status = ok
+        ? "submitted"
+        : (failure.reason ? (FAILURE_TO_STATUS[failure.reason] || "error") : "error");
+
+      const extra: Record<string, unknown> = {};
+      if (connectsCost != null) extra.submitted_connects_cost = connectsCost;
+      if (proposalsAtSubmit != null) extra.proposals_when_submitted = proposalsAtSubmit;
+      if (!ok && failure.detail) extra.reasoning = failure.detail;
+
+      await cloud.updateProposalStatus(proposal.id, status, extra);
       obsidian.logProposal({ title: proposal.title, score: proposal.score || 0, bid: proposal.bid || 0 }, status);
       const posted = proposal.posted || "";
       const speedInfo = posted ? ` | Posted: ${posted}` : "";
+      const costInfo = connectsCost != null ? ` | Spent ${connectsCost}c, ${connectsRemaining ?? "?"} left` : "";
+      const reasonInfo = !ok && failure.reason ? ` (${failure.reason})` : "";
       await tg.notify(ok
-        ? `🚀 Auto-submitted in ${submitSec}s: ${proposal.title}${speedInfo}`
-        : `❌ Auto-submit failed (${submitSec}s): ${proposal.title}`);
+        ? `🚀 Auto-submitted in ${submitSec}s: ${proposal.title}${speedInfo}${costInfo}`
+        : `❌ Auto-submit failed [${status}] (${submitSec}s)${reasonInfo}: ${proposal.title}`);
     } else {
       // ── MANUAL APPROVAL: send to Telegram and wait ──
       await tg.sendForApproval({
@@ -494,11 +653,18 @@ async function processJobs(
         jobUrl: proposal.url,
       });
 
+      // While the human is reviewing, kick off prewarm so the cover letter is already cached
+      // by the time they hit Approve — submit happens instantly instead of paying a regen.
+      try {
+        const { prewarmProposal } = await import("../services/prewarm");
+        prewarmProposal(proposal);
+      } catch { /* prewarm is best-effort */ }
+
       const { action } = await tg.waitForApproval(proposal.id, "upwork");
 
       if (action === "send" || action === "send_with_portfolio") {
         if (action === "send_with_portfolio") {
-          const portfolioLine = getPortfolioLine(proposal.tags, proposal.id);
+          const portfolioLine = await getPortfolioLineTracked(proposal.tags, proposal.id);
           if (portfolioLine && !(proposal.coverLetter || "").includes(portfolioLine)) {
             proposal.coverLetter = `${portfolioLine}\n\n${proposal.coverLetter || ""}`;
             await cloud.saveProposal({
@@ -506,6 +672,7 @@ async function processJobs(
               description: proposal.description, budget: proposal.budget,
               score: proposal.score || 0, bid: proposal.bid || 0,
               coverLetter: proposal.coverLetter, status: "pending",
+              slots: proposal.proposalSlots,
             });
             await tg.notify(`📋 Portfolio link added to proposal: ${proposal.title}`);
           }
@@ -597,9 +764,9 @@ export async function submitTopQueued(count = 1): Promise<{ submitted: number; f
 
   for (const row of topJobs) {
     const connects = getConnectsRemaining();
-    if (connects !== null && connects < 16) {
-      logger.warn(`[Upwork] Auto-submit: only ${connects} connects — stopping`);
-      await tg.notify(`⚠️ Auto-submit paused: ${connects} connects remaining`);
+    if (connects !== null && connects < MIN_CONNECTS_CRITICAL) {
+      logger.warn(`[Upwork] Auto-submit: ${connects} connects < AUTO_SEND_MIN_CONNECTS (${MIN_CONNECTS_CRITICAL}) — stopping`);
+      await tg.notify(`⚠️ Auto-submit paused: ${connects} connects < min ${MIN_CONNECTS_CRITICAL}`);
       break;
     }
 
@@ -720,6 +887,55 @@ export async function checkAndProcessNotifications(): Promise<{
     ["interview_invite", "offer", "hire", "message", "proposal_declined"].includes(n.type)
   );
 
+  // ── Outcome auto-capture ────────────────────────────────────────────────
+  // Every notification that references a job we've submitted on becomes a status update.
+  // Maps the typed notification → outcome so the dashboard / reinforcement loop see real
+  // signals instead of every submitted proposal sitting in "submitted" forever.
+  // We match by job_id parsed from the notification URL — only proposals already in Supabase
+  // get touched (we don't fabricate rows from new-job alerts here).
+  const NOTIFICATION_TO_OUTCOME: Partial<Record<UpworkNotification["type"], "won" | "rejected" | "interviewed" | "no_response">> = {
+    hire: "won",
+    offer: "won",
+    proposal_declined: "rejected",
+    interview_invite: "interviewed",
+    message: "interviewed",            // client messaged us = active conversation
+    // proposal_viewed is intentionally not mapped — it's a soft signal we capture below
+    //   without overwriting the binary outcome state.
+  };
+  let outcomeUpdates = 0;
+  let viewedSignals = 0;
+  for (const n of notifications) {
+    if (!n.url) continue;
+    const m = n.url.match(/~0?([a-f0-9]{10,})/);
+    if (!m) continue;
+    const jobId = m[1];
+    // Only act on jobs that are already in our DB (i.e. we've submitted on them).
+    const exists = await cloud.proposalExists(jobId).catch(() => false);
+    if (!exists) continue;
+
+    const outcome = NOTIFICATION_TO_OUTCOME[n.type];
+    if (outcome) {
+      try {
+        await cloud.recordOutcome(jobId, outcome);
+        outcomeUpdates++;
+        logger.info(`[Upwork] Auto-marked outcome: ${jobId.slice(0, 10)} → ${outcome} (from ${n.type} notification)`);
+      } catch (e) {
+        logger.warn(`[Upwork] Failed to record outcome for ${jobId}: ${(e as Error).message}`);
+      }
+    } else if (n.type === "proposal_viewed") {
+      // Soft signal: don't change status, just stamp the viewed timestamp via reasoning text.
+      // updateProposalStatus's `extra` map lets us persist a timestamp without forcing an
+      // outcome category. This unblocks "we got viewed in N minutes" analytics later.
+      await cloud.updateProposalStatus(jobId, "submitted", {
+        viewed_at: new Date().toISOString(),
+      }).catch(() => {});
+      viewedSignals++;
+    }
+  }
+  if (outcomeUpdates > 0 || viewedSignals > 0) {
+    logger.info(`[Upwork] Notification → outcome sync: ${outcomeUpdates} status updates, ${viewedSignals} viewed signals`);
+  }
+
   // Emoji map for notification types
   const emoji: Record<string, string> = {
     interview_invite: "📩",
@@ -793,6 +1009,8 @@ export async function checkAndProcessNotifications(): Promise<{
             score: result.score, preScore: result.preScore,
             coverLetter: built.coverLetter, status: "auto_sending",
             reasoning: result.reasoning, tags: result.tags,
+            aiScore: result.aiScore, aiReasoning: result.aiReasoning,
+            slots: built.proposalSlots,
           });
 
           await tg.notify(`📩 *Auto-applying to invite* [${result.score}/10]\n${details.title.slice(0, 60)}\n💰 ${details.budget || "N/A"}\n🔗 ${invite.url}`);
@@ -809,6 +1027,7 @@ export async function checkAndProcessNotifications(): Promise<{
             description: details.description, budget: details.budget,
             score: result.score, status: result.excluded ? "excluded" : "queued",
             reasoning: result.reasoning || result.excluded, tags: result.tags,
+            aiScore: result.aiScore, aiReasoning: result.aiReasoning,
           });
           if (!result.excluded) {
             await tg.notify(`📩 *Invite queued* [${result.score}/10] — below auto-apply threshold\n${details.title.slice(0, 60)}\n🔗 ${invite.url}`);
@@ -866,6 +1085,8 @@ export async function checkAndProcessNotifications(): Promise<{
             score: result.score, preScore: result.preScore,
             coverLetter: built.coverLetter, status: "auto_sending",
             reasoning: result.reasoning, tags: result.tags,
+            aiScore: result.aiScore, aiReasoning: result.aiReasoning,
+            slots: built.proposalSlots,
           });
 
           await tg.notify(`🔔 *Job alert auto-apply* [${result.score}/10]\n${details.title.slice(0, 60)}\n💰 ${details.budget || "N/A"}\n🔗 ${alert.url}`);
@@ -882,6 +1103,7 @@ export async function checkAndProcessNotifications(): Promise<{
             description: details.description, budget: details.budget,
             score: result.score, status: "queued",
             reasoning: result.reasoning, tags: result.tags,
+            aiScore: result.aiScore, aiReasoning: result.aiReasoning,
           });
           await tg.notify(`📋 *Job alert queued* [${result.score}/10]\n${details.title.slice(0, 60)}\n💰 ${details.budget || "N/A"}\n🔗 ${alert.url}`);
         }
@@ -940,12 +1162,22 @@ export async function getCloseRateMetrics(): Promise<{
   noResponse: number;
   closeRate: number;
   avgScore: number;
+  windows: {
+    "7d": { submitted: number; won: number; closeRate: number };
+    "30d": { submitted: number; won: number; closeRate: number };
+    "90d": { submitted: number; won: number; closeRate: number };
+  };
 }> {
-  const metrics = await cloud.getProposalMetrics();
+  const [metrics, w7, w30, w90] = await Promise.all([
+    cloud.getProposalMetrics(),
+    cloud.getCloseRateWindow(7),
+    cloud.getCloseRateWindow(30),
+    cloud.getCloseRateWindow(90),
+  ]);
   const closeRate = metrics.submitted > 0
     ? Math.round((metrics.won / metrics.submitted) * 100)
     : 0;
-  return { ...metrics, closeRate };
+  return { ...metrics, closeRate, windows: { "7d": w7, "30d": w30, "90d": w90 } };
 }
 
 // ── Archived Proposals & Lessons Learned ──────────────────────────────────
