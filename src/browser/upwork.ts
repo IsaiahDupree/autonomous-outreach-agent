@@ -6,6 +6,7 @@ import type { Page } from "puppeteer";
 import { newPage, humanDelay, waitForCloudflare, launch, saveCookies, restoreCookies, hasSavedCookies } from "./engine";
 import logger from "../config/logger";
 import { answerScreeningQuestion } from "../Agent";
+import { requestChromeRestart } from "../services/process-control";
 
 /** Fast text insertion via CDP — avoids per-keystroke overhead on heavy pages */
 async function fastType(page: Page, text: string): Promise<void> {
@@ -28,6 +29,83 @@ export function setBrowserBusy(busy: boolean): void { _browserBusy = busy; }
 // Connects balance tracking
 let _connectsRemaining: number | null = null;
 export function getConnectsRemaining(): number | null { return _connectsRemaining; }
+
+// Per-submission connect cost — populated by submitProposal (browser-level) so that
+// processJobs (client-level) can read it and persist to upwork_proposals.submitted_connects_cost.
+let _lastSubmitConnectsCost: number | null = null;
+export function getLastSubmitConnectsCost(): number | null { return _lastSubmitConnectsCost; }
+export function resetLastSubmitConnectsCost(): void { _lastSubmitConnectsCost = null; }
+
+// Per-submission failure reason — distinguishes "Job not found" / Cloudflare / validation /
+// timeout from generic errors. processJobs reads this AFTER a failed submitProposal so we can
+// store the specific status (e.g. status="expired") instead of a generic "error". Without this,
+// every failure looks the same in the queue and stale jobs get retried forever.
+export type SubmitFailureReason =
+  | "job_not_found"      // Upwork redirected to /freelance-jobs/apply/ or "Job not found" body
+  | "apply_disabled"     // Apply button found but disabled (already applied / cannot bid)
+  | "cloudflare"         // Cloudflare challenge couldn't be solved
+  | "validation_error"   // Form submitted but Upwork rejected (e.g. "Hourly rate")
+  | "no_cover_letter"    // Cover letter regen failed and no original
+  | "low_connects"       // Connects below MIN_CONNECTS_CRITICAL
+  | "bid_out_of_range"   // Bid > MAX_BID or < MIN_BID
+  | "puppeteer_error"    // Generic browser failure
+  | "unknown";
+
+let _lastSubmitFailureReason: SubmitFailureReason | null = null;
+let _lastSubmitFailureDetail: string | null = null;
+export function getLastSubmitFailure(): { reason: SubmitFailureReason | null; detail: string | null } {
+  return { reason: _lastSubmitFailureReason, detail: _lastSubmitFailureDetail };
+}
+export function setSubmitFailure(reason: SubmitFailureReason, detail?: string): void {
+  _lastSubmitFailureReason = reason;
+  _lastSubmitFailureDetail = detail ?? null;
+}
+export function resetSubmitFailure(): void {
+  _lastSubmitFailureReason = null;
+  _lastSubmitFailureDetail = null;
+}
+
+// Number of proposals already on this job at the moment we hit Submit. Captured during the
+// apply-form scrape and read by processJobs to persist to upwork_proposals.proposals_when_submitted.
+let _lastProposalsAtSubmit: number | null = null;
+export function getLastProposalsAtSubmit(): number | null { return _lastProposalsAtSubmit; }
+export function resetLastProposalsAtSubmit(): void { _lastProposalsAtSubmit = null; }
+
+// Live in-flight submission state — visible via /api/agent/in-flight so the dashboard can
+// show "currently submitting: <title> | step: form-fill | elapsed: 23s". Clears when the
+// submission resolves (success or failure). Single-slot because withSubmissionLock serializes
+// real submissions one at a time.
+export type InFlightStep =
+  | "starting" | "navigating" | "cloudflare" | "applying" | "form_open"
+  | "filling" | "submitting" | "verifying" | "boosting";
+export interface InFlightState {
+  jobId: string;
+  jobTitle: string;
+  jobUrl: string;
+  step: InFlightStep;
+  startedAt: string;
+  stepStartedAt: string;
+}
+let _inFlight: InFlightState | null = null;
+export function getInFlight(): (InFlightState & { elapsed_sec: number; step_elapsed_sec: number }) | null {
+  if (!_inFlight) return null;
+  const now = Date.now();
+  return {
+    ..._inFlight,
+    elapsed_sec: Math.round((now - new Date(_inFlight.startedAt).getTime()) / 1000),
+    step_elapsed_sec: Math.round((now - new Date(_inFlight.stepStartedAt).getTime()) / 1000),
+  };
+}
+export function setInFlight(s: { jobId: string; jobTitle: string; jobUrl: string }): void {
+  const nowIso = new Date().toISOString();
+  _inFlight = { ...s, step: "starting", startedAt: nowIso, stepStartedAt: nowIso };
+}
+export function setInFlightStep(step: InFlightStep): void {
+  if (!_inFlight) return;
+  _inFlight.step = step;
+  _inFlight.stepStartedAt = new Date().toISOString();
+}
+export function clearInFlight(): void { _inFlight = null; }
 
 export interface ScrapedJob {
   id: string;
@@ -729,6 +807,51 @@ async function ensureLoggedIn(page: Page): Promise<boolean> {
 }
 
 /**
+ * PUBLIC: detect signed-out state and auto-login. Safe to call anywhere — startup, cron tick,
+ * fast-poll, before submission. Returns true when the session is healthy at end of call.
+ *
+ * Flow:
+ *   1. checkSessionHealth() — fast read on whatever Upwork tab is active.
+ *   2. If healthy, return true.
+ *   3. Else navigate the tab to the login page and run handleLogin (uses UPWORK_EMAIL/PASSWORD).
+ *   4. Re-check; return final state.
+ *
+ * Notification: callers can opt into Telegram alerts via the optional `notify` arg so we don't
+ * spam at every tick — only the cron / startup pass true.
+ */
+export async function ensureUpworkLoggedIn(notify?: (msg: string) => Promise<void>): Promise<boolean> {
+  const initial = await checkSessionHealth();
+  if (initial.valid) return true;
+
+  logger.warn(`[Browser/Upwork] Session invalid: ${initial.detail} — attempting auto-login`);
+  if (notify) await notify(`⚠️ Upwork session expired: ${initial.detail.slice(0, 120)} — auto-logging in...`).catch(() => {});
+
+  if (!process.env.UPWORK_EMAIL || !process.env.UPWORK_PASSWORD) {
+    const msg = "Cannot auto-login — UPWORK_EMAIL/UPWORK_PASSWORD not set in .env";
+    logger.error(`[Browser/Upwork] ${msg}`);
+    if (notify) await notify(`❌ ${msg}`).catch(() => {});
+    return false;
+  }
+
+  try {
+    const page = await getActivePage();
+    const ok = await ensureLoggedIn(page);
+    if (ok) {
+      logger.info("[Browser/Upwork] Auto-login succeeded");
+      if (notify) await notify("✅ Upwork auto-login succeeded — session restored").catch(() => {});
+    } else {
+      logger.error("[Browser/Upwork] Auto-login failed");
+      if (notify) await notify("❌ Upwork auto-login FAILED — manual intervention needed (run `npm run login:upwork`)").catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] Auto-login error: ${(e as Error).message}`);
+    if (notify) await notify(`❌ Upwork auto-login error: ${(e as Error).message.slice(0, 200)}`).catch(() => {});
+    return false;
+  }
+}
+
+/**
  * Search for jobs with a single keyword and optional filters.
  */
 // Track consecutive Cloudflare blocks for backoff
@@ -751,8 +874,17 @@ async function getActivePage(): Promise<Page> {
 /**
  * Helper: solve Cloudflare with retry + exponential backoff.
  * Returns the active page after solving (page ref may change due to CDP reconnect).
+ *
+ * `maxTotalMs` is the hard wall-clock budget across all attempts. Submissions have a 90s
+ * outer timeout, so the default 60s here leaves ~30s for the actual proposal flow. Callers
+ * doing background work (scan, login warm-up) can pass a larger budget.
  */
-async function solveCloudflareWithRetry(page: Page, maxAttempts = 3): Promise<{ page: Page; passed: boolean }> {
+async function solveCloudflareWithRetry(
+  page: Page,
+  maxAttempts = 3,
+  maxTotalMs = 60_000,
+): Promise<{ page: Page; passed: boolean }> {
+  const start = Date.now();
   let currentPage = page;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const title = await currentPage.title().catch(() => "");
@@ -761,8 +893,25 @@ async function solveCloudflareWithRetry(page: Page, maxAttempts = 3): Promise<{ 
       return { page: currentPage, passed: true };
     }
 
-    logger.info(`[Browser/Upwork] Cloudflare solve attempt ${attempt}/${maxAttempts}`);
-    const passed = await waitForCloudflare(currentPage, 90000);
+    const remaining = maxTotalMs - (Date.now() - start);
+    if (remaining <= 1000) {
+      logger.warn(`[Browser/Upwork] Cloudflare time budget exhausted after attempt ${attempt - 1}/${maxAttempts}`);
+      _cfConsecutiveBlocks++;
+      // cloudflare-recover-001: budget exhausted means we've spent the full ~60s
+      // wall-clock attempting to solve and still see "Just a moment" / "Checking".
+      // Looping again would just re-enter the same wedged session — restart Chrome
+      // (cooldowned in process-control to avoid thrash) so the next call gets a
+      // fresh browser context. Best-effort: failure here just falls through.
+      const restarted = await requestChromeRestart(`cloudflare stuck >${Math.round(maxTotalMs / 1000)}s`).catch(() => false);
+      if (restarted) {
+        currentPage = await getActivePage().catch(() => currentPage);
+      }
+      return { page: currentPage, passed: false };
+    }
+    // Cap each attempt at remaining budget (or 30s, whichever is smaller).
+    const attemptBudgetMs = Math.min(30_000, remaining);
+    logger.info(`[Browser/Upwork] Cloudflare solve attempt ${attempt}/${maxAttempts} (budget ${Math.round(attemptBudgetMs / 1000)}s, ${Math.round(remaining / 1000)}s remaining)`);
+    const passed = await waitForCloudflare(currentPage, attemptBudgetMs);
     currentPage = await getActivePage();
 
     if (passed) {
@@ -772,11 +921,21 @@ async function solveCloudflareWithRetry(page: Page, maxAttempts = 3): Promise<{ 
 
     _cfConsecutiveBlocks++;
     if (attempt < maxAttempts) {
-      // Exponential backoff: 15s, 30s, 60s...
-      const backoffMs = Math.min(15000 * Math.pow(2, attempt - 1), 120000);
+      const remainingAfter = maxTotalMs - (Date.now() - start);
+      if (remainingAfter <= 2000) {
+        logger.warn(`[Browser/Upwork] Cloudflare time budget exhausted (${Math.round(remainingAfter / 1000)}s remaining) — bailing out`);
+        return { page: currentPage, passed: false };
+      }
+      // Cap backoff at half of remaining budget so we always get one more try.
+      const backoffMs = Math.min(15000 * Math.pow(2, attempt - 1), Math.max(1000, Math.floor(remainingAfter / 2)));
       logger.info(`[Browser/Upwork] Cloudflare blocked — backing off ${Math.round(backoffMs / 1000)}s before retry`);
       await new Promise(r => setTimeout(r, backoffMs));
     }
+  }
+  // All attempts failed within budget — same recovery as budget-exhausted path.
+  const restarted = await requestChromeRestart(`cloudflare stuck across ${maxAttempts} attempts`).catch(() => false);
+  if (restarted) {
+    currentPage = await getActivePage().catch(() => currentPage);
   }
   return { page: currentPage, passed: false };
 }
@@ -1561,34 +1720,49 @@ export async function submitProposal(
     // Set busy flag so scan loop pauses
     setBrowserBusy(true);
 
-    // Open a DEDICATED new tab for submission to avoid conflicts with scan's page.
-    // This prevents CDP frame detachment when the scan navigates concurrently.
     const b = await launch();
-
-    // Copy cookies from existing Upwork page (if any) so the new tab is authenticated
     const existingPages = await b.pages();
     const upworkPage = existingPages.find(p => p.url().includes("upwork.com") && !p.url().includes("about:blank"));
-    let cookies: any[] = [];
-    if (upworkPage) {
-      cookies = await upworkPage.cookies().catch(() => []);
+
+    // For dry-runs, reuse the user's existing logged-in Upwork tab. Spawning a fresh tab via
+    // CDP causes Upwork's SPA to render a near-blank page (likely automation detection on the
+    // brand-new context), so the Apply button never appears. The user's tab is already
+    // authenticated and trusted, so navigating it directly works.
+    //
+    // For real submissions we still want a dedicated tab so we don't yank the user's UI mid-task.
+    if (options?.dryRun && upworkPage) {
+      logger.info(`[Browser/Upwork] Dry-run: reusing existing Upwork tab at ${upworkPage.url().slice(0, 80)}`);
+      page = upworkPage;
+      dedicatedTab = false;
+    } else {
+      // Production / no existing tab: open a DEDICATED new tab. Copy cookies from the existing
+      // tab (if any) so the new tab is authenticated.
+      let cookies: any[] = [];
+      if (upworkPage) {
+        cookies = await upworkPage.cookies().catch(() => []);
+      }
+
+      page = await b.newPage();
+      dedicatedTab = true;
+
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => false });
+        Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      });
+
+      if (cookies.length > 0) {
+        await page.setCookie(...cookies);
+      } else if (hasSavedCookies()) {
+        await restoreCookies(page);
+      }
     }
 
-    page = await b.newPage();
-    dedicatedTab = true;
+    // Force viewport — when Puppeteer attaches via CDP to existing Chrome the page can render
+    // off-screen with no visible width, which hid Upwork's job content + Apply button.
+    await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
 
     // Set realistic headers (same as engine.newPage)
     await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => false });
-      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-    });
-
-    // Restore cookies to the new tab
-    if (cookies.length > 0) {
-      await page.setCookie(...cookies);
-    } else if (hasSavedCookies()) {
-      await restoreCookies(page);
-    }
 
     // Auto-dismiss any browser dialogs (alert/confirm/prompt)
     // Use a named handler so we can clean it up in the finally block
@@ -1601,11 +1775,17 @@ export async function submitProposal(
     // Navigate to job using Chrome's native navigation (less detectable than page.goto)
     const jobId = jobUrl.match(/~(\w+)/)?.[1] || Date.now().toString();
     logger.info(`[Browser/Upwork] Navigating to job for proposal: ${jobUrl.slice(0, 80)}`);
+    // Live state for the dashboard's "submitting now" card.
+    setInFlight({ jobId, jobTitle: options?.jobTitle || jobUrl.slice(0, 80), jobUrl });
+    setInFlightStep("navigating");
     await page.evaluate((url: string) => { window.location.href = url; }, jobUrl);
-    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
+    // Tightened from 30s → 15s. The outer submit timeout is 90s; blowing 30s on a single
+    // navigate left almost no budget for Cloudflare + form fill + verify.
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {});
     await humanDelay(800, 1500);
 
     // ── Solve Cloudflare if present ──────────────────────
+    setInFlightStep("cloudflare");
     const cfResult = await solveCloudflareWithRetry(page);
     if (cfResult.page !== page) {
       page = cfResult.page;
@@ -1619,6 +1799,7 @@ export async function submitProposal(
     }
     if (!cfResult.passed) {
       logger.error("[Browser/Upwork] Cloudflare challenge failed — cannot access job page");
+      setSubmitFailure("cloudflare", "Cloudflare challenge could not be solved within the retry budget");
       return false;
     }
 
@@ -1635,14 +1816,29 @@ export async function submitProposal(
       logger.error("[Browser/Upwork] Cannot read page content — CDP session may be invalid");
       return false;
     }
-    if (pageText.includes("client is suspended") || pageText.includes("no longer available") || pageText.includes("has been closed")) {
-      logger.error(`[Browser/Upwork] Job is not available (suspended/closed/removed)`);
+    if (
+      pageText.includes("client is suspended") ||
+      pageText.includes("no longer available") ||
+      pageText.includes("has been closed") ||
+      pageText.includes("Job not found") ||
+      /\/freelance-jobs\/apply\//.test(await page.url())   // Upwork redirects expired jobs to this path
+    ) {
+      const url = (await page.url()).slice(0, 120);
+      logger.error(`[Browser/Upwork] Job is not available (suspended/closed/removed/notfound) — URL: ${url}`);
+      setSubmitFailure("job_not_found", `Job page redirected or shows not-found state: ${url}`);
       await page.screenshot({ path: `debug-proposal-unavailable-${Date.now()}.png` }).catch(() => {});
       return false;
     }
 
     // ── Click "Apply Now" ──────────────────────────────
+    setInFlightStep("applying");
+    // Selectors observed live (2026-04, scripts/diag-find-apply.ts): Upwork uses
+    //   id="submit-proposal-button" / data-cy="submit-proposal-button" / aria-label="Apply now"
+    // Older [data-test="apply-button"] kept as fallback for legacy job pages.
     const applySelectors = [
+      '#submit-proposal-button',
+      'button[data-cy="submit-proposal-button"]',
+      'button[aria-label="Apply now"]',
       'button[data-test="apply-button"]',
       'a[href*="proposals/job"]',
     ];
@@ -1657,6 +1853,7 @@ export async function submitProposal(
         }, btn);
         if (isDisabled) {
           logger.error(`[Browser/Upwork] Apply button found but is disabled: ${sel}`);
+          setSubmitFailure("apply_disabled", `Apply button disabled — already applied, job paused, or client suspended`);
           return false;
         }
         await btn.click();
@@ -1700,6 +1897,16 @@ export async function submitProposal(
         return "Apply button not found on page";
       });
       logger.error(`[Browser/Upwork] Cannot apply: ${reason}`);
+      // Map the discovered reason to a typed failure category so the dashboard / reinforcement
+      // loop can distinguish "this job was closed" from "Upwork's UI changed and we can't find the button".
+      const lower = reason.toLowerCase();
+      if (lower.includes("client is suspended") || lower.includes("no longer available") || lower.includes("has been closed")) {
+        setSubmitFailure("job_not_found", reason);
+      } else if (lower.includes("disabled")) {
+        setSubmitFailure("apply_disabled", reason);
+      } else {
+        setSubmitFailure("puppeteer_error", reason);
+      }
       await page.screenshot({ path: `debug-proposal-no-apply-${Date.now()}.png` }).catch(() => {});
       return false;
     }
@@ -1719,9 +1926,16 @@ export async function submitProposal(
       logger.info(`[Browser/Upwork] Switched to proposal page: ${page.url().slice(0, 80)}`);
     }
 
-    // Solve Cloudflare on proposal form page if needed
-    const cfForm = await solveCloudflareWithRetry(page);
+    // Solve Cloudflare on proposal form page if needed.
+    // Tighter budget here (30s) — the initial nav already took up to 60s of CF budget and
+    // hitting CF a second time on the form is rare. Total CF budget across both checks ≤ 90s.
+    const cfForm = await solveCloudflareWithRetry(page, 2, 30_000);
     if (cfForm.page !== page) page = cfForm.page;
+    if (!cfForm.passed) {
+      logger.error("[Browser/Upwork] Cloudflare on proposal form could not be solved within budget");
+      setSubmitFailure("cloudflare", "Cloudflare challenge on proposal form");
+      return false;
+    }
 
     await waitForContent(page);
 
@@ -1743,8 +1957,35 @@ export async function submitProposal(
 
     await page.screenshot({ path: `debug-proposal-form-${jobId}.png` }).catch(() => {});
 
-    // Log form inventory
+    // Log form inventory + capture "X proposals already submitted" — Upwork displays this on
+    // the apply form so freelancers know how saturated the job is. We persist it as
+    // proposals_when_submitted so the dashboard can show "we got there at proposal #N" and
+    // correlate first-to-apply position with response/win rate.
     const formInfo = await page.evaluate(() => {
+      const text = document.body.innerText || "";
+      // Match patterns like:
+      //   "12 proposals" / "Less than 5" / "5 to 10" / "20+"
+      //   appearing near a heading like "Activity on this job" or "Proposals"
+      let proposalsAtSubmit: number | null = null;
+      // Look near "Activity on this job" / "Proposals:" / "proposals" tokens
+      const blocks = Array.from(document.querySelectorAll("section, aside, div"))
+        .map(el => (el as HTMLElement).innerText || "")
+        .filter(t => t.length < 600 && /proposals?/i.test(t));
+      for (const b of blocks) {
+        const range = b.match(/(\d+)\s*to\s*(\d+)\s*proposals?/i);
+        const plus  = b.match(/(\d+)\s*\+\s*proposals?/i);
+        const lt    = b.match(/less than\s*(\d+)/i);
+        const exact = b.match(/^\s*(\d+)\s*proposals?\b/im);
+        if (range) { proposalsAtSubmit = parseInt(range[1], 10); break; }
+        if (plus)  { proposalsAtSubmit = parseInt(plus[1], 10);  break; }
+        if (lt)    { proposalsAtSubmit = Math.max(0, parseInt(lt[1], 10) - 1); break; }
+        if (exact) { proposalsAtSubmit = parseInt(exact[1], 10); break; }
+      }
+      // Fallback: scan whole page text
+      if (proposalsAtSubmit === null) {
+        const m = text.match(/(\d+)\s*proposals?\b/i);
+        if (m) proposalsAtSubmit = parseInt(m[1], 10);
+      }
       return {
         textareas: document.querySelectorAll("textarea").length,
         textInputs: document.querySelectorAll('input[type="text"], input:not([type])').length,
@@ -1752,9 +1993,15 @@ export async function submitProposal(
         radios: document.querySelectorAll('input[type="radio"]').length,
         comboboxes: document.querySelectorAll('[role="combobox"]').length,
         url: window.location.href,
+        proposalsAtSubmit,
       };
     });
     logger.info(`[Browser/Upwork] Form: ${formInfo.textareas} textareas, ${formInfo.textInputs} text, ${formInfo.numberInputs} number, ${formInfo.radios} radios, ${formInfo.comboboxes} comboboxes | ${formInfo.url.slice(0, 80)}`);
+    if (formInfo.proposalsAtSubmit !== null) {
+      _lastProposalsAtSubmit = formInfo.proposalsAtSubmit;
+      logger.info(`[Browser/Upwork] Proposals already submitted on this job: ${formInfo.proposalsAtSubmit}`);
+    }
+    setInFlightStep("form_open");
 
     // ── 0. Auto-fill required fields if not explicitly provided ──
     // Detect job type (fixed vs hourly) and fill bid/rate + duration
@@ -2541,23 +2788,36 @@ export async function submitProposal(
     }
 
     // ── Submit ─────────────────────────────────────────
+    setInFlightStep("submitting");
     let submitted = false;
-    // Primary: find the green submit button — matches "Send for X Connects" or "Submit proposal"
-    submitted = await page.evaluate(() => {
+    // Primary: find the green submit button — matches "Send for X Connects" or "Submit proposal".
+    // We also pull out the numeric X so we can record actual connect spend per proposal.
+    const submitInfo = await page.evaluate(() => {
       const btns = document.querySelectorAll("button");
       for (const b of Array.from(btns)) {
-        const t = b.textContent?.trim().toLowerCase() || "";
-        if (((t.includes("send for") && t.includes("connects"))
-            || t === "submit proposal"
-            || t === "submit a proposal") && !b.disabled) {
-          b.click();
-          return true;
+        const t = b.textContent?.trim() || "";
+        const lower = t.toLowerCase();
+        if (((lower.includes("send for") && lower.includes("connects"))
+            || lower === "submit proposal"
+            || lower === "submit a proposal") && !(b as HTMLButtonElement).disabled) {
+          // Parse "Send for 16 Connects" → 16
+          const match = t.match(/(\d+)\s*connects/i);
+          const cost = match ? parseInt(match[1], 10) : null;
+          (b as HTMLButtonElement).click();
+          return { clicked: true, buttonText: t, connectsCost: cost };
         }
       }
-      return false;
+      return { clicked: false, buttonText: "", connectsCost: null };
     });
+    submitted = submitInfo.clicked;
     if (submitted) {
-      logger.info("[Browser/Upwork] Clicked 'Send for X Connects'");
+      // Record cost in the module-level "last submission" so processJobs can persist it.
+      _lastSubmitConnectsCost = submitInfo.connectsCost ?? _lastSubmitConnectsCost;
+      // Decrement cached balance so the budget check stays honest until next refresh.
+      if (typeof submitInfo.connectsCost === "number" && _connectsRemaining !== null) {
+        _connectsRemaining = Math.max(0, _connectsRemaining - submitInfo.connectsCost);
+      }
+      logger.info(`[Browser/Upwork] Submitted: "${submitInfo.buttonText}" — cost ${submitInfo.connectsCost ?? "?"} connects, ${_connectsRemaining ?? "?"} remaining`);
     } else {
       // Fallback selectors
       for (const sel of ['button[data-test="submit-proposal"]', 'button[type="submit"]']) {
@@ -2668,33 +2928,42 @@ export async function submitProposal(
           // Check for enhance/boost modal
           if (bodyText.includes("enhance your proposal") || bodyText.includes("boost your proposal") ||
               bodyText.includes("get more visibility") || bodyText.includes("boosted proposal")) {
-            // Look for "Enhance" or "Boost" button
+            // Try to extract the boost cost from modal body text. Typical phrasing:
+            // "Boost for 16 Connects" / "Use 24 Connects to boost"
+            const boostCostMatch = bodyText.match(/(\d+)\s*connects/i);
+            const boostCost = boostCostMatch ? parseInt(boostCostMatch[1], 10) : null;
+
             const btns = Array.from(document.querySelectorAll("button"));
             for (const b of btns) {
               const t = b.textContent?.trim().toLowerCase() || "";
-              if ((t.includes("enhance") || t.includes("boost") || t.includes("get boosted")) && !b.disabled) {
-                b.click();
-                return "clicked-enhance";
+              if ((t.includes("enhance") || t.includes("boost") || t.includes("get boosted")) && !(b as HTMLButtonElement).disabled) {
+                (b as HTMLButtonElement).click();
+                return { result: "clicked-enhance", cost: boostCost };
               }
             }
-            // If no enhance button, dismiss modal (click "No thanks" / "Skip" / "Maybe later")
             for (const b of btns) {
               const t = b.textContent?.trim().toLowerCase() || "";
               if (t.includes("no thanks") || t.includes("skip") || t.includes("maybe later") || t.includes("not now")) {
-                b.click();
-                return "dismissed";
+                (b as HTMLButtonElement).click();
+                return { result: "dismissed", cost: null };
               }
             }
-            return "enhance-modal-visible";
+            return { result: "enhance-modal-visible", cost: boostCost };
           }
-          return "no-enhance-modal";
+          return { result: "no-enhance-modal", cost: null };
         });
-        if (enhanceHandled === "clicked-enhance") {
-          logger.info("[Browser/Upwork] Clicked 'Enhance' on boost modal — proposal boosted!");
+        if (enhanceHandled.result === "clicked-enhance") {
+          if (typeof enhanceHandled.cost === "number") {
+            _lastSubmitConnectsCost = (_lastSubmitConnectsCost || 0) + enhanceHandled.cost;
+            if (_connectsRemaining !== null) {
+              _connectsRemaining = Math.max(0, _connectsRemaining - enhanceHandled.cost);
+            }
+          }
+          logger.info(`[Browser/Upwork] Boost: spent ${enhanceHandled.cost ?? "?"} connects (total job cost: ${_lastSubmitConnectsCost ?? "?"}, ${_connectsRemaining ?? "?"} remaining)`);
           await humanDelay(2000, 3000);
-        } else if (enhanceHandled === "dismissed") {
+        } else if (enhanceHandled.result === "dismissed") {
           logger.info("[Browser/Upwork] Dismissed enhance modal");
-        } else if (enhanceHandled === "enhance-modal-visible") {
+        } else if (enhanceHandled.result === "enhance-modal-visible") {
           logger.warn("[Browser/Upwork] Enhance modal visible but no button found");
         }
       } catch (enhanceErr) {
@@ -2703,6 +2972,7 @@ export async function submitProposal(
 
       // Hard verification: navigate to proposals page and confirm it's listed
       logger.info("[Browser/Upwork] Submission looks successful — verifying on proposals page...");
+      setInFlightStep("verifying");
       try {
         await page.goto("https://www.upwork.com/nx/proposals/", { waitUntil: "networkidle2", timeout: 15000 });
         await humanDelay(2000, 3000);
@@ -2764,6 +3034,7 @@ export async function submitProposal(
       if (validationErrors.length > 0) {
         logger.error(`[Browser/Upwork] Validation errors: ${validationErrors.join(" | ")}`);
       }
+      setSubmitFailure("validation_error", validationErrors.length > 0 ? validationErrors.join(" | ") : failReason);
     } else {
       logger.warn(`[Browser/Upwork] Submission status unclear — URL: ${resultUrl}`);
       logger.warn(`[Browser/Upwork] Page text (first 300): ${resultText.slice(0, 300).replace(/\n/g, " ")}`);
@@ -2796,6 +3067,7 @@ export async function submitProposal(
       logger.info("[Browser/Upwork] Closed dedicated submission tab");
     }
     setBrowserBusy(false);
+    clearInFlight();
   }
 }
 

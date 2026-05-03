@@ -92,6 +92,66 @@ export function onStop(cb: () => Promise<void>): void {
   _stopCallbacks.push(cb);
 }
 
+// ── Chrome-restart policy (cloudflare-recover-001) ─────────────────────────
+// Cloudflare can wedge a Chrome session for minutes; the in-page solver can't
+// always escape. process-control owns the policy for forcing a Chrome restart
+// so the same logic applies to every caller (search, fast-poll, submit) and so
+// we can rate-limit it — back-to-back restarts trigger Cloudflare even harder.
+const RESTART_COOLDOWN_MS = 5 * 60_000;
+let _lastChromeRestartAt = 0;
+let _chromeRestartCount = 0;
+type ChromeRestartFn = () => Promise<unknown>;
+let _chromeRestartImpl: ChromeRestartFn | null = null;
+
+/** Wired by browser/engine on first import to break the circular dep. */
+export function registerChromeRestartImpl(fn: ChromeRestartFn): void {
+  _chromeRestartImpl = fn;
+}
+
+export function getChromeRestartStats() {
+  return {
+    lastRestartAt: _lastChromeRestartAt ? new Date(_lastChromeRestartAt).toISOString() : null,
+    restartCount: _chromeRestartCount,
+    cooldownMs: RESTART_COOLDOWN_MS,
+  };
+}
+
+/**
+ * Request a Chrome restart, typically after a Cloudflare challenge has persisted
+ * past the 60s solve budget. Honours a cooldown so repeated CF blocks don't
+ * thrash the browser. Returns true if a restart was actually performed.
+ */
+export async function requestChromeRestart(reason: string): Promise<boolean> {
+  const now = Date.now();
+  const sinceLast = now - _lastChromeRestartAt;
+  if (_lastChromeRestartAt && sinceLast < RESTART_COOLDOWN_MS) {
+    logger.warn(`[control] Chrome restart skipped (cooldown ${Math.round((RESTART_COOLDOWN_MS - sinceLast) / 1000)}s remaining): ${reason}`);
+    return false;
+  }
+  if (!_chromeRestartImpl) {
+    logger.warn(`[control] Chrome restart requested but no impl registered: ${reason}`);
+    return false;
+  }
+  _lastChromeRestartAt = now;
+  _chromeRestartCount++;
+  logger.warn(`[control] Restarting Chrome (count=${_chromeRestartCount}): ${reason}`);
+  try {
+    await _chromeRestartImpl();
+    logger.info("[control] Chrome restart complete");
+    return true;
+  } catch (e) {
+    logger.error(`[control] Chrome restart failed: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+/** Test-only: clear the cooldown so subsequent requestChromeRestart calls fire. */
+export function _resetChromeRestartStateForTests(): void {
+  _lastChromeRestartAt = 0;
+  _chromeRestartCount = 0;
+  _chromeRestartImpl = null;
+}
+
 /** Gracefully stop the agent. Runs all cleanup callbacks then exits. */
 export async function stop(reason?: string): Promise<void> {
   _state.state = "stopping";
