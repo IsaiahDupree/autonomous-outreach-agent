@@ -405,6 +405,21 @@ async function startServer() {
     });
   });
 
+  // analytics-weekly-001: Sunday 18:00 Telegram digest with the past
+  // week's pipeline numbers. Read-only — runs even when paused.
+  cron.schedule("0 18 * * 0", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Weekly Telegram digest");
+    try {
+      const { buildWeeklyDigestMessage } = await import("./services/analytics");
+      const { getConnectsRemaining } = await import("./browser/upwork");
+      const message = await buildWeeklyDigestMessage(getConnectsRemaining() ?? null);
+      await notify(message);
+    } catch (e) {
+      logger.error(`[cron] Weekly digest failed: ${(e as Error).message}`);
+    }
+  });
+
   // outcome-tracking-001: weekly scrape of /nx/proposals/ to catch viewed /
   // messaged / hired / declined transitions the notification stream missed.
   // Sunday 4 AM — stays clear of the 2 AM reinforcement job below so we
@@ -416,6 +431,16 @@ async function startServer() {
       const { runWeeklyMyProposalsSync } = await import("./services/my-proposals-sync");
       const result = await runWeeklyMyProposalsSync();
       logger.info(`[cron] my-proposals sync: scanned=${result.scanned} updated=${result.updated} skipped=${result.skipped} unmatched=${result.unmatched}`);
+    });
+  });
+
+  // Weekly digest: Sunday 18:00 — Telegram summary of jobs scanned, scored, submitted, replies, hires, connects spent
+  cron.schedule("0 18 * * 0", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Weekly digest");
+    await ops.trackedSafe("weekly_digest", { source: "cron" }, async () => {
+      const { sendWeeklyDigest } = await import("./services/weekly-digest");
+      await sendWeeklyDigest();
     });
   });
 

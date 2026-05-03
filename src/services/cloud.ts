@@ -315,6 +315,39 @@ export async function getProposalMetrics(): Promise<{
 /**
  * Mark a proposal outcome (won/rejected/no_response) for close rate tracking.
  */
+/**
+ * Fetch proposal rows created since the given ISO timestamp. Used by the weekly digest
+ * to summarize last-7-days activity. Returns an empty array on transport failure.
+ */
+export async function fetchProposalsSince(sinceIso: string): Promise<Array<{
+  status: string;
+  score: number | null;
+  pre_score: number | null;
+  submitted_at: string | null;
+  submitted_connects_cost: number | null;
+  created_at: string;
+}>> {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/upwork_proposals?select=status,score,pre_score,submitted_at,submitted_connects_cost,created_at&created_at=gte.${encodeURIComponent(sinceIso)}&order=created_at.desc`;
+    const res = await safeFetch(url, { headers: supabaseHeaders() });
+    if (!res.ok) {
+      logger.error(`[Cloud] fetchProposalsSince failed: ${res.status}`);
+      return [];
+    }
+    return (await res.json()) as Array<{
+      status: string;
+      score: number | null;
+      pre_score: number | null;
+      submitted_at: string | null;
+      submitted_connects_cost: number | null;
+      created_at: string;
+    }>;
+  } catch (e) {
+    logger.error(`[Cloud] fetchProposalsSince error: ${(e as Error).message}`);
+    return [];
+  }
+}
+
 export async function recordOutcome(jobId: string, outcome: "won" | "rejected" | "no_response" | "interviewed"): Promise<void> {
   try {
     await updateProposalStatus(jobId, outcome, { outcome_at: new Date().toISOString() });

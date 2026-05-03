@@ -25,7 +25,10 @@ export type OpType =
   | "expire_stale"
   | "requeue_errors"
   | "daily_plan"
-  | "proof_generation";
+  | "proof_generation"
+  | "reinforcement_refresh"
+  | "my_proposals_sync"
+  | "weekly_digest";
 
 export type OpStatus = "pending" | "running" | "success" | "failed" | "cancelled";
 
