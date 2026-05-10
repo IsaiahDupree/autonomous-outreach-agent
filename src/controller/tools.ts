@@ -56,7 +56,10 @@ const checkPipelineHealth: ControllerTool = {
         errorPatterns,
         runningOps: running.map(o => ({ id: o.id.slice(0, 8), type: o.type, startedAt: o.startedAt })),
         proposals: { ...statusCounts, queuedAboveThreshold: queuedCount },
-        connects: { remaining: connects, lowWarning: connects !== null && connects < 16 },
+        connects: (() => {
+          const min = parseInt(process.env.AUTO_SEND_MIN_CONNECTS || "16");
+          return { remaining: connects, min, lowWarning: connects !== null && connects < min };
+        })(),
       },
     };
   },
