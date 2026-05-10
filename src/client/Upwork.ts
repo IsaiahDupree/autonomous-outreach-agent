@@ -12,6 +12,7 @@ import * as tg from "../services/telegram";
 import { generateProposalContent, getLastVariantPicked, getPortfolioLineTracked, qualityCheckCoverLetter, qualityCheckSlots, refineCoverLetter, type ProposalSlots } from "../Agent";
 import { researchJob, formatResearchBrief } from "../services/research";
 import { scoreJob } from "../Agent/scorer";
+import { getAllNichePerformance, pickNicheForJob } from "../services/reinforcement";
 import * as upworkBrowser from "../browser/upwork";
 import type { SearchFilters, UpworkNotification, ArchivedProposal } from "../browser/upwork";
 import { AUTO_SEND, AUTO_SEND_MIN_SCORE, AUTO_SEND_MIN_CONNECTS } from "../secret";
@@ -539,6 +540,9 @@ export async function processJobs(
     .join("\n\n");
   await tg.notify(`📋 *${label}: ${scoredJobs.length} qualified jobs*\n\n${summary}`);
 
+  // Pull niche stats once per cycle so the approval message can show "this niche responds X%"
+  const allNicheStats = await getAllNichePerformance().catch(() => ({}));
+
   // Process each qualified job
   for (const job of scoredJobs) {
     // Check connects budget before submitting
@@ -577,13 +581,21 @@ export async function processJobs(
     if (proposal.invitesSent) plusParts.push(`Invites: ${proposal.invitesSent}`);
     const plusLine = plusParts.length > 0 ? `🔍 ${plusParts.join(" | ")}` : "";
 
+    // Niche history — only shown when we have enough outcome samples to be meaningful
+    const nicheStats = pickNicheForJob(proposal.tags, allNicheStats);
+    const nicheLine = nicheStats && nicheStats.response_rate != null
+      ? `📈 Niche "${nicheStats.niche}": ${Math.round(nicheStats.response_rate * 100)}% response over ${nicheStats.sample_count}`
+      : "";
+
     const preview = [
       `📌 *${proposal.title}*`,
       `🔗 ${proposal.url}`,
+      proposal.posted ? `🕒 Posted: ${proposal.posted}` : "",
       `💰 Budget: ${proposal.budget || "N/A"} | Suggested bid: ${proposal.bidRange || "TBD"}`,
       `📊 Proposals: ${proposal.proposals || "unknown"}`,
       `🎯 Score: ${proposal.score}/10 — ${proposal.reasoning || ""}`,
       proposal.tags?.length ? `🏷 Skills: ${proposal.tags.join(", ")}` : "",
+      nicheLine,
       plusLine,
       proposal.source === "best_matches" ? "⭐ Source: Best Matches" : "",
       `\n📝 *Cover Letter:*\n${proposal.coverLetter || "(none)"}`,
