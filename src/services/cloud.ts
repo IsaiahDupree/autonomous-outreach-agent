@@ -79,6 +79,17 @@ export async function saveProposal(proposal: {
   // Enhanced insights
   paymentVerified?: boolean;
   screeningQuestionCount?: number;
+  // Structured proposal beats (problem / solution / proof / portfolio / prior_results / cta)
+  slots?: Record<string, string>;
+  // ISO timestamp of when the job was posted on Upwork (parsed from relative "X minutes ago").
+  postedAt?: string | null;
+  // A/B variant tracking: which prompt-variant fragment (if any) was injected at gen time.
+  variantNiche?: string | null;
+  variantName?: string | null;
+  // Raw Stage-2 Claude rating + reasoning (before niche-bias adjustment). Audited
+  // separately from the bias-adjusted `score`/`reasoning` to detect prompt drift.
+  aiScore?: number | null;
+  aiReasoning?: string | null;
 }): Promise<boolean> {
   try {
     const body: Record<string, unknown> = {
@@ -89,6 +100,7 @@ export async function saveProposal(proposal: {
       budget: proposal.budget || null,
       score: proposal.score,
       proposal_text: proposal.coverLetter || null,
+      proposal_slots_json: proposal.slots && Object.keys(proposal.slots).length > 0 ? proposal.slots : null,
       status: proposal.status || "queued",
       offer_type: proposal.offerType || null,
       submitted_bid_amount: proposal.bid || null,
@@ -107,6 +119,14 @@ export async function saveProposal(proposal: {
       // Enhanced insights
       payment_verified: proposal.paymentVerified ?? null,
       screening_question_count: proposal.screeningQuestionCount ?? null,
+      // Speed metrics
+      tags: proposal.tags && proposal.tags.length > 0 ? proposal.tags : null,
+      posted_at: proposal.postedAt ?? null,
+      reasoning: proposal.reasoning ?? null,
+      variant_niche: proposal.variantNiche ?? null,
+      variant_name: proposal.variantName ?? null,
+      ai_score: proposal.aiScore ?? null,
+      ai_reasoning: proposal.aiReasoning ?? null,
     };
 
     // Calculate bid competitiveness: our bid / avg competitive bid
@@ -213,6 +233,26 @@ export async function proposalExists(jobId: string): Promise<boolean> {
   }
 }
 
+/**
+ * Batch check which job IDs already exist in proposals.
+ * Returns a Set of IDs that exist. Single query instead of N+1.
+ */
+export async function proposalExistsBatch(jobIds: string[]): Promise<Set<string>> {
+  if (jobIds.length === 0) return new Set();
+  try {
+    const ids = jobIds.map(id => encodeURIComponent(id)).join(",");
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=in.(${ids})&select=job_id`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return new Set();
+    const data = await res.json() as Array<{ job_id: string }>;
+    return new Set(data.map(r => r.job_id));
+  } catch {
+    return new Set();
+  }
+}
+
 export async function saveProspect(prospect: {
   platform: string; username: string; displayName?: string;
   bio?: string; followers?: number; icpScore?: number; url?: string;
@@ -275,11 +315,109 @@ export async function getProposalMetrics(): Promise<{
 /**
  * Mark a proposal outcome (won/rejected/no_response) for close rate tracking.
  */
+/**
+ * Fetch proposal rows created since the given ISO timestamp. Used by the weekly digest
+ * to summarize last-7-days activity. Returns an empty array on transport failure.
+ */
+export async function fetchProposalsSince(sinceIso: string): Promise<Array<{
+  status: string;
+  score: number | null;
+  pre_score: number | null;
+  submitted_at: string | null;
+  submitted_connects_cost: number | null;
+  created_at: string;
+}>> {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/upwork_proposals?select=status,score,pre_score,submitted_at,submitted_connects_cost,created_at&created_at=gte.${encodeURIComponent(sinceIso)}&order=created_at.desc`;
+    const res = await safeFetch(url, { headers: supabaseHeaders() });
+    if (!res.ok) {
+      logger.error(`[Cloud] fetchProposalsSince failed: ${res.status}`);
+      return [];
+    }
+    return (await res.json()) as Array<{
+      status: string;
+      score: number | null;
+      pre_score: number | null;
+      submitted_at: string | null;
+      submitted_connects_cost: number | null;
+      created_at: string;
+    }>;
+  } catch (e) {
+    logger.error(`[Cloud] fetchProposalsSince error: ${(e as Error).message}`);
+    return [];
+  }
+}
+
 export async function recordOutcome(jobId: string, outcome: "won" | "rejected" | "no_response" | "interviewed"): Promise<void> {
   try {
     await updateProposalStatus(jobId, outcome, { outcome_at: new Date().toISOString() });
   } catch (e) {
     logger.error(`[Cloud] recordOutcome error for ${jobId}: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Close rate (hires / submitted) over a rolling N-day window. Counts proposals whose
+ * submitted_at (or created_at fallback) falls inside [now - days, now].
+ */
+export async function getCloseRateWindow(days: number): Promise<{ submitted: number; won: number; closeRate: number }> {
+  try {
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(submitted,won,rejected,no_response,interviewed)&or=(submitted_at.gte.${cutoff},and(submitted_at.is.null,created_at.gte.${cutoff}))&select=status`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return { submitted: 0, won: 0, closeRate: 0 };
+    const rows = (await res.json()) as Array<{ status: string }>;
+    const submitted = rows.length;
+    const won = rows.filter(r => r.status === "won").length;
+    const closeRate = submitted > 0 ? Math.round((won / submitted) * 1000) / 10 : 0;
+    return { submitted, won, closeRate };
+  } catch (e) {
+    logger.error(`[Cloud] getCloseRateWindow(${days}d) error: ${(e as Error).message}`);
+    return { submitted: 0, won: 0, closeRate: 0 };
+  }
+}
+
+/**
+ * Reply-rate per A/B prompt variant. Aggregates upwork_proposals by (variant_niche, variant_name)
+ * and counts how many submitted proposals received a client response (won/rejected/interviewed).
+ * Rows missing a variant are bucketed under niche="(default)", name="(default)" so the default
+ * prompt path is comparable to variants.
+ */
+export async function getVariantMetrics(): Promise<Array<{
+  variant_niche: string;
+  variant_name: string;
+  submitted: number;
+  replies: number;
+  won: number;
+  reply_rate: number;
+}>> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(submitted,won,rejected,no_response,interviewed)&select=variant_niche,variant_name,status`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return [];
+    const rows = (await res.json()) as Array<{ variant_niche: string | null; variant_name: string | null; status: string }>;
+    const buckets = new Map<string, { variant_niche: string; variant_name: string; submitted: number; replies: number; won: number }>();
+    for (const r of rows) {
+      const niche = r.variant_niche || "(default)";
+      const name = r.variant_name || "(default)";
+      const key = `${niche}::${name}`;
+      let b = buckets.get(key);
+      if (!b) { b = { variant_niche: niche, variant_name: name, submitted: 0, replies: 0, won: 0 }; buckets.set(key, b); }
+      b.submitted += 1;
+      if (r.status === "won" || r.status === "rejected" || r.status === "interviewed") b.replies += 1;
+      if (r.status === "won") b.won += 1;
+    }
+    return Array.from(buckets.values()).map(b => ({
+      ...b,
+      reply_rate: b.submitted > 0 ? Math.round((b.replies / b.submitted) * 1000) / 10 : 0,
+    })).sort((a, b) => b.submitted - a.submitted);
+  } catch (e) {
+    logger.error(`[Cloud] getVariantMetrics error: ${(e as Error).message}`);
+    return [];
   }
 }
 
@@ -346,7 +484,7 @@ export async function saveAnalyticsSnapshot(analytics: {
       proposal_count: overview.totalJobs,
     };
 
-    const res = await safeFetch(`${SUPABASE_URL}/rest/v1/analytics_snapshots`, {
+    const res = await safeFetch(`${SUPABASE_URL}/rest/v1/upwork_analytics_snapshots`, {
       method: "POST",
       headers: { ...supabaseHeaders(), Prefer: "return=representation" },
       body: JSON.stringify(body),
@@ -412,7 +550,7 @@ export async function saveContentBrief(brief: {
 export async function getLatestSnapshot(): Promise<Record<string, unknown> | null> {
   try {
     const res = await safeFetch(
-      `${SUPABASE_URL}/rest/v1/analytics_snapshots?snapshot_type=eq.full&order=created_at.desc&limit=1`,
+      `${SUPABASE_URL}/rest/v1/upwork_analytics_snapshots?snapshot_type=eq.full&order=created_at.desc&limit=1`,
       { headers: supabaseHeaders() }
     );
     if (!res.ok) return null;
@@ -435,6 +573,135 @@ export async function getPlusInsightsData(): Promise<Record<string, unknown>[]> 
     return res.ok ? (await res.json()) as Record<string, unknown>[] : [];
   } catch {
     return [];
+  }
+}
+
+/**
+ * Expire stale queued/error jobs that are older than 72 hours.
+ * Returns the count of expired rows.
+ */
+export async function expireStaleJobs(): Promise<number> {
+  try {
+    const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+    // Get queued/error jobs older than cutoff
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=in.(queued,error)&created_at=lt.${cutoff}`,
+      {
+        method: "PATCH",
+        headers: { ...supabaseHeaders(), Prefer: "return=representation,count=exact" },
+        body: JSON.stringify({ status: "expired" }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] expireStaleJobs failed: ${res.status}`);
+      return 0;
+    }
+    const rows = await res.json() as unknown[];
+    return rows.length;
+  } catch (e) {
+    logger.error(`[Cloud] expireStaleJobs error: ${(e as Error).message}`);
+    return 0;
+  }
+}
+
+/**
+ * Requeue error-status jobs that are less than 48 hours old.
+ * Returns the count of requeued rows.
+ */
+export async function requeueRecentErrors(): Promise<number> {
+  try {
+    const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?status=eq.error&created_at=gt.${cutoff}`,
+      {
+        method: "PATCH",
+        headers: { ...supabaseHeaders(), Prefer: "return=representation,count=exact" },
+        body: JSON.stringify({ status: "queued" }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] requeueRecentErrors failed: ${res.status}`);
+      return 0;
+    }
+    const rows = await res.json() as unknown[];
+    return rows.length;
+  } catch (e) {
+    logger.error(`[Cloud] requeueRecentErrors error: ${(e as Error).message}`);
+    return 0;
+  }
+}
+
+/**
+ * Update the bid amount for a submitted proposal.
+ */
+export async function updateProposalBid(jobId: string, bid: number): Promise<void> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${jobId}`,
+      {
+        method: "PATCH",
+        headers: supabaseHeaders(),
+        body: JSON.stringify({ submitted_bid_amount: bid }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] updateProposalBid failed (${res.status}) for ${jobId}`);
+    }
+  } catch (e) {
+    logger.error(`[Cloud] updateProposalBid error for ${jobId}: ${(e as Error).message}`);
+  }
+}
+
+// ── Proof-of-Work Artifact CRUD ──
+
+export async function saveProofArtifact(jobId: string, artifact: {
+  type: string;
+  url?: string;
+  brief: { analysis: string; architectureDiagram: string; codeSnippets: unknown[]; implementationPlan: string };
+  generatedAt: string;
+}): Promise<boolean> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}`,
+      {
+        method: "PATCH",
+        headers: supabaseHeaders(),
+        body: JSON.stringify({
+          proof_artifact_url: artifact.url || null,
+          proof_artifact_json: artifact,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!res.ok) {
+      logger.warn(`[Cloud] saveProofArtifact failed (${res.status}) for ${jobId}`);
+    }
+    return res.ok;
+  } catch (e) {
+    logger.error(`[Cloud] saveProofArtifact error: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+export async function getProofArtifact(jobId: string): Promise<{
+  url?: string;
+  brief: { analysis: string };
+} | null> {
+  try {
+    const res = await safeFetch(
+      `${SUPABASE_URL}/rest/v1/upwork_proposals?job_id=eq.${encodeURIComponent(jobId)}&select=proof_artifact_url,proof_artifact_json`,
+      { headers: supabaseHeaders() }
+    );
+    if (!res.ok) return null;
+    const rows = (await res.json()) as Array<{ proof_artifact_url?: string; proof_artifact_json?: Record<string, unknown> }>;
+    if (!rows[0]?.proof_artifact_json) return null;
+    const artifact = rows[0].proof_artifact_json as { url?: string; brief: { analysis: string } };
+    return {
+      url: rows[0].proof_artifact_url || artifact.url,
+      brief: artifact.brief,
+    };
+  } catch {
+    return null;
   }
 }
 

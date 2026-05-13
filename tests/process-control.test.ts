@@ -72,3 +72,38 @@ describe("process-control", () => {
     expect(s.pausedAt).toBeTruthy();
   });
 });
+
+describe("process-control / chrome restart (cloudflare-recover-001)", () => {
+  beforeEach(() => {
+    control._resetChromeRestartStateForTests();
+  });
+
+  it("requestChromeRestart returns false when no impl is registered", async () => {
+    const ok = await control.requestChromeRestart("test");
+    expect(ok).toBe(false);
+  });
+
+  it("invokes the registered impl exactly once per cooldown window", async () => {
+    let calls = 0;
+    control.registerChromeRestartImpl(async () => { calls++; });
+
+    const first = await control.requestChromeRestart("cf stuck");
+    expect(first).toBe(true);
+    expect(calls).toBe(1);
+
+    // Within cooldown — should be skipped, impl not called again.
+    const second = await control.requestChromeRestart("cf stuck again");
+    expect(second).toBe(false);
+    expect(calls).toBe(1);
+
+    const stats = control.getChromeRestartStats();
+    expect(stats.restartCount).toBe(1);
+    expect(stats.lastRestartAt).toBeTruthy();
+  });
+
+  it("returns false and logs but does not throw when impl rejects", async () => {
+    control.registerChromeRestartImpl(async () => { throw new Error("boom"); });
+    const ok = await control.requestChromeRestart("cf stuck");
+    expect(ok).toBe(false);
+  });
+});

@@ -162,3 +162,11 @@ npx vitest tests/scorer.test.ts
 - **Cloudflare**: Engine handles Cloudflare challenges automatically with stealth plugin
 - **CDP timeout**: Set to 5 minutes for heavy Upwork pages
 - **Browser busy flag**: Prevents scan loop from navigating while a submission is in progress
+
+## Known Limitations
+
+- **Upwork-only**: LinkedIn/Chrome discovery code exists but is currently disabled in `src/index.ts`
+- **Manual login required**: Run `npm run login:upwork` once to seed the Puppeteer profile; sessions persist via the user-data dir
+- **External services required**: Without Supabase + Anthropic + Telegram credentials the agent will start but produce no output
+- **Single-account**: One Upwork account per running instance (Chrome user-data dir is shared)
+- **Connects-bound**: Submissions stop automatically when the account drops below 16 connects

@@ -18,6 +18,7 @@ vi.mock("../src/secret", () => ({
   ANTHROPIC_AUTH_TOKEN: "",
   AUTO_SEND: true,
   AUTO_SEND_MIN_SCORE: 7,
+  AUTO_SEND_MIN_CONNECTS: 16,
   TELEGRAM_BOT_TOKEN: "test-token",
   TELEGRAM_CHAT_ID: "test-chat",
 }));

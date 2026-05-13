@@ -10,6 +10,7 @@ import type { Browser, Page } from "puppeteer";
 import path from "path";
 import fs from "fs";
 import logger from "../config/logger";
+import { registerChromeRestartImpl } from "../services/process-control";
 
 // Stealth with all evasions
 puppeteer.use(StealthPlugin());
@@ -18,6 +19,10 @@ puppeteer.use(StealthPlugin());
 puppeteer.use(RecaptchaPlugin({ visualFeedback: true }));
 
 let browser: Browser | null = null;
+// True when we attached to an existing Chrome we didn't launch — close() must disconnect, not
+// kill the underlying process, otherwise stopping the agent destroys the user's logged-in
+// session and they have to re-run start-chrome.bat.
+let attachedToExisting = false;
 
 // Isolated profile for automation — avoids lock conflicts with regular Chrome
 const DEFAULT_USER_DATA_DIR = path.join(
@@ -57,12 +62,14 @@ export async function launch(opts: BrowserOptions = {}): Promise<Browser> {
   if (executablePath && !headless) {
     // First: check if Chrome is already running on our CDP port
     let cdpReady = false;
+    let preExisting = false;
     try {
       const res = await fetch(`http://127.0.0.1:${cdpPort}/json/version`, {
         signal: AbortSignal.timeout(2000),
       });
       if (res.ok) {
         cdpReady = true;
+        preExisting = true;
         logger.info(`[Browser] Found existing Chrome on CDP port ${cdpPort}`);
       }
     } catch { /* not running */ }
@@ -120,12 +127,16 @@ export async function launch(opts: BrowserOptions = {}): Promise<Browser> {
         protocolTimeout: 300_000, // 5 min — Upwork pages can be slow
       });
 
+      // If Chrome was already running before we got here, the user's session is precious —
+      // stop our agent should NOT kill their browser. We'll disconnect on shutdown instead.
+      attachedToExisting = preExisting;
+
       browser!.on("disconnected", () => {
         logger.warn("[Browser] Disconnected");
         browser = null;
       });
 
-      logger.info("[Browser] Connected to native Chrome via CDP");
+      logger.info(`[Browser] Connected to native Chrome via CDP (${preExisting ? "preserving user's existing instance" : "spawned by agent"})`);
       return browser!;
     }
   }
@@ -165,6 +176,12 @@ export async function newPage(): Promise<Page> {
   // Reuse the first blank tab if available
   const page = pages.length > 0 && pages[0].url() === "about:blank" ? pages[0] : await b.newPage();
 
+  // Force a known viewport. When Puppeteer attaches via CDP to an existing Chrome window the
+  // viewport defaults to whatever the user's browser is sized at, which on Upwork rendered as
+  // a near-blank page (content laid out off-screen). Setting an explicit viewport guarantees
+  // selectors hit the visible/laid-out DOM.
+  await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
+
   // Set realistic headers
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
@@ -181,16 +198,40 @@ export async function newPage(): Promise<Page> {
 }
 
 export async function close(): Promise<void> {
-  if (browser) {
+  if (!browser) return;
+  if (attachedToExisting) {
+    // We don't own this Chrome — disconnect cleanly so the user's session keeps running.
+    await browser.disconnect().catch(() => {});
+    logger.info("[Browser] Disconnected (Chrome left running for user)");
+  } else {
     await browser.close().catch(() => {});
-    browser = null;
     logger.info("[Browser] Closed");
   }
+  browser = null;
+  attachedToExisting = false;
 }
 
 export function isRunning(): boolean {
   return browser !== null && browser.connected;
 }
+
+/**
+ * Tear down the current browser connection so the next call to launch() spawns or
+ * reattaches to a fresh Chrome. When we own the underlying Chrome process we close
+ * it; when attached to a user-owned Chrome we only disconnect (killing the user's
+ * session would be hostile). Used by process-control to recover from unrecoverable
+ * Cloudflare loops.
+ */
+export async function restartChrome(): Promise<Browser> {
+  const wasAttached = attachedToExisting;
+  await close();
+  logger.info(`[Browser] restartChrome — relaunching (was ${wasAttached ? "attached" : "owned"})`);
+  return launch();
+}
+
+// Break the circular dep: engine depends on process-control for the policy hook,
+// process-control delegates the actual teardown back to engine.
+registerChromeRestartImpl(restartChrome);
 
 // ── Cookie persistence ──────────────────────────────────
 const COOKIE_FILE = path.join(DEFAULT_USER_DATA_DIR, "saved-cookies.json");

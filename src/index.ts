@@ -10,45 +10,45 @@ import logger from "./config/logger";
 import { shutdown } from "./services";
 import { notify } from "./services/telegram";
 import app from "./app";
-import { initAgent } from "./Agent/index";
+import { initAgent, proactiveTokenRefresh } from "./Agent/index";
 import { runProposalCycle, runBestMatchesCycle, getCloseRateMetrics, submitTopQueued, checkAndProcessNotifications } from "./client/Upwork";
+import * as cloud from "./services/cloud";
 import { runDiscoveryCycle } from "./client/Chrome";
-import { PORT, BROWSER_MODE } from "./secret";
+import { PORT, BROWSER_MODE, FAST_POLL, assertRequiredEnv } from "./secret";
+
+assertRequiredEnv();
 import { engine } from "./browser";
 import cron from "node-cron";
 import * as control from "./services/process-control";
 import * as ops from "./services/operations";
+import { startController, stopController } from "./controller";
+import { buildDailyPlan, executeSlot } from "./services/daily-strategy";
+import { enrichWithProofs } from "./services/proof-of-work";
 
-// Upwork search keywords — 10 niches × 2-3 variations each
+// Upwork search keywords — consolidated to ~30 high-signal terms (reduced from 55)
 const UPWORK_KEYWORDS = [
-  // Niche 1: AI/LLM automation
-  "AI automation", "LLM integration", "AI workflow",
-  // Niche 2: Claude/OpenAI/GPT
-  "Claude API", "OpenAI API", "GPT integration",
-  // Niche 3: Python automation/scripting
-  "Python automation", "Python script", "Python developer automation",
-  // Niche 4: Web scraping & data extraction
-  "web scraping", "data extraction", "web crawler",
-  // Niche 5: Chatbot / AI agent
-  "AI chatbot", "AI agent", "chatbot development",
-  // Niche 6: Marketing automation / CRM
-  "marketing automation", "CRM automation", "email automation",
-  // Niche 7: Workflow / no-code automation
-  "n8n automation", "zapier automation", "workflow automation", "make.com",
-  // Niche 8: Data pipeline / ETL
-  "data pipeline", "ETL pipeline", "data integration",
-  // Niche 9: Mobile app development
-  "mobile app development", "react native app", "flutter app", "cross platform app",
-  // Niche 10: Full stack / SaaS / MVP
-  "full stack app", "SaaS MVP", "full stack developer", "MVP development",
-  // Niche 11: Web app development
-  "web app development", "web application", "dashboard development", "admin panel",
-  // Niche 12: Voice AI / Audio
-  "elevenlabs", "11labs", "voice ai", "text to speech", "voice cloning", "voice agent",
-  // Niche 13: CAD / 3D Design
-  "CAD design", "3D modeling", "AutoCAD", "SolidWorks", "Fusion 360", "CAD automation",
-  // Niche 14: Arduino / Embedded / IoT
-  "Arduino", "ESP32", "Raspberry Pi", "IoT development", "embedded systems", "microcontroller",
+  // AI/LLM (core niche)
+  "AI automation", "AI agent", "Claude API",
+  // Python
+  "Python automation", "web scraping",
+  // Chatbot
+  "AI chatbot", "chatbot development",
+  // Marketing/CRM
+  "CRM automation", "email automation",
+  // Workflow/No-code
+  "n8n automation", "workflow automation",
+  // Data
+  "data pipeline", "data extraction",
+  // Mobile
+  "mobile app development", "react native app", "flutter app",
+  // Full stack / SaaS
+  "full stack developer", "SaaS MVP", "web application",
+  // Voice AI
+  "voice ai", "text to speech", "elevenlabs",
+  // CAD / 3D
+  "CAD design", "SolidWorks", "Fusion 360",
+  // IoT / Embedded
+  "Arduino", "ESP32", "Raspberry Pi", "embedded systems",
 ];
 
 // Default filters — loosened to maximize job volume
@@ -220,16 +220,48 @@ async function startServer() {
     logger.info(`Health: http://localhost:${PORT}/api/health`);
   });
 
-  // Run initial scans on startup (tracked)
-  logger.info("[startup] Running initial Upwork scan...");
-  await ops.trackedSafe("scan_keywords", { source: "startup", keywords: UPWORK_KEYWORDS }, async (opId) => {
-    ops.addStep(opId, "search", `Searching ${UPWORK_KEYWORDS.length} keywords`);
-    await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
-  });
-  logger.info("[startup] Running initial Best Matches scan...");
-  await ops.trackedSafe("scan_best_matches", { source: "startup" }, async () => {
-    await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
-  });
+  // Verify (and auto-recover) Upwork login before any work starts. If we're signed out and
+  // UPWORK_EMAIL/PASSWORD are set, this will fill the login form via Puppeteer using the
+  // existing handleLogin flow. Notifies via Telegram on success/failure.
+  try {
+    const { ensureUpworkLoggedIn } = await import("./browser/upwork");
+    const ok = await ensureUpworkLoggedIn(notify);
+    if (!ok) {
+      logger.warn("[startup] Upwork login failed — agent will retry via session-health cron every 15 min. Run `npm run login:upwork` to fix manually.");
+    }
+  } catch (e) {
+    logger.warn(`[startup] Login check error: ${(e as Error).message}`);
+  }
+
+  // Start the fast-poll loop BEFORE the initial scans so the real-time loop kicks in within
+  // seconds of boot. The 29-keyword initial scan can take 30+ minutes and would otherwise
+  // monopolize Chrome before fast-poll ever gets to run.
+  if (FAST_POLL) {
+    try {
+      const { startFastPoll } = await import("./services/fast-poll");
+      startFastPoll();
+    } catch (e) {
+      logger.warn(`[startup] Fast-poll not started: ${(e as Error).message}`);
+    }
+  } else {
+    logger.info("[startup] Fast-poll disabled (set FAST_POLL=true to enable)");
+  }
+
+  // Run initial scans on startup (tracked). Skip when SKIP_INITIAL_SCAN=true so dry-run smoke
+  // tests and other manual flows don't have to fight a 29-keyword scan over the same Chrome tab.
+  if (process.env.SKIP_INITIAL_SCAN === "true") {
+    logger.info("[startup] SKIP_INITIAL_SCAN=true — skipping initial scans");
+  } else {
+    logger.info("[startup] Running initial Upwork scan...");
+    await ops.trackedSafe("scan_keywords", { source: "startup", keywords: UPWORK_KEYWORDS }, async (opId) => {
+      ops.addStep(opId, "search", `Searching ${UPWORK_KEYWORDS.length} keywords`);
+      await runProposalCycle(UPWORK_KEYWORDS, UPWORK_FILTERS, UPWORK_SCORE_THRESHOLD);
+    });
+    logger.info("[startup] Running initial Best Matches scan...");
+    await ops.trackedSafe("scan_best_matches", { source: "startup" }, async () => {
+      await runBestMatchesCycle(UPWORK_SCORE_THRESHOLD);
+    });
+  }
 
   // Cron schedules — all check control.isActive() before running
   // Upwork keyword search every 20 min — catch jobs within 30 min of posting
@@ -259,15 +291,54 @@ async function startServer() {
   //   await runDiscoveryCycle(CHROME_KEYWORDS).catch((e) => logger.error("[cron] chrome error", e));
   // });
 
-  // Auto-submit top queued proposals every 12 hours to meet daily minimum (2/day)
-  // Runs at 8 AM and 8 PM UTC — picks highest-scoring queued jobs
-  const DAILY_SUBMIT_TARGET = 2;
-  cron.schedule("0 8,20 * * *", async () => {
-    if (!control.isActive()) { logger.info("[cron] Skipped auto-submit (agent paused/stopped)"); return; }
-    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped auto-submit (submitting paused)"); return; }
-    logger.info("[cron] Auto-submit top queued (daily minimum)");
-    await ops.trackedSafe("auto_submit", { source: "cron", target: DAILY_SUBMIT_TARGET }, async () => {
-      await submitTopQueued(DAILY_SUBMIT_TARGET);
+  // ── Daily Strategy: Top-5 quality submissions with staggered timing ──
+  const DAILY_SUBMIT_TARGET = 5;
+
+  // 6:30 AM UTC — Build daily plan: rank queue, select top 5, kick off proof generation
+  cron.schedule("30 6 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped daily plan (agent paused/stopped)"); return; }
+    logger.info("[cron] Building daily submission plan");
+    await ops.trackedSafe("daily_plan", { source: "cron" }, async () => {
+      const plan = await buildDailyPlan();
+      // Kick off proof-of-work generation for eligible jobs (async, non-blocking)
+      if (plan.proofJobs.length > 0) {
+        logger.info(`[cron] Generating proofs for ${plan.proofJobs.length} top jobs`);
+        enrichWithProofs(plan.proofJobs.map(j => ({
+          jobId: j.jobId, title: j.title, description: j.description,
+          budget: j.budget, tags: j.tags,
+        }))).catch(e => logger.error(`[cron] Proof enrichment error: ${(e as Error).message}`));
+      }
+    });
+  });
+
+  // Staggered submission slots — spread across the day for optimal client visibility
+  // Morning (8 AM UTC): 2 jobs — catches US West Coast evening / EU morning
+  cron.schedule("0 8 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped morning slot (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped morning slot (submitting paused)"); return; }
+    logger.info("[cron] Morning submission slot");
+    await ops.trackedSafe("auto_submit", { source: "cron", slot: "morning" }, async () => {
+      await executeSlot("morning", submitByJobId);
+    });
+  });
+
+  // Midday (1 PM UTC): 2 jobs — catches US East Coast morning / EU afternoon
+  cron.schedule("0 13 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped midday slot (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped midday slot (submitting paused)"); return; }
+    logger.info("[cron] Midday submission slot");
+    await ops.trackedSafe("auto_submit", { source: "cron", slot: "midday" }, async () => {
+      await executeSlot("midday", submitByJobId);
+    });
+  });
+
+  // Evening (6 PM UTC): 1 job — catches US West Coast morning
+  cron.schedule("0 18 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped evening slot (agent paused/stopped)"); return; }
+    if (control.isSystemPaused("submitting")) { logger.info("[cron] Skipped evening slot (submitting paused)"); return; }
+    logger.info("[cron] Evening submission slot");
+    await ops.trackedSafe("auto_submit", { source: "cron", slot: "evening" }, async () => {
+      await executeSlot("evening", submitByJobId);
     });
   });
 
@@ -281,6 +352,50 @@ async function startServer() {
     });
   });
 
+  // Expire stale queued/error jobs daily at 6 AM UTC — keeps the queue fresh
+  cron.schedule("0 6 * * *", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Expiring stale jobs (>72h old)");
+    await ops.trackedSafe("expire_stale", { source: "cron" }, async () => {
+      const count = await cloud.expireStaleJobs();
+      logger.info(`[cron] Expired ${count} stale jobs`);
+      if (count > 0) await notify(`🧹 Expired ${count} stale queued/error jobs (>72h old)`);
+    });
+  });
+
+  // Auto-retry recent error jobs every 6 hours — requeue errors <48h old
+  cron.schedule("0 3,9,15,21 * * *", async () => {
+    if (!control.isActive()) { logger.info("[cron] Skipped error retry (agent paused/stopped)"); return; }
+    logger.info("[cron] Requeuing recent error jobs (<48h old)");
+    await ops.trackedSafe("requeue_errors", { source: "cron" }, async () => {
+      const count = await cloud.requeueRecentErrors();
+      logger.info(`[cron] Requeued ${count} error jobs for retry`);
+      if (count > 0) await notify(`🔄 Requeued ${count} recent error jobs for retry`);
+    });
+  });
+
+  // Session health check every 15 minutes — auto-recover if signed out.
+  cron.schedule("*/15 * * * *", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    if (control.isSystemPaused("scanning")) return;
+    try {
+      const { ensureUpworkLoggedIn } = await import("./browser/upwork");
+      await ensureUpworkLoggedIn(notify);
+    } catch (e) {
+      logger.warn(`[cron] Session health check error: ${(e as Error).message}`);
+    }
+  });
+
+  // Proactive OAuth token refresh every 4 hours — keeps token fresh during quiet periods
+  cron.schedule("0 */4 * * *", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Proactive OAuth token refresh");
+    const ok = await proactiveTokenRefresh();
+    if (!ok) {
+      await notify("⚠️ *OAuth token refresh failed*\nAgent may lose API access. Check credentials.");
+    }
+  });
+
   // Daily metrics report at 9 AM (runs even when paused — it's read-only)
   cron.schedule("0 9 * * *", async () => {
     if (control.getState() === "stopped" || control.getState() === "stopping") return;
@@ -290,13 +405,71 @@ async function startServer() {
     });
   });
 
+  // outcome-tracking-001: weekly scrape of /nx/proposals/ to catch viewed /
+  // messaged / hired / declined transitions the notification stream missed.
+  // Sunday 4 AM — stays clear of the 2 AM reinforcement job below so we
+  // don't fight for the same Chrome tab.
+  cron.schedule("0 4 * * 0", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Weekly my-proposals outcome sync");
+    await ops.trackedSafe("my_proposals_sync", { source: "cron" }, async () => {
+      const { runWeeklyMyProposalsSync } = await import("./services/my-proposals-sync");
+      const result = await runWeeklyMyProposalsSync();
+      logger.info(`[cron] my-proposals sync: scanned=${result.scanned} updated=${result.updated} skipped=${result.skipped} unmatched=${result.unmatched}`);
+    });
+  });
+
+  // Weekly digest: Sunday 18:00 — Telegram summary of jobs scanned, scored, submitted, replies, hires, connects spent
+  cron.schedule("0 18 * * 0", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Weekly digest");
+    await ops.trackedSafe("weekly_digest", { source: "cron" }, async () => {
+      const { sendWeeklyDigest } = await import("./services/weekly-digest");
+      await sendWeeklyDigest();
+    });
+  });
+
+  // Weekly reinforcement: recompute per-niche win rates + winning patterns from outcomed proposals
+  cron.schedule("0 2 * * 0", async () => {
+    if (control.getState() === "stopped" || control.getState() === "stopping") return;
+    logger.info("[cron] Weekly reinforcement refresh");
+    await ops.trackedSafe("reinforcement_refresh", { source: "cron" }, async () => {
+      const { computeNichePerformance } = await import("./services/reinforcement");
+      const { invalidateNicheCache } = await import("./Agent/scorer");
+      const result = await computeNichePerformance();
+      invalidateNicheCache();
+      logger.info(`[cron] Reinforcement refresh: ${result.updated} niches updated, ${result.skipped} skipped`);
+    });
+  });
+
+  // Helper: submit a specific job by ID (used by daily strategy slots)
+  async function submitByJobId(jobId: string): Promise<boolean> {
+    const { submitProposalById } = await import("./client/Upwork");
+    return submitProposalById(jobId);
+  }
+
+  // Start the autonomous controller (Claude-powered decision loop)
+  try {
+    const { getClient } = await import("./Agent");
+    const client = getClient();
+    startController(client);
+    logger.info("[startup] Autonomous controller started");
+  } catch (e) {
+    logger.warn(`[startup] Controller not started: ${(e as Error).message}`);
+  }
+
   // Register cleanup for graceful stop (via API, Telegram, or signal)
   control.onStop(async () => {
+    stopController();
+    try {
+      const { stopFastPoll } = await import("./services/fast-poll");
+      stopFastPoll();
+    } catch { /* noop */ }
     await engine.close();
     shutdown(server);
   });
 
-  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 20min | Best Matches: every 20min (offset)\nNotifications: every 1h | Auto-submit: ${DAILY_SUBMIT_TARGET}/day\nMetrics: daily 9 AM\n\n⏸️ /pause — pause all  |  🛑 /stop — shutdown`);
+  await notify(`🚀 *Autonomous Outreach Agent started*\nMode: ${BROWSER_MODE}\nUpwork search: every 20min | Best Matches: every 20min (offset)\nNotifications: every 1h\nDaily strategy: top ${DAILY_SUBMIT_TARGET} at 8AM/1PM/6PM UTC + fast-apply\nProof-of-work: auto for score 8+ jobs\nMetrics: daily 9 AM\n\n⏸️ /pause ��� pause all  |  🛑 /stop — shutdown`);
   logger.info(`All crons registered. Browser mode: ${BROWSER_MODE}. Agent running 24/7.`);
 
   // Start listening for Telegram control commands (/pause, /resume, /stop, /status)

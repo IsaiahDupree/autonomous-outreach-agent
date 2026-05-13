@@ -4,7 +4,55 @@
  * Stage 2: Claude AI scoring for fit assessment (only for jobs that pass Stage 1)
  */
 import logger from "../config/logger";
-import { getCharacter, getClientAsync } from "./index";
+import { getCharacter } from "./index";
+import { getAllNichePerformance, pickNicheForJob, MIN_SAMPLES, type NichePerformance } from "../services/reinforcement";
+import { WEIGHTS, strongBonusFor, weakBonusFor } from "./scorer-weights";
+
+// Cache niche stats for one scan cycle so we don't re-fetch per job.
+let _nicheCache: Record<string, NichePerformance> | null = null;
+let _nicheCacheLoadedAt = 0;
+const NICHE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function getCachedNicheStats(): Promise<Record<string, NichePerformance>> {
+  const now = Date.now();
+  if (_nicheCache && now - _nicheCacheLoadedAt < NICHE_CACHE_TTL_MS) return _nicheCache;
+  try {
+    _nicheCache = await getAllNichePerformance();
+    _nicheCacheLoadedAt = now;
+  } catch {
+    _nicheCache = {};
+    _nicheCacheLoadedAt = now;
+  }
+  return _nicheCache;
+}
+
+/** Force-clear the niche stats cache — call when a fresh refresh has just run. */
+export function invalidateNicheCache(): void {
+  _nicheCache = null;
+  _nicheCacheLoadedAt = 0;
+}
+
+/** Apply ±1 bias to AI score based on cached niche win rate. Returns adjusted score + note. */
+function applyNicheBias(baseScore: number, tags: string[], stats: Record<string, NichePerformance>): { score: number; note: string } {
+  const niche = pickNicheForJob(tags, stats);
+  if (!niche || niche.sample_count < MIN_SAMPLES || niche.win_rate == null) {
+    return { score: baseScore, note: "" };
+  }
+  const winPct = Math.round(niche.win_rate * 100);
+  if (niche.win_rate >= 0.4) {
+    return {
+      score: Math.min(10, baseScore + 1),
+      note: ` (+1 for ${niche.niche}: ${winPct}% win rate over ${niche.sample_count} outcomes)`,
+    };
+  }
+  if (niche.win_rate <= 0.1) {
+    return {
+      score: Math.max(1, baseScore - 1),
+      note: ` (-1 for ${niche.niche}: ${winPct}% win rate over ${niche.sample_count} outcomes)`,
+    };
+  }
+  return { score: baseScore, note: "" };
+}
 
 // ── Hard exclude keywords — instant drop if title or description matches ──
 const HARD_EXCLUDES = [
@@ -30,7 +78,7 @@ const COMPETITIVE_BLACKLIST: string[] = [
 ];
 
 // ── ICP strong keywords — must match at least 1 or score → 0 ──
-const ICP_STRONG_KEYWORDS = [
+export const ICP_STRONG_KEYWORDS = [
   // AI / LLM
   "ai automation", "workflow automation", "browser automation",
   "claude", "openai", "anthropic", "gemini",
@@ -66,7 +114,7 @@ const ICP_STRONG_KEYWORDS = [
 ];
 
 // ── ICP weak keywords — supporting signals ──
-const ICP_WEAK_KEYWORDS = [
+export const ICP_WEAK_KEYWORDS = [
   "automat", "script", "bot", "scrape", "crawl", "pipeline",
   "integration", "webhook", "api", "etl", "data",
   "lead gen", "outreach", "email", "sms", "notification",
@@ -100,6 +148,14 @@ function matchesKeyword(text: string, kw: string): boolean {
   return re.test(text);
 }
 
+/** Exposed for tooling (calibration script): returns matched strong/weak keywords for a job text. */
+export function matchedKeywords(text: string): { strongHits: string[]; weakHits: string[] } {
+  const lower = text.toLowerCase();
+  const strongHits = ICP_STRONG_KEYWORDS.filter((kw) => matchesKeyword(lower, kw));
+  const weakHits = ICP_WEAK_KEYWORDS.filter((kw) => matchesKeyword(lower, kw));
+  return { strongHits, weakHits };
+}
+
 // ── Budget floors ── (URL filters already enforce minimums, these catch edge cases)
 const BUDGET_FLOOR_HOURLY = 20;   // below $20/hr → drop
 const BUDGET_FLOOR_FIXED = 200;   // below $200 fixed → drop
@@ -108,9 +164,13 @@ export interface ScoredJob {
   score: number;        // 0-10 overall fit (final combined)
   preScore: number;     // 0-100 deterministic pre-score
   bidRange: string;     // suggested bid range
-  reasoning: string;    // 1-line reason
+  reasoning: string;    // 1-line reason (final, with bias note)
   tags: string[];       // matched skill tags
   excluded?: string;    // if excluded, the reason
+  // Raw Stage-2 Claude output before niche bias is applied. Persisted separately
+  // for audit so prompt drift and bias impact can be measured.
+  aiScore?: number;     // 0-10 raw Claude rating
+  aiReasoning?: string; // raw Claude reasoning
 }
 
 export interface PreScoreResult {
@@ -265,15 +325,17 @@ export function preScoreJob(job: {
   // ── Point-based scoring ──
   let score = 0;
 
-  // Strong keyword hits: +20 each, capped at 60
-  score += Math.min(60, strongHits.length * 20);
+  // Strong keyword hits: per-keyword bonus (default STRONG_BONUS), capped at STRONG_CAP
+  const strongRaw = strongHits.reduce((sum, kw) => sum + strongBonusFor(kw), 0);
+  score += Math.min(WEIGHTS.STRONG_CAP, strongRaw);
 
-  // Weak keyword hits: +8 each, capped at 24
+  // Weak keyword hits: per-keyword bonus (default WEAK_BONUS), capped at WEAK_CAP
   const weakHits: string[] = [];
   for (const kw of ICP_WEAK_KEYWORDS) {
     if (matchesKeyword(text, kw)) weakHits.push(kw);
   }
-  score += Math.min(24, weakHits.length * 8);
+  const weakRaw = weakHits.reduce((sum, kw) => sum + weakBonusFor(kw), 0);
+  score += Math.min(WEIGHTS.WEAK_CAP, weakRaw);
 
   // ── Budget bonus ──
   let budgetBonus = 0;
@@ -358,8 +420,8 @@ export async function scoreJob(job: {
   const persona = character?.persona || "AI automation consultant";
 
   try {
-    const client = await getClientAsync();
-    const msg = await client.messages.create({
+    const { aiComplete } = await import("../services/ai-fallback");
+    const result = await aiComplete({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 200,
       messages: [{
@@ -396,22 +458,31 @@ Example: A "React Native bug fix" at $250 = 2/10`,
       }],
     });
 
-    const block = msg.content?.[0];
-    if (!block || !("text" in block)) throw new Error("Empty Claude response");
-    let text = block.text.trim();
+    if (result.provider === "openai") {
+      logger.info("[Scorer] Job scored via OpenAI fallback");
+    }
+    let text = result.text.trim();
     text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error("No JSON found in response");
     const parsed = JSON.parse(jsonMatch[0]);
 
     const aiScore = Math.min(10, Math.max(0, parsed.score || 0));
+    const tags = [...(parsed.tags || []), ...pre.strongHits.slice(0, 3)];
 
+    // Reinforcement bias: nudge ±1 based on cached per-niche win rate.
+    const stats = await getCachedNicheStats();
+    const { score: biasedScore, note: biasNote } = applyNicheBias(aiScore, tags, stats);
+
+    const rawReasoning = parsed.reasoning || "";
     return {
-      score: aiScore,
+      score: biasedScore,
       preScore: pre.score,
       bidRange: parsed.bidRange || "TBD",
-      reasoning: parsed.reasoning || "",
-      tags: [...(parsed.tags || []), ...pre.strongHits.slice(0, 3)],
+      reasoning: rawReasoning + biasNote,
+      tags,
+      aiScore,
+      aiReasoning: rawReasoning,
     };
   } catch (e) {
     logger.error(`[Scorer] AI scoreJob error: ${(e as Error).message}`);

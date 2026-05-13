@@ -58,6 +58,44 @@ describe("saveProposal", () => {
     expect(body.status).toBe("queued");
   });
 
+  it("maps aiScore + aiReasoning to ai_score / ai_reasoning columns", async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, status: 201 });
+
+    await cloud.saveProposal({
+      jobId: "ai123",
+      title: "Audit Stage-2 Output",
+      url: "https://upwork.com/jobs/ai123",
+      score: 8,
+      reasoning: "Strong fit (+1 niche bias)",
+      aiScore: 7,
+      aiReasoning: "Strong fit",
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.ai_score).toBe(7);
+    expect(body.ai_reasoning).toBe("Strong fit");
+    // Final adjusted score/reasoning persist independently
+    expect(body.score).toBe(8);
+    expect(body.reasoning).toBe("Strong fit (+1 niche bias)");
+  });
+
+  it("writes null ai_score / ai_reasoning when omitted", async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, status: 201 });
+
+    await cloud.saveProposal({
+      jobId: "noai123",
+      title: "No AI score",
+      url: "https://upwork.com/jobs/noai123",
+      score: 5,
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.ai_score).toBeNull();
+    expect(body.ai_reasoning).toBeNull();
+  });
+
   it("falls back to PATCH on 409 conflict", async () => {
     // First call returns 409, second is the PATCH
     mockFetch
@@ -203,6 +241,61 @@ describe("getStatusCounts", () => {
     mockFetch.mockResolvedValue({ ok: false, status: 500 });
     const counts = await cloud.getStatusCounts();
     expect(counts).toEqual({});
+  });
+});
+
+describe("getCloseRateWindow", () => {
+  it("computes close rate over a rolling window", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        { status: "submitted" }, { status: "submitted" }, { status: "submitted" },
+        { status: "won" }, { status: "rejected" },
+      ],
+    });
+    const w = await cloud.getCloseRateWindow(7);
+    expect(w.submitted).toBe(5);
+    expect(w.won).toBe(1);
+    expect(w.closeRate).toBe(20);
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toContain("submitted_at.gte.");
+  });
+
+  it("returns zeroes on error", async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 500 });
+    const w = await cloud.getCloseRateWindow(30);
+    expect(w).toEqual({ submitted: 0, won: 0, closeRate: 0 });
+  });
+});
+
+describe("getVariantMetrics", () => {
+  it("aggregates reply-rate per (variant_niche, variant_name) bucket", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        { variant_niche: "automation", variant_name: "lead-with-portfolio", status: "submitted" },
+        { variant_niche: "automation", variant_name: "lead-with-portfolio", status: "won" },
+        { variant_niche: "automation", variant_name: "lead-with-portfolio", status: "rejected" },
+        { variant_niche: "automation", variant_name: "lead-with-portfolio", status: "no_response" },
+        { variant_niche: "automation", variant_name: "lead-with-github", status: "submitted" },
+        { variant_niche: "automation", variant_name: "lead-with-github", status: "interviewed" },
+        { variant_niche: null, variant_name: null, status: "submitted" },
+      ],
+    });
+
+    const variants = await cloud.getVariantMetrics();
+    const portfolio = variants.find(v => v.variant_name === "lead-with-portfolio");
+    const github = variants.find(v => v.variant_name === "lead-with-github");
+    const fallback = variants.find(v => v.variant_name === "(default)");
+    expect(portfolio).toMatchObject({ submitted: 4, replies: 2, won: 1, reply_rate: 50 });
+    expect(github).toMatchObject({ submitted: 2, replies: 1, won: 0, reply_rate: 50 });
+    expect(fallback).toMatchObject({ variant_niche: "(default)", submitted: 1, replies: 0 });
+  });
+
+  it("returns empty array on error", async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 500 });
+    const variants = await cloud.getVariantMetrics();
+    expect(variants).toEqual([]);
   });
 });
 
