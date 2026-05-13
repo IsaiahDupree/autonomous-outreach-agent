@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, scoreClass, type ProposalRow } from "../lib/api";
+import { api, type ProposalRow } from "../lib/api";
 import { SlotBadges } from "../components/SlotBadges";
 import { InFlightCard } from "../components/InFlightCard";
 import { CooldownPanel } from "../components/CooldownPanel";
-import { CloseRateBar } from "../components/CloseRateBar";
+import { KPIStrip } from "../components/KPIStrip";
+import { ScoreChip } from "../components/ScoreChip";
 
 const FILTERS = [
   { key: "queued", label: "Queued" },
@@ -108,7 +109,7 @@ export function Queue() {
 
   return (
     <>
-      <CloseRateBar />
+      <KPIStrip />
       <InFlightCard />
       <CooldownPanel />
       <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
@@ -145,7 +146,7 @@ export function Queue() {
                 <Link to={`/proposals/${encodeURIComponent(p.job_id)}`}>{p.job_title || "(untitled)"}</Link>
               </div>
               <div className="card-meta">
-                {p.score != null && <span className={`score-badge ${scoreClass(p.score)}`}>{p.score}/10</span>}
+                {p.score != null && <ScoreChip score={p.score} />}
                 {p.budget && <span>💰 {p.budget}</span>}
                 {p.submitted_bid_amount && <span>Bid ${p.submitted_bid_amount}</span>}
                 {p.client_hire_rate != null && <span>Hire {p.client_hire_rate}%</span>}

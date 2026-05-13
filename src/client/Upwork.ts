@@ -217,11 +217,12 @@ const MIN_CONNECTS_RESERVE = 50;   // warn below this
 // so a low-connects pause is consistent and the reason surfaces to logs + Telegram + dashboard.
 const MIN_CONNECTS_CRITICAL = AUTO_SEND_MIN_CONNECTS;
 
-// Hard ceiling on a single submission attempt. Successful submissions complete in 15-30s; the
-// fast-poll cycle is 60s. If a submit takes longer than 90s it's hung — usually Cloudflare
-// deadlock, a Puppeteer tab that never resolved, or AI rate-limit retries. We log + return
+// Hard ceiling on a single submission attempt. Happy-path submissions complete in 15-30s, but
+// the budget must absorb a Cloudflare solve, which alone can eat 70-90s on a cold tab. Pushed
+// from 90s → 180s after a 2026-05-09 dry-run timed out at 90s with the form already filled.
+// If we hit this, it's a genuine hang (Puppeteer tab stuck, AI retry loop, etc.) — log + return
 // false so the lock releases and the queue moves on instead of cascading the backlog.
-const SUBMIT_TIMEOUT_MS = 90 * 1000;
+const SUBMIT_TIMEOUT_MS = 180 * 1000;
 
 // Per-job recent-failure cooldown. After a submission fails (timeout, validation, expired,
 // already_applied, etc.) we record the jobId and refuse to retry it for COOLDOWN_MS. Without

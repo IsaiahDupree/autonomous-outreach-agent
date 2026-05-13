@@ -34,16 +34,18 @@ vi.mock("../src/secret", () => ({
   OPENAI_API_KEY: "test-openai-key",
   ANTHROPIC_API_KEY: "",
   ANTHROPIC_AUTH_TOKEN: "",
+  AI_PRIMARY: "auto",
 }));
 
 vi.mock("../src/config/logger", () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { aiComplete, getAIFallbackStats } from "../src/services/ai-fallback";
+import { aiComplete, getAIFallbackStats, resetAIFallbackBreakers } from "../src/services/ai-fallback";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetAIFallbackBreakers();
 });
 
 describe("AI Fallback Layer", () => {
@@ -319,6 +321,100 @@ describe("AI Fallback Layer", () => {
         messages: [{ role: "user", content: "test" }],
       });
       expect(result.provider).toBe("openai");
+    });
+  });
+
+  // ── Circuit breaker ──
+
+  describe("circuit breaker", () => {
+    function err429() {
+      return Object.assign(new Error("429 rate_limit_error"), { status: 429 });
+    }
+
+    it("trips OAuth breaker after 429 + 429 retry, skips Tier 1 on next call", async () => {
+      // Call 1: OAuth 429 → retry 429 → OpenAI succeeds → breaker should trip
+      mockClaudeCreate.mockRejectedValueOnce(err429()).mockRejectedValueOnce(err429());
+      mockOpenAICreate.mockResolvedValueOnce({
+        choices: [{ message: { content: "openai-1" } }],
+      });
+
+      const r1 = await aiComplete({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "test" }],
+      });
+      expect(r1.provider).toBe("openai");
+      expect(mockClaudeCreate).toHaveBeenCalledTimes(2); // initial + 5s retry
+      expect(getAIFallbackStats().oauthBreakerSecLeft).toBeGreaterThan(0);
+
+      // Call 2: breaker active → OAuth NOT called → OpenAI succeeds
+      mockClaudeCreate.mockClear();
+      mockOpenAICreate.mockResolvedValueOnce({
+        choices: [{ message: { content: "openai-2" } }],
+      });
+
+      const r2 = await aiComplete({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "test" }],
+      });
+      expect(r2.provider).toBe("openai");
+      expect(mockClaudeCreate).not.toHaveBeenCalled();
+    });
+
+    it("does NOT trip OAuth breaker on a single 429 that recovers via 5s retry", async () => {
+      mockClaudeCreate
+        .mockRejectedValueOnce(err429())
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "claude-recovered" }] });
+
+      const r = await aiComplete({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "test" }],
+      });
+      expect(r.provider).toBe("claude");
+      expect(getAIFallbackStats().oauthBreakerSecLeft).toBe(0);
+    }, 10_000);
+
+    it("does NOT trip OAuth breaker on non-429 errors", async () => {
+      mockClaudeCreate.mockRejectedValueOnce(new Error("network down"));
+      mockOpenAICreate.mockResolvedValueOnce({
+        choices: [{ message: { content: "openai" } }],
+      });
+
+      await aiComplete({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "test" }],
+      });
+      expect(getAIFallbackStats().oauthBreakerSecLeft).toBe(0);
+    });
+
+    it("clears OAuth breaker on a successful call after window expiry (manual reset)", async () => {
+      // Trip the breaker
+      mockClaudeCreate.mockRejectedValueOnce(err429()).mockRejectedValueOnce(err429());
+      mockOpenAICreate.mockResolvedValueOnce({
+        choices: [{ message: { content: "openai" } }],
+      });
+      await aiComplete({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "test" }],
+      });
+      expect(getAIFallbackStats().oauthBreakerSecLeft).toBeGreaterThan(0);
+
+      // Manually clear (simulates window expiry) and verify next call hits OAuth
+      resetAIFallbackBreakers();
+      mockClaudeCreate.mockClear();
+      mockClaudeCreate.mockResolvedValueOnce({ content: [{ type: "text", text: "claude-back" }] });
+
+      const r = await aiComplete({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 100,
+        messages: [{ role: "user", content: "test" }],
+      });
+      expect(r.provider).toBe("claude");
+      expect(mockClaudeCreate).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -51,6 +51,10 @@ export const FAST_POLL_TOP_N = parseInt(process.env.FAST_POLL_TOP_N || "3");
 export const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY || "";
 export const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+// Which provider aiComplete() tries first. "auto" (default) → Claude OAuth → API key → OpenAI.
+// "openai" → OpenAI first, with Claude as backup if OpenAI fails. Use when Anthropic credit is
+// known empty or when you want predictably-priced OpenAI runs without paying the Claude-failure tax.
+export const AI_PRIMARY: "auto" | "openai" = (process.env.AI_PRIMARY === "openai" ? "openai" : "auto");
 
 /**
  * Required env vars for production runs. Missing values cause a fail-fast at boot

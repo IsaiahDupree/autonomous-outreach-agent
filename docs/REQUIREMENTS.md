@@ -284,3 +284,102 @@ A 24/7 autonomous system that finds Upwork jobs matching the operator's ICP, dra
 - Multi-account support (if response rate plateau confirms need)
 - Auto-tuning scoring thresholds
 - Public read-only analytics view (for collaborator)
+
+---
+
+## 11. UI/UX Prototype Comparison
+
+A standalone prototype was delivered as `Upwork Agent.zip` (single-page React app with Babel-in-browser, ~140KB of JSX across `dashboard-shell.jsx`, `telegram.jsx`, `variation-{a,b,c}.jsx`, plus a `tweaks-panel` for live theming). It treats three surfaces as design exercises: **Queue dashboard**, **Proposal Detail (3 aesthetic directions)**, and **Telegram approval card (chat + zoomed)**. This section compares it 1:1 to what's in `dashboard/` today and itemizes the deltas worth adopting.
+
+### 11.1 What the prototype shows
+
+**Global chrome** — topbar (logo + env tag + nav: Queue / Proposals / Niches / Templates / Clicks / Ops), live `ConnectBar` (used / cap with progress + reset countdown), `StatusDot` for daemon, theme toggle (dark / light), accent picker (cyan / violet / green / orange), density toggle (compact / regular).
+
+**Queue dashboard** (`dashboard-shell.jsx`):
+- **In-flight strip** — pulsing dot, current job title, `step · CF challenge`, elapsed seconds, Open button. Single-row, gradient background.
+- **5 KPI tiles** with sparklines: Submitted/7d, Replies/7d, Won/7d, Median score, Spend/7d (vs. monthly cap). Each shows trend arrows.
+- **Filterable queue table** with 7 columns: score chip (color-coded ≥85 / ≥70 / <70), title + id + best-matches flag + outcome chip, niche, status pill, bid, age, actions. First row highlighted.
+
+**Proposal Detail** — three aesthetic directions on the same data:
+- **A · Mission Control** (dark, techy, monospace metadata) — three-column: job desc + AI reasoning | annotated cover letter with per-slot reasoning + token counts | fit breakdown ring + niche stats + bid/connects ROI + skills match.
+- **B · Forensic Inspector** (GitHub-like, side rail tabs) — emphasizes the prompt → render audit trail.
+- **C · Field Notebook** (warm cream/brown, journaling) — writer's perspective, deemphasizes machinery.
+
+All three carry the same data: score breakdown (deterministic, AI semantic, niche fit, budget fit, client history), 6-slot proposal with per-slot tokens + AI reasoning, niche stats sparkline, timeline of pipeline events, ops log. Action row: Send now / With portfolio / Dry-run / **Edit draft** / **Snooze 1h** / View on Upwork.
+
+**Telegram approval** (`telegram.jsx`):
+- **Chat view** — phone bezel, full thread context (cycle-complete bubble, reply alert, approval card, user reply, submission progress). Grounds the card in the operator's mobile reality.
+- **Zoomed approval card** — 4-stat decision strip (SCORE / NICHE REPLIES + sample size / POSTED ago / CONNECTS), client one-liner with hire rate + spend + rating, **dashed-bordered editable proposal preview** ("reply with edits or accept as-is"), sparkline-backed niche callout ("V3 proof-led variant lifts to 16.0%"), 6 buttons (✅ Send / 📋 With portfolio / **✏️ Edit & send** / **💤 Snooze 1h** / 🔗 View / ❌ Skip), and a **bulk row** ("4 more queued in this niche · Approve all 5 with portfolio →").
+
+### 11.2 What we have today
+
+| Surface | Prototype | Current (`dashboard/`) | Notes |
+|---|---|---|---|
+| Topbar | Logo + env tag + 6-item nav + connect bar + status | `App.tsx`: title + 4-item nav + ConnectsBadge + AgentBar | Missing env tag, "Proposals"/"Ops" tabs, density/theme toggles |
+| Theme | Dark/light + 4 accents + compact/regular | Single light theme | No theming layer at all |
+| In-flight strip | Single-row gradient strip in dashboard chrome | `InFlightCard.tsx` (82 lines) — separate card, polled | Card is fine but doesn't surface to global chrome |
+| KPI tiles | 5 tiles with sparklines + trend arrows | None at top of Queue — KPIs only on Niches page | Biggest visual gap |
+| Queue table | 7-col, color-coded score chip, outcome chip, best-matches flag, status pill | `Queue.tsx` (261 lines) — has filters, status tabs, similar columns | Current is functional but visually denser/grayer; lacks score chip color, outcome chip |
+| ProposalDetail | 3 design directions, slot annotations, fit ring, timeline, ops log | `ProposalDetail.tsx` (199 lines) — speed metadata + slot list + click stats + outcome buttons | No score breakdown ring, no timeline, no ops log surfacing, no AI reasoning per slot |
+| Telegram preview | Score / niche replies / posted / connects + edit + snooze + bulk | `src/services/telegram.ts` — has score, posted (just added), niche (just added), Plus insights, but no edit/snooze/bulk | §4.2 gaps remain on edit/snooze/bulk |
+| Sparklines | Custom SVG component, used 6+ places | Not used anywhere | Whole primitive missing |
+| Score chip | Color thresholds (≥85 green / ≥70 cyan / <70 amber) | Plain text | Easy adoption |
+| Score breakdown | 5-bar breakdown with width animation | Single number | Operator can't see why a score is what it is |
+
+### 11.3 Gaps the prototype exposes
+
+1. **Visual hierarchy is flat** — current dashboard treats every section equally. Prototype uses size, color, and motion (pulse on in-flight, gradient strip, sparklines) to direct attention to "what's happening right now."
+2. **No KPI surface on Queue** — the operator's first screen has no "you submitted 41 / replied 5 / won 1" overview. Have to navigate to Niches.
+3. **Score is opaque** — we render `8/10` but not "8 = 64 deterministic + 91 AI semantic + 88 niche fit." Operator can't audit a score.
+4. **No timeline / ops log on a proposal** — "what did the agent actually do for this job?" requires SQL.
+5. **No theme system** — single light theme limits glanceability at night and when the tray is the ambient surface.
+6. **Telegram approval card already has score+niche+posted (just shipped) but lacks edit/snooze/bulk** — prototype shows the polished target.
+7. **Density / typography** — prototype uses tabular-nums, monospace for ids/timestamps, sans for prose. Current is inconsistent.
+8. **Sparklines** — every metric in the prototype has a 14-day spark. Easy to add, big readability win.
+
+### 11.4 Recommended adoptions (ranked by impact ÷ effort)
+
+**S effort, M–L impact:**
+- **Score chip with color thresholds** (~30 LOC) on Queue + ProposalDetail.
+- **Sparkline primitive** (the 25-line SVG component in `shared.jsx`) — drop into Niches and a future Queue KPI strip.
+- **Tabular-nums + monospace for ids/timestamps** — CSS-only, immediate scanability win.
+- **Best-matches + outcome chips on Queue rows** — already in our data model, just need rendering.
+
+**M effort, L impact:**
+- **KPI strip at top of Queue** — 5 tiles (Submitted, Replies, Won, Median score, Spend). Reuse existing API endpoints; data is already there.
+- **Score breakdown bars on ProposalDetail** — requires persisting the 5 sub-scores in `upwork_proposals` (currently we only keep the composite). Migration + scorer change + UI.
+- **Timeline panel on ProposalDetail** — list of `ops` rows filtered by `job_id`. Endpoint and UI.
+- **Theme toggle (dark/light)** — CSS variable refactor; the prototype's pattern is clean and copyable.
+
+**L effort, L impact (warrants design pass first):**
+- **Telegram edit-before-send** — message-reply listener, callback state machine, regen flow. Open question §9.3 still applies.
+- **Telegram bulk approval** — group queued items by niche, single-tap approve N. Requires queue snapshot in approval message.
+- **ProposalDetail aesthetic direction pick — DECIDED 2026-05-09: Field Notebook (variation C).** Pairs naturally with the existing warm cream/olive palette (`--bg: #FBFAF5`, `--accent: #6B7C2E`). Implications:
+  - Mixed serif (Georgia/Cambria for prose + section titles) + sans (system for nav/UI) + monospace (Menlo for ids/eyebrows/timestamps).
+  - Eyebrow style: monospace, small, letter-spaced, faint color, above each section title.
+  - Sticky right-rail marginalia on ProposalDetail (score breakdown, niche, variants, timeline) — manuscript on the left, signals on the right.
+  - Pill-shaped buttons (border-radius: 999px) — extend existing `.btn` rather than fork.
+  - Italic reasoning quoted with left-border accent (`border-left: 2px solid var(--accent-soft)`).
+  - Skip Mission Control / Forensic Inspector entirely. One coherent direction.
+
+**Not recommended (yet):**
+- Building three full design directions of ProposalDetail. Pick one, ship, iterate.
+- Density toggle. Premature; we don't have one cohesive design yet.
+
+### 11.5 Suggested next sprint (one week)
+
+1. Add `Sparkline`, `ScoreChip`, `KPI` primitives to `dashboard/src/components/`. (~150 LOC total)
+2. Add KPI strip to top of Queue using existing `/api/metrics` data.
+3. Render outcome chip + best-matches flag on Queue rows.
+4. Add CSS-variable-based theme with dark mode default; toggle in topbar.
+5. Persist score breakdown in scorer + expose on `/api/upwork/proposals/:id`; render bar chart on ProposalDetail.
+6. Add a timeline panel on ProposalDetail that pulls `/api/ops?jobId=<id>`.
+
+Defer: Telegram edit/bulk, second/third aesthetic direction, density toggle.
+
+### 11.6 What the prototype gets right that we should preserve
+
+- **Single source of truth for data** (`data.jsx`) makes design iteration cheap. Our dashboard already does this via `dashboard/src/lib/api.ts` — keep typed contracts there.
+- **Live-tweakable design knobs** — theme/accent/density via a side panel. Worth building a `?debug=1` version of this for our dashboard so design choices are testable in-context.
+- **Proposal slot annotations** — showing `01 · PROBLEM · 38 tok` next to each slot, with the slot's reasoning underneath. Closes the "why did the AI write this?" loop without requiring a separate audit page.
+- **Connect-budget visibility** — the `ConnectBar` (used / cap + progress + reset days) belongs in the global topbar, not just on Queue.
