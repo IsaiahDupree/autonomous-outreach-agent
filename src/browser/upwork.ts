@@ -1,0 +1,3715 @@
+/**
+ * src/browser/upwork.ts — Puppeteer-based Upwork scraper
+ * Searches one keyword at a time with filters. Handles Cloudflare + login.
+ */
+import type { Page } from "puppeteer";
+import { newPage, humanDelay, waitForCloudflare, launch, saveCookies, restoreCookies, hasSavedCookies } from "./engine";
+import logger from "../config/logger";
+import { answerScreeningQuestion } from "../Agent";
+import { requestChromeRestart } from "../services/process-control";
+
+/** Fast text insertion via CDP — avoids per-keystroke overhead on heavy pages */
+async function fastType(page: Page, text: string): Promise<void> {
+  const cdp = await page.createCDPSession();
+  try {
+    await Promise.race([
+      cdp.send("Input.insertText", { text }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("fastType timeout (30s)")), 30000)),
+    ]);
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+// Browser busy flag — scan loop pauses when submit is in progress
+let _browserBusy = false;
+export function isBrowserBusy(): boolean { return _browserBusy; }
+export function setBrowserBusy(busy: boolean): void { _browserBusy = busy; }
+
+// Connects balance tracking
+let _connectsRemaining: number | null = null;
+export function getConnectsRemaining(): number | null { return _connectsRemaining; }
+
+// Per-submission connect cost — populated by submitProposal (browser-level) so that
+// processJobs (client-level) can read it and persist to upwork_proposals.submitted_connects_cost.
+let _lastSubmitConnectsCost: number | null = null;
+export function getLastSubmitConnectsCost(): number | null { return _lastSubmitConnectsCost; }
+export function resetLastSubmitConnectsCost(): void { _lastSubmitConnectsCost = null; }
+
+// Per-submission failure reason — distinguishes "Job not found" / Cloudflare / validation /
+// timeout from generic errors. processJobs reads this AFTER a failed submitProposal so we can
+// store the specific status (e.g. status="expired") instead of a generic "error". Without this,
+// every failure looks the same in the queue and stale jobs get retried forever.
+export type SubmitFailureReason =
+  | "job_not_found"      // Upwork redirected to /freelance-jobs/apply/ or "Job not found" body
+  | "apply_disabled"     // Apply button found but disabled (already applied / cannot bid)
+  | "cloudflare"         // Cloudflare challenge couldn't be solved
+  | "validation_error"   // Form submitted but Upwork rejected (e.g. "Hourly rate")
+  | "no_cover_letter"    // Cover letter regen failed and no original
+  | "low_connects"       // Connects below MIN_CONNECTS_CRITICAL
+  | "bid_out_of_range"   // Bid > MAX_BID or < MIN_BID
+  | "puppeteer_error"    // Generic browser failure
+  | "unknown";
+
+let _lastSubmitFailureReason: SubmitFailureReason | null = null;
+let _lastSubmitFailureDetail: string | null = null;
+export function getLastSubmitFailure(): { reason: SubmitFailureReason | null; detail: string | null } {
+  return { reason: _lastSubmitFailureReason, detail: _lastSubmitFailureDetail };
+}
+export function setSubmitFailure(reason: SubmitFailureReason, detail?: string): void {
+  _lastSubmitFailureReason = reason;
+  _lastSubmitFailureDetail = detail ?? null;
+}
+export function resetSubmitFailure(): void {
+  _lastSubmitFailureReason = null;
+  _lastSubmitFailureDetail = null;
+}
+
+// Number of proposals already on this job at the moment we hit Submit. Captured during the
+// apply-form scrape and read by processJobs to persist to upwork_proposals.proposals_when_submitted.
+let _lastProposalsAtSubmit: number | null = null;
+export function getLastProposalsAtSubmit(): number | null { return _lastProposalsAtSubmit; }
+export function resetLastProposalsAtSubmit(): void { _lastProposalsAtSubmit = null; }
+
+// Live in-flight submission state — visible via /api/agent/in-flight so the dashboard can
+// show "currently submitting: <title> | step: form-fill | elapsed: 23s". Clears when the
+// submission resolves (success or failure). Single-slot because withSubmissionLock serializes
+// real submissions one at a time.
+export type InFlightStep =
+  | "starting" | "navigating" | "cloudflare" | "applying" | "form_open"
+  | "filling" | "submitting" | "verifying" | "boosting";
+export interface InFlightState {
+  jobId: string;
+  jobTitle: string;
+  jobUrl: string;
+  step: InFlightStep;
+  startedAt: string;
+  stepStartedAt: string;
+}
+let _inFlight: InFlightState | null = null;
+export function getInFlight(): (InFlightState & { elapsed_sec: number; step_elapsed_sec: number }) | null {
+  if (!_inFlight) return null;
+  const now = Date.now();
+  return {
+    ..._inFlight,
+    elapsed_sec: Math.round((now - new Date(_inFlight.startedAt).getTime()) / 1000),
+    step_elapsed_sec: Math.round((now - new Date(_inFlight.stepStartedAt).getTime()) / 1000),
+  };
+}
+export function setInFlight(s: { jobId: string; jobTitle: string; jobUrl: string }): void {
+  const nowIso = new Date().toISOString();
+  _inFlight = { ...s, step: "starting", startedAt: nowIso, stepStartedAt: nowIso };
+}
+export function setInFlightStep(step: InFlightStep): void {
+  if (!_inFlight) return;
+  _inFlight.step = step;
+  _inFlight.stepStartedAt = new Date().toISOString();
+}
+export function clearInFlight(): void { _inFlight = null; }
+
+export interface ScrapedJob {
+  id: string;
+  title: string;
+  description: string;
+  url: string;
+  budget?: string;
+  clientSpend?: string;
+  proposals?: string;
+  posted?: string;
+  skills?: string[];
+  score?: number;
+  // Freelancer Plus insights (scraped from job cards/detail pages)
+  clientHireRate?: number;      // e.g. 45 means 45%
+  clientHires?: number;         // total hires
+  competitiveBidRange?: { low?: number; avg?: number; high?: number };
+  interviewing?: number;
+  invitesSent?: number;
+  unansweredInvites?: number;
+  // Enhanced insights
+  paymentVerified?: boolean;
+  screeningQuestionCount?: number;
+}
+
+export interface SearchFilters {
+  // Sorting
+  sort?: "recency" | "relevance";
+
+  // Posted within: only jobs from last N hours
+  postedWithin?: "1" | "3" | "24" | "72" | "168";  // hours: 1h, 3h, 24h, 3d, 7d
+
+  // Experience level: 1=entry, 2=intermediate, 3=expert (can combine)
+  experienceLevel?: ("1" | "2" | "3")[];
+
+  // Job type + budget
+  jobType?: "fixed" | "hourly";
+  budgetMin?: number;           // fixed-price min (used with amount=min-max)
+  budgetMax?: number;           // fixed-price max
+  hourlyRateMin?: number;       // hourly min (used with hourly_rate=min-max)
+  hourlyRateMax?: number;       // hourly max
+
+  // Number of proposals: 0-4, 5-9, 10-14, 15-19, 20-49
+  proposalRange?: "0-4" | "5-9" | "10-14" | "15-19" | "20-49";
+
+  // Client info
+  paymentVerified?: boolean;     // only show payment-verified clients
+  previouslyHired?: boolean;     // only show your previous clients
+
+  // Client history: no hires, 1-9, 10+
+  clientHires?: "0" | "1-9" | "10+";
+
+  // Client location (country name, e.g. "United States")
+  clientLocation?: string;
+
+  // Client time zone (GMT offset or timezone name)
+  clientTimezone?: string;
+
+  // Project length: less than month, 1-3 months, 3-6 months, 6+ months
+  projectLength?: "weeks" | "months" | "semester" | "ongoing";
+
+  // Hours per week (for hourly jobs)
+  hoursPerWeek?: "less_than_30" | "more_than_30";
+
+  // Contract-to-hire roles only
+  contractToHire?: boolean;
+
+  // Category filter (Upwork category slug, e.g. "it_networking", "web_mobile_software_dev")
+  category?: string;
+
+  // Subcategory filter
+  subcategory?: string;
+
+  // Connect price range (cost to apply): "0-2", "2-4", "4-6"
+  connectPrice?: string;
+
+  // Pagination
+  page?: number;
+  perPage?: number;              // results per page (default 10, max 50)
+}
+
+function buildSearchUrl(keyword: string, filters: SearchFilters = {}): string {
+  const params = new URLSearchParams();
+  params.set("q", keyword);
+  params.set("sort", filters.sort || "recency");
+
+  // Posted within (hours)
+  if (filters.postedWithin) {
+    params.set("hours", filters.postedWithin);
+  }
+
+  // Results per page — default to 50 (max) for maximum coverage
+  params.set("per_page", String(filters.perPage || 50));
+
+  // Experience level (can set multiple)
+  if (filters.experienceLevel?.length) {
+    filters.experienceLevel.forEach(l => params.append("contractor_tier", l));
+  }
+
+  // Job type
+  if (filters.jobType) params.set("job_type", filters.jobType);
+
+  // Fixed-price budget range
+  if (filters.budgetMin && filters.budgetMax) {
+    params.set("amount", `${filters.budgetMin}-${filters.budgetMax}`);
+  } else if (filters.budgetMin) {
+    params.set("amount", `${filters.budgetMin}-`);
+  } else if (filters.budgetMax) {
+    params.set("amount", `0-${filters.budgetMax}`);
+  }
+
+  // Hourly rate range
+  if (filters.hourlyRateMin && filters.hourlyRateMax) {
+    params.set("hourly_rate", `${filters.hourlyRateMin}-${filters.hourlyRateMax}`);
+  } else if (filters.hourlyRateMin) {
+    params.set("hourly_rate", `${filters.hourlyRateMin}-`);
+  } else if (filters.hourlyRateMax) {
+    params.set("hourly_rate", `0-${filters.hourlyRateMax}`);
+  }
+
+  // Number of proposals
+  if (filters.proposalRange) params.set("proposals", filters.proposalRange);
+
+  // Client info
+  if (filters.paymentVerified) params.set("payment_verified", "1");
+  if (filters.previouslyHired) params.set("previously_hired", "true");
+
+  // Client history
+  if (filters.clientHires === "0") params.set("client_hires", "0");
+  else if (filters.clientHires === "1-9") params.set("client_hires", "1-9");
+  else if (filters.clientHires === "10+") params.set("client_hires", "10-");
+
+  // Client location
+  if (filters.clientLocation) params.set("location", filters.clientLocation);
+
+  // Client time zone
+  if (filters.clientTimezone) params.set("timezone", filters.clientTimezone);
+
+  // Project length
+  if (filters.projectLength) params.set("duration_v3", filters.projectLength);
+
+  // Hours per week
+  if (filters.hoursPerWeek === "less_than_30") params.set("hours_per_week", "as_needed");
+  if (filters.hoursPerWeek === "more_than_30") params.set("hours_per_week", "30");
+
+  // Contract to hire
+  if (filters.contractToHire) params.set("t", "1");
+
+  // Category / subcategory
+  if (filters.category) params.set("category2", filters.category);
+  if (filters.subcategory) params.set("subcategory2", filters.subcategory);
+
+  // Connect price
+  if (filters.connectPrice) params.set("connect_price", filters.connectPrice);
+
+  // Pagination
+  if (filters.page) params.set("page", String(filters.page));
+  if (filters.perPage) params.set("per_page", String(filters.perPage));
+
+  return `https://www.upwork.com/nx/search/jobs/?${params.toString()}`;
+}
+
+/**
+ * Detect and handle Upwork login page.
+ */
+async function handleLogin(page: Page): Promise<boolean> {
+  const url = page.url();
+  const isLoginPage = url.includes("login") || url.includes("account-security");
+  if (!isLoginPage) {
+    const loginForm = await page.$('#login_username, input[name="login[username]"]');
+    if (!loginForm) return true;
+  }
+
+  const email = process.env.UPWORK_EMAIL;
+  const password = process.env.UPWORK_PASSWORD;
+  if (!email || !password) {
+    logger.warn("[Browser/Upwork] Login required but no UPWORK_EMAIL/UPWORK_PASSWORD in env");
+    return false;
+  }
+
+  logger.info("[Browser/Upwork] Logging in...");
+  try {
+    // Take debug screenshot of login page
+    await page.screenshot({ path: "debug-login-page.png" }).catch(() => {});
+
+    // Wait for page to fully settle
+    await humanDelay(2000, 3000);
+
+    // Try multiple username selectors
+    const usernameSelectors = [
+      '#login_username',
+      'input[name="login[username]"]',
+      'input[type="email"]',
+      'input[placeholder*="email" i]',
+      'input[placeholder*="username" i]',
+    ];
+
+    let usernameInput = null;
+    for (const sel of usernameSelectors) {
+      await page.waitForSelector(sel, { timeout: 5000 }).catch(() => {});
+      usernameInput = await page.$(sel);
+      if (usernameInput) {
+        logger.info(`[Browser/Upwork] Found username input: ${sel}`);
+        break;
+      }
+    }
+
+    if (!usernameInput) {
+      logger.warn("[Browser/Upwork] No username input found");
+      await page.screenshot({ path: "debug-login-no-input.png" }).catch(() => {});
+      return false;
+    }
+
+    // Focus and clear the field first
+    await usernameInput.focus();
+    await humanDelay(200, 400);
+    await page.keyboard.down("Control");
+    await page.keyboard.press("a");
+    await page.keyboard.up("Control");
+    await humanDelay(100, 200);
+    await page.keyboard.type(email, { delay: 25 + Math.random() * 40 });
+    await humanDelay(800, 1500);
+
+    // Submit username by pressing Enter (avoids button click issues)
+    await page.keyboard.press("Enter");
+    logger.info("[Browser/Upwork] Pressed Enter to submit username");
+
+    // Wait for navigation (Upwork navigates to password page)
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {});
+    await humanDelay(2000, 3500);
+
+    // Refresh page ref in case of navigation
+    let currentPage = page;
+    try {
+      const b = await launch();
+      const pages = await b.pages();
+      const p = pages.find(pg => pg.url().includes("upwork")) || pages[0];
+      if (p) currentPage = p;
+    } catch { /* keep existing page */ }
+
+    // Handle potential Cloudflare on password page
+    const cfTitle = await currentPage.title().catch(() => "");
+    if (cfTitle.includes("Just a moment") || cfTitle.includes("Checking")) {
+      logger.info("[Browser/Upwork] Cloudflare challenge on password step");
+      await waitForCloudflare(currentPage, 90000);
+      const b = await launch();
+      const pages = await b.pages();
+      const p = pages.find(pg => pg.url().includes("upwork")) || pages[0];
+      if (p) {
+        await humanDelay(2000, 3000);
+        return handleLogin(p);
+      }
+    }
+
+    // Wait for password field
+    const passwordSelectors = [
+      '#login_password',
+      'input[name="login[password]"]',
+      'input[type="password"]',
+    ];
+    let passwordInput = null;
+    for (const sel of passwordSelectors) {
+      await currentPage.waitForSelector(sel, { timeout: 8000 }).catch(() => {});
+      passwordInput = await currentPage.$(sel);
+      if (passwordInput) {
+        logger.info(`[Browser/Upwork] Found password input: ${sel}`);
+        break;
+      }
+    }
+
+    if (!passwordInput) {
+      logger.warn("[Browser/Upwork] No password input found");
+      await currentPage.screenshot({ path: "debug-login-no-password.png" }).catch(() => {});
+      return false;
+    }
+
+    await passwordInput.focus();
+    await humanDelay(200, 400);
+    await currentPage.keyboard.down("Control");
+    await currentPage.keyboard.press("a");
+    await currentPage.keyboard.up("Control");
+    await humanDelay(100, 200);
+    await currentPage.keyboard.type(password, { delay: 20 + Math.random() * 35 });
+    await humanDelay(800, 1500);
+
+    // Submit by pressing Enter
+    await currentPage.keyboard.press("Enter");
+    logger.info("[Browser/Upwork] Pressed Enter to submit login");
+
+    await currentPage.waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 }).catch(() => {});
+    await humanDelay(2000, 4000);
+
+    await currentPage.screenshot({ path: "debug-login-after.png" }).catch(() => {});
+
+    const currentUrl = currentPage.url();
+    if (currentUrl.includes("login") || currentUrl.includes("account-security")) {
+      logger.warn(`[Browser/Upwork] Still on login page — URL: ${currentUrl}`);
+      return false;
+    }
+
+    logger.info("[Browser/Upwork] Login successful");
+    return true;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] Login error: ${(e as Error).message}`);
+    await page.screenshot({ path: "debug-login-error.png" }).catch(() => {});
+    return false;
+  }
+}
+
+/**
+ * Scrape job listings from the current page.
+ */
+async function scrapeCurrentPage(page: Page, limit: number): Promise<ScrapedJob[]> {
+  // Wait for job article cards to load
+  await page.waitForSelector(
+    'article.job-tile, article[data-ev-job-uid], a[href*="/jobs/"]',
+    { timeout: 15000 }
+  ).catch(() => {
+    logger.warn("[Browser/Upwork] No job elements found on page");
+  });
+
+  // Scroll down to load all lazy-loaded job cards
+  let prevCount = 0;
+  for (let scroll = 0; scroll < 10; scroll++) {
+    const currentCount = await page.evaluate(() =>
+      document.querySelectorAll('article[data-ev-job-uid], article.job-tile').length
+    ).catch(() => 0);
+
+    if (currentCount >= limit || (scroll > 0 && currentCount === prevCount)) break;
+    prevCount = currentCount;
+
+    await page.evaluate(() => window.scrollBy(0, 800));
+    await new Promise(r => setTimeout(r, 800 + Math.random() * 600));
+  }
+  // Scroll back to top
+  await page.evaluate(() => window.scrollTo(0, 0));
+
+  const jobs = await page.evaluate((lim: number) => {
+    const results: any[] = [];
+    const seen = new Set<string>();
+
+    // Strategy 1: Use article elements with job UIDs (most reliable)
+    const articles = Array.from(document.querySelectorAll('article[data-ev-job-uid], article.job-tile'));
+    for (const article of articles) {
+      if (results.length >= lim) break;
+
+      // Get job ID from data attribute or link
+      let id = article.getAttribute('data-ev-job-uid') || '';
+      const jobLink = article.querySelector('a[href*="/jobs/"]') as HTMLAnchorElement | null;
+      const href = jobLink?.href || '';
+
+      if (!id) {
+        const idMatch = href.match(/~0?([a-f0-9]{10,})/);
+        id = idMatch ? idMatch[1] : '';
+      }
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+
+      // Title from the first link in the article
+      const title = jobLink?.textContent?.trim() || '';
+      if (!title || title.length < 5) continue;
+
+      // Description - look for paragraph or description element
+      let desc = '';
+      const descEl = article.querySelector('p, [data-test="job-description-text"], .text-body-sm, span.up-line-clamp-v2, [class*="description"]');
+      desc = descEl?.textContent?.trim().slice(0, 500) || '';
+
+      // Budget
+      let budget = '';
+      const budgetEl = article.querySelector('[data-test="budget"], [data-test="is-fixed-price"], [class*="budget"]');
+      budget = budgetEl?.textContent?.trim() || '';
+      // Also check for budget in general text
+      if (!budget) {
+        const allText = article.textContent || '';
+        const budgetMatch = allText.match(/\$[\d,.]+(?:\s*-\s*\$[\d,.]+)?(?:\s*\/\s*hr)?/);
+        budget = budgetMatch ? budgetMatch[0] : '';
+      }
+
+      // Posted time
+      let posted = '';
+      const timeEl = article.querySelector('small, time, [data-test="posted-on"], span[data-test="posted-on"]');
+      posted = timeEl?.textContent?.trim() || '';
+
+      // Proposals count
+      let proposals = '';
+      const allText = article.textContent || '';
+      const proposalMatch = allText.match(/(\d+)\s*to\s*(\d+)\s*proposals?|Less than \d+ proposals?|(\d+)\+?\s*proposals?/i);
+      proposals = proposalMatch ? proposalMatch[0] : '';
+
+      // Client spend
+      let clientSpend = '';
+      const spendMatch = allText.match(/\$[\d,.]+[KkMm]?\+?\s*(?:spent|total)/i);
+      clientSpend = spendMatch ? spendMatch[0] : '';
+
+      // Payment verified
+      const paymentVerified = /payment\s*(?:method\s*)?verified/i.test(allText) || undefined;
+
+      // Freelancer Plus: Client hire rate from job cards
+      const hireRateMatch = allText.match(/(\d+)%\s*hire\s*rate/i) || allText.match(/hire\s*rate[:\s]*(\d+)%/i);
+      const clientHireRate = hireRateMatch ? parseInt(hireRateMatch[1]) : undefined;
+
+      // Freelancer Plus: Client total hires
+      const hiresMatch = allText.match(/(\d+)\s*hires?/i);
+      const clientHires = hiresMatch ? parseInt(hiresMatch[1]) : undefined;
+
+      // Freelancer Plus: Bid range on card
+      let bidLow: number | undefined, bidAvg: number | undefined, bidHigh: number | undefined;
+      const bidRangeMatch = allText.match(/(?:Low|Min)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:Avg|Average)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:High|Max)[:\s]*\$([\d,.]+)/i);
+      if (bidRangeMatch) {
+        bidLow = parseFloat(bidRangeMatch[1].replace(/,/g, ''));
+        bidAvg = parseFloat(bidRangeMatch[2].replace(/,/g, ''));
+        bidHigh = parseFloat(bidRangeMatch[3].replace(/,/g, ''));
+      }
+
+      // Freelancer Plus: Interviewing count
+      const interviewMatch = allText.match(/Interviewing[:\s]*(\d+)/i);
+      const interviewing = interviewMatch ? parseInt(interviewMatch[1]) : undefined;
+
+      // Freelancer Plus: Invites sent
+      const invitesMatch = allText.match(/Invites?\s*sent[:\s]*(\d+)/i);
+      const invitesSent = invitesMatch ? parseInt(invitesMatch[1]) : undefined;
+
+      // Freelancer Plus: Unanswered invites
+      const unansweredMatch = allText.match(/Unanswered\s*invites?[:\s]*(\d+)/i);
+      const unansweredInvites = unansweredMatch ? parseInt(unansweredMatch[1]) : undefined;
+
+      // Skill tags
+      const skillTags: string[] = [];
+      const skillEls = article.querySelectorAll('a[data-test="skill"], span.up-skill-badge, .air3-token, [class*="skill"]');
+      skillEls.forEach(s => {
+        const t = s.textContent?.trim();
+        if (t && t.length < 40) skillTags.push(t);
+      });
+
+      // Always build URL from clean job ID — scraped hrefs contain search highlight markup
+      // e.g. "span-class-highlight-Automation-span-" in the path breaks job page navigation
+      const url = id ? `https://www.upwork.com/jobs/~0${id}` : (href.startsWith('http') ? href.split('?')[0] : `https://www.upwork.com${href.split('?')[0]}`);
+
+      results.push({
+        id,
+        title,
+        description: desc,
+        url,
+        budget: budget || undefined,
+        posted: posted || undefined,
+        proposals: proposals || undefined,
+        clientSpend: clientSpend || undefined,
+        skills: skillTags.length > 0 ? skillTags : undefined,
+        clientHireRate,
+        clientHires,
+        competitiveBidRange: (bidLow || bidAvg || bidHigh) ? { low: bidLow, avg: bidAvg, high: bidHigh } : undefined,
+        interviewing,
+        invitesSent,
+        unansweredInvites,
+        paymentVerified: paymentVerified || undefined,
+      });
+    }
+
+    // Strategy 2: Fallback - find any links to /jobs/ pages
+    if (results.length === 0) {
+      const jobLinks = Array.from(document.querySelectorAll('a[href*="/jobs/"]'));
+      for (const link of jobLinks) {
+        if (results.length >= lim) break;
+        const a = link as HTMLAnchorElement;
+        const href = a.href || '';
+        const idMatch = href.match(/~0?([a-f0-9]{10,})/);
+        const id = idMatch ? idMatch[1] : '';
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+
+        const title = a.textContent?.trim() || '';
+        if (!title || title.length < 5) continue;
+
+        const card = a.closest('article, section, div.up-card-section, [class*="card"]');
+        const desc = card?.querySelector('p')?.textContent?.trim().slice(0, 500) || '';
+
+        results.push({
+          id,
+          title,
+          description: desc,
+          url: href.split('?')[0],
+        });
+      }
+    }
+
+    return results;
+  }, limit);
+
+  return jobs;
+}
+
+let _loggedIn = false;
+let _lastSessionCheck = 0;
+const SESSION_CHECK_INTERVAL_MS = 10 * 60 * 1000; // Re-verify session every 10 minutes
+
+/** Reset the login flag — forces ensureLoggedIn to re-check on next call */
+export function invalidateSession(): void {
+  _loggedIn = false;
+  _lastSessionCheck = 0;
+  logger.info("[Browser/Upwork] Session invalidated — will re-check login on next operation");
+}
+
+/**
+ * Check if the current Upwork session is still valid.
+ * Navigates to a lightweight API endpoint and checks for login redirect.
+ * Returns true if session is alive, false if signed out.
+ */
+export async function checkSessionHealth(): Promise<{ valid: boolean; detail: string }> {
+  try {
+    const b = await launch();
+    const pages = await b.pages();
+    const page = pages.find(p => p.url().includes("upwork.com") && !p.url().includes("login")) || pages[0];
+    if (!page) return { valid: false, detail: "No browser page available" };
+
+    // Check the current page for login indicators without navigating
+    const checks = await page.evaluate(() => {
+      const url = window.location.href;
+      const body = document.body?.innerText?.slice(0, 3000) || "";
+      const hasLoginLink = !!document.querySelector('a[href*="login"], a[href*="account-security/login"]');
+      const hasSignupLink = !!document.querySelector('a[href*="signup"], a[href*="sign-up"]');
+      const hasLoginText = body.includes("Log in to Upwork") || body.includes("Log In");
+      const hasSignupText = body.includes("Sign up") || body.includes("Sign Up");
+      const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar, img[alt*="avatar"]');
+      const hasNavMenu = !!document.querySelector('[data-test="nav-dropdown"], .nav-d-account, .dropdown-toggle, .fe-navbar-user');
+      const isOnLoginPage = url.includes("/login") || url.includes("account-security");
+      const isOnCF = document.title.includes("Just a moment") || document.title.includes("Checking");
+      return { url, hasLoginLink, hasSignupLink, hasLoginText, hasSignupText, hasAvatar, hasNavMenu, isOnLoginPage, isOnCF, title: document.title };
+    }).catch(() => null);
+
+    if (!checks) return { valid: false, detail: "Could not evaluate page state" };
+
+    // Definitely signed out
+    if (checks.isOnLoginPage) {
+      _loggedIn = false;
+      return { valid: false, detail: `On login page: ${checks.url.slice(0, 80)}` };
+    }
+    if (checks.isOnCF) {
+      return { valid: false, detail: "Stuck on Cloudflare challenge" };
+    }
+    if ((checks.hasLoginText || checks.hasSignupText || checks.hasSignupLink || checks.hasLoginLink) && !checks.hasAvatar && !checks.hasNavMenu) {
+      _loggedIn = false;
+      return { valid: false, detail: `Signed out — login=${checks.hasLoginLink}, signup=${checks.hasSignupLink}, no avatar/nav` };
+    }
+
+    // Definitely signed in
+    if (checks.hasAvatar || checks.hasNavMenu) {
+      _loggedIn = true; _lastSessionCheck = Date.now();
+      _lastSessionCheck = Date.now();
+      return { valid: true, detail: "Session valid — avatar/nav menu present" };
+    }
+
+    // Ambiguous — do a lightweight navigation check
+    // Hit the /my-stats/ page which redirects to login if not authenticated
+    const testUrl = "https://www.upwork.com/nx/find-work/";
+    await page.goto(testUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await new Promise(r => setTimeout(r, 2000));
+
+    const afterUrl = page.url();
+    if (afterUrl.includes("login") || afterUrl.includes("account-security")) {
+      _loggedIn = false;
+      return { valid: false, detail: `Redirected to login: ${afterUrl.slice(0, 80)}` };
+    }
+
+    // Check for avatar after navigation
+    const hasAvatar = await page.$('[data-test="avatar"], .nav-avatar, .user-avatar').catch(() => null);
+    if (hasAvatar) {
+      _loggedIn = true; _lastSessionCheck = Date.now();
+      _lastSessionCheck = Date.now();
+      return { valid: true, detail: "Session valid after navigation check" };
+    }
+
+    _loggedIn = false;
+    return { valid: false, detail: `No clear login indicators on ${afterUrl.slice(0, 80)}` };
+  } catch (e) {
+    return { valid: false, detail: `Session check error: ${(e as Error).message}` };
+  }
+}
+
+/**
+ * Ensure we're logged into Upwork. Navigates to login page if needed.
+ * Now also periodically re-validates the session (every 10 min).
+ */
+async function ensureLoggedIn(page: Page): Promise<boolean> {
+  // If session was validated recently, trust it
+  if (_loggedIn && (Date.now() - _lastSessionCheck) < SESSION_CHECK_INTERVAL_MS) return true;
+
+  // If _loggedIn is true but stale, do a quick page check
+  if (_loggedIn) {
+    const quickCheck = await page.evaluate(() => {
+      const hasSignup = !!document.querySelector('a[href*="signup"]');
+      const hasLogin = !!document.querySelector('a[href*="login"]');
+      const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar');
+      const hasUserMenu = !!document.querySelector('.nav-d-account, [data-test="nav-dropdown"], .fe-navbar-user');
+      return { signedOut: hasSignup || hasLogin, signedIn: hasAvatar || hasUserMenu };
+    }).catch(() => ({ signedOut: false, signedIn: false }));
+
+    if (quickCheck.signedIn && !quickCheck.signedOut) {
+      _lastSessionCheck = Date.now();
+      return true;
+    }
+    // Session expired — reset and fall through to full login
+    logger.warn("[Browser/Upwork] Session appears expired — re-authenticating");
+    _loggedIn = false;
+  }
+
+  // Check if already logged in — look for BOTH "Log in" AND "Sign up" indicators
+  // Upwork shows "Sign up" (not "Log in") when fully signed out
+  const signedOutIndicator = await page.evaluate(() => {
+    const signupLink = document.querySelector('a[href*="signup"], a[href*="sign-up"]');
+    const loginLink = document.querySelector('a[href*="login"], a[href*="account-security"]');
+    const bodyText = document.body?.innerText?.slice(0, 1000) || "";
+    const hasSignUp = !!signupLink || bodyText.includes("Sign up") || bodyText.includes("Sign Up");
+    const hasLogIn = !!loginLink || bodyText.includes("Log in") || bodyText.includes("Log In");
+    // Positive signals: avatar or user nav menu = definitely logged in
+    const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar, img[alt*="avatar"]');
+    const hasUserMenu = !!document.querySelector('.nav-d-account, [data-test="nav-dropdown"], .fe-navbar-user');
+    return { hasSignUp, hasLogIn, hasAvatar, hasUserMenu };
+  }).catch(() => ({ hasSignUp: false, hasLogIn: false, hasAvatar: false, hasUserMenu: false }));
+
+  // If we see avatar or user menu, we're definitely logged in
+  if (signedOutIndicator.hasAvatar || signedOutIndicator.hasUserMenu) {
+    _loggedIn = true; _lastSessionCheck = Date.now();
+    return true;
+  }
+
+  // If no sign-out indicators and no positive indicators, check URL
+  if (!signedOutIndicator.hasSignUp && !signedOutIndicator.hasLogIn) {
+    // Ambiguous — might be a non-nav page. Trust it cautiously.
+    _loggedIn = true; _lastSessionCheck = Date.now();
+    return true;
+  }
+
+  // We see "Sign up" or "Log in" without avatar — we're signed out
+  logger.info(`[Browser/Upwork] Signed out detected (signup=${signedOutIndicator.hasSignUp}, login=${signedOutIndicator.hasLogIn})`);
+
+
+  // Try restoring saved cookies before doing a full login
+  if (hasSavedCookies()) {
+    logger.info("[Browser/Upwork] Attempting session restore via saved cookies...");
+    const restored = await restoreCookies(page);
+    if (restored) {
+      // Reload page to apply cookies
+      await page.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
+      await humanDelay(1500, 2500);
+      // Check login state again — look for Sign up AND Log in (Upwork shows "Sign up" when signed out)
+      const stillNeedsLogin = await page.evaluate(() => {
+        const hasSignup = !!document.querySelector('a[href*="signup"]');
+        const hasLogin = !!document.querySelector('a[href*="login"]');
+        const hasAvatar = !!document.querySelector('[data-test="avatar"], .nav-avatar, .user-avatar');
+        const hasUserMenu = !!document.querySelector('.nav-d-account, [data-test="nav-dropdown"], .fe-navbar-user');
+        // Signed in if we have avatar/menu, signed out if we see signup/login links
+        if (hasAvatar || hasUserMenu) return false; // not needs login
+        return hasSignup || hasLogin;
+      }).catch(() => true);
+      if (!stillNeedsLogin) {
+        logger.info("[Browser/Upwork] Session restored from cookies — no login needed!");
+        _loggedIn = true; _lastSessionCheck = Date.now();
+        return true;
+      }
+      logger.info("[Browser/Upwork] Saved cookies expired — proceeding with full login");
+    }
+  }
+
+  logger.info("[Browser/Upwork] Not logged in — navigating to login page");
+  await page.goto("https://www.upwork.com/ab/account-security/login", {
+    waitUntil: "networkidle2",
+    timeout: 30000,
+  });
+
+  // Handle Cloudflare on login page
+  const cfPassed = await waitForCloudflare(page, 90000);
+  if (!cfPassed) {
+    // Refresh page ref after disconnect
+    const b = await launch();
+    const pages = await b.pages();
+    const p = pages.find(pg => pg.url().includes("upwork")) || pages[0];
+    if (p) {
+      await p.goto("https://www.upwork.com/ab/account-security/login", {
+        waitUntil: "networkidle2",
+        timeout: 30000,
+      });
+    }
+  }
+
+  // Refresh page ref after potential CDP reconnect
+  const b = await launch();
+  const allPages = await b.pages();
+  const loginPage = allPages.find(p => p.url().includes("upwork")) || allPages[0];
+
+  const ok = await handleLogin(loginPage);
+  if (ok) {
+    _loggedIn = true; _lastSessionCheck = Date.now();
+    logger.info("[Browser/Upwork] Login confirmed");
+    // Save cookies for future sessions
+    const b3 = await launch();
+    const p3 = (await b3.pages()).find(p => p.url().includes("upwork")) || loginPage;
+    await saveCookies(p3);
+  }
+  return ok;
+}
+
+/**
+ * PUBLIC: detect signed-out state and auto-login. Safe to call anywhere — startup, cron tick,
+ * fast-poll, before submission. Returns true when the session is healthy at end of call.
+ *
+ * Flow:
+ *   1. checkSessionHealth() — fast read on whatever Upwork tab is active.
+ *   2. If healthy, return true.
+ *   3. Else navigate the tab to the login page and run handleLogin (uses UPWORK_EMAIL/PASSWORD).
+ *   4. Re-check; return final state.
+ *
+ * Notification: callers can opt into Telegram alerts via the optional `notify` arg so we don't
+ * spam at every tick — only the cron / startup pass true.
+ */
+export async function ensureUpworkLoggedIn(notify?: (msg: string) => Promise<void>): Promise<boolean> {
+  const initial = await checkSessionHealth();
+  if (initial.valid) return true;
+
+  logger.warn(`[Browser/Upwork] Session invalid: ${initial.detail} — attempting auto-login`);
+  if (notify) await notify(`⚠️ Upwork session expired: ${initial.detail.slice(0, 120)} — auto-logging in...`).catch(() => {});
+
+  if (!process.env.UPWORK_EMAIL || !process.env.UPWORK_PASSWORD) {
+    const msg = "Cannot auto-login — UPWORK_EMAIL/UPWORK_PASSWORD not set in .env";
+    logger.error(`[Browser/Upwork] ${msg}`);
+    if (notify) await notify(`❌ ${msg}`).catch(() => {});
+    return false;
+  }
+
+  try {
+    const page = await getActivePage();
+    const ok = await ensureLoggedIn(page);
+    if (ok) {
+      logger.info("[Browser/Upwork] Auto-login succeeded");
+      if (notify) await notify("✅ Upwork auto-login succeeded — session restored").catch(() => {});
+    } else {
+      logger.error("[Browser/Upwork] Auto-login failed");
+      if (notify) await notify("❌ Upwork auto-login FAILED — manual intervention needed (run `npm run login:upwork`)").catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] Auto-login error: ${(e as Error).message}`);
+    if (notify) await notify(`❌ Upwork auto-login error: ${(e as Error).message.slice(0, 200)}`).catch(() => {});
+    return false;
+  }
+}
+
+/**
+ * Search for jobs with a single keyword and optional filters.
+ */
+// Track consecutive Cloudflare blocks for backoff
+let _cfConsecutiveBlocks = 0;
+
+/**
+ * Helper: get the active Upwork page after a potential CDP reconnect.
+ * Prefers search pages over proposal pages to avoid grabbing the dedicated submission tab.
+ */
+async function getActivePage(): Promise<Page> {
+  const b = await launch();
+  const pages = await b.pages();
+  // Prefer search/job listing pages, avoid proposal form pages (used by dedicated submit tab)
+  return pages.find(p => p.url().includes("upwork") && p.url().includes("/search/"))
+    || pages.find(p => p.url().includes("upwork") && !p.url().includes("/proposals/"))
+    || pages.find(p => p.url().includes("upwork"))
+    || pages[0];
+}
+
+/**
+ * Helper: solve Cloudflare with retry + exponential backoff.
+ * Returns the active page after solving (page ref may change due to CDP reconnect).
+ *
+ * `maxTotalMs` is the hard wall-clock budget across all attempts. Submissions have a 90s
+ * outer timeout, so the default 60s here leaves ~30s for the actual proposal flow. Callers
+ * doing background work (scan, login warm-up) can pass a larger budget.
+ */
+async function solveCloudflareWithRetry(
+  page: Page,
+  maxAttempts = 3,
+  maxTotalMs = 60_000,
+): Promise<{ page: Page; passed: boolean }> {
+  const start = Date.now();
+  let currentPage = page;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const title = await currentPage.title().catch(() => "");
+    if (!title.includes("Just a moment") && !title.includes("Checking") && !title.includes("Attention")) {
+      _cfConsecutiveBlocks = 0;
+      return { page: currentPage, passed: true };
+    }
+
+    const remaining = maxTotalMs - (Date.now() - start);
+    if (remaining <= 1000) {
+      logger.warn(`[Browser/Upwork] Cloudflare time budget exhausted after attempt ${attempt - 1}/${maxAttempts}`);
+      _cfConsecutiveBlocks++;
+      // cloudflare-recover-001: budget exhausted means we've spent the full ~60s
+      // wall-clock attempting to solve and still see "Just a moment" / "Checking".
+      // Looping again would just re-enter the same wedged session — restart Chrome
+      // (cooldowned in process-control to avoid thrash) so the next call gets a
+      // fresh browser context. Best-effort: failure here just falls through.
+      const restarted = await requestChromeRestart(`cloudflare stuck >${Math.round(maxTotalMs / 1000)}s`).catch(() => false);
+      if (restarted) {
+        currentPage = await getActivePage().catch(() => currentPage);
+      }
+      return { page: currentPage, passed: false };
+    }
+    // Cap each attempt at remaining budget (or 30s, whichever is smaller).
+    const attemptBudgetMs = Math.min(30_000, remaining);
+    logger.info(`[Browser/Upwork] Cloudflare solve attempt ${attempt}/${maxAttempts} (budget ${Math.round(attemptBudgetMs / 1000)}s, ${Math.round(remaining / 1000)}s remaining)`);
+    const passed = await waitForCloudflare(currentPage, attemptBudgetMs);
+    currentPage = await getActivePage();
+
+    if (passed) {
+      _cfConsecutiveBlocks = 0;
+      return { page: currentPage, passed: true };
+    }
+
+    _cfConsecutiveBlocks++;
+    if (attempt < maxAttempts) {
+      const remainingAfter = maxTotalMs - (Date.now() - start);
+      if (remainingAfter <= 2000) {
+        logger.warn(`[Browser/Upwork] Cloudflare time budget exhausted (${Math.round(remainingAfter / 1000)}s remaining) — bailing out`);
+        return { page: currentPage, passed: false };
+      }
+      // Cap backoff at half of remaining budget so we always get one more try.
+      const backoffMs = Math.min(15000 * Math.pow(2, attempt - 1), Math.max(1000, Math.floor(remainingAfter / 2)));
+      logger.info(`[Browser/Upwork] Cloudflare blocked — backing off ${Math.round(backoffMs / 1000)}s before retry`);
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
+  }
+  // All attempts failed within budget — same recovery as budget-exhausted path.
+  const restarted = await requestChromeRestart(`cloudflare stuck across ${maxAttempts} attempts`).catch(() => false);
+  if (restarted) {
+    currentPage = await getActivePage().catch(() => currentPage);
+  }
+  return { page: currentPage, passed: false };
+}
+
+export async function searchJobs(
+  keyword: string,
+  filters: SearchFilters = {},
+  limit = 20,
+  existingPage?: Page
+): Promise<ScrapedJob[]> {
+  let page: Page | null = existingPage || null;
+  const ownsPage = !existingPage;
+
+  try {
+    if (!page) {
+      page = await newPage();
+
+      // Ensure logged in first — only when opening a fresh page
+      await page.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
+      const cfResult = await solveCloudflareWithRetry(page);
+      page = cfResult.page;
+
+      if (!cfResult.passed) {
+        logger.warn("[Browser/Upwork] Cloudflare blocked on homepage");
+      }
+
+      await ensureLoggedIn(page);
+    }
+
+    // Navigate directly to search URL (skip homepage if we already have a page)
+    const url = buildSearchUrl(keyword, filters);
+    logger.info(`[Browser/Upwork] Searching: "${keyword}" (${filters.sort || "recency"})`);
+
+    // Check busy flag before navigating (proposal submission may have started)
+    if (_browserBusy) {
+      logger.info("[Browser/Upwork] Pausing scan (pre-nav) — proposal submission in progress...");
+      while (_browserBusy) await new Promise(r => setTimeout(r, 2000));
+      logger.info("[Browser/Upwork] Resuming scan after proposal submission");
+    }
+
+    page = await getActivePage();
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+    await humanDelay(3000, 5000);
+
+    // Handle Cloudflare on search page
+    const searchTitle = await page.title();
+    if (searchTitle.includes("Just a moment") || searchTitle.includes("Checking") || searchTitle.includes("Attention")) {
+      logger.info("[Browser/Upwork] Cloudflare challenge on search page — solving...");
+      const cfResult = await solveCloudflareWithRetry(page);
+      page = cfResult.page;
+
+      if (cfResult.passed) {
+        // After CF, check if submit took the page — don't navigate if busy
+        if (_browserBusy) {
+          logger.info("[Browser/Upwork] Pausing scan (post-CF) — proposal submission in progress...");
+          while (_browserBusy) await new Promise(r => setTimeout(r, 2000));
+          logger.info("[Browser/Upwork] Resuming scan after proposal submission");
+          page = await getActivePage();
+        }
+        // Check if CF redirected us or if we need to re-navigate
+        const currentUrl = page.url();
+        if (!currentUrl.includes("/search/jobs")) {
+          await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+          await humanDelay(3000, 5000);
+        }
+      }
+    }
+
+    // Wait for job content to load (SPA may load async)
+    await page.waitForSelector('article.job-tile, article[data-ev-job-uid], a[href*="/jobs/"]', { timeout: 15000 }).catch(() => {
+      logger.warn("[Browser/Upwork] Timed out waiting for job listings to appear");
+    });
+    await humanDelay(1000, 2000);
+
+    // Dismiss cookie banner if present
+    const cookieBtn = await page.$('button[id*="cookie"], button.onetrust-close-btn-handler, button[aria-label="Close"]');
+    if (cookieBtn) {
+      await cookieBtn.click().catch(() => {});
+      await humanDelay(500, 1000);
+    }
+
+    // Debug: save screenshot and check page state
+    const pageTitle = await page.title();
+    const pageUrl = page.url();
+    logger.info(`[Browser/Upwork] Page: "${pageTitle}" | URL: ${pageUrl.slice(0, 100)}`);
+    await page.screenshot({ path: `debug-search-${keyword.replace(/\s+/g, "-")}.png` }).catch(() => {});
+
+    // Check for "can't complete" / "Log in" / empty results
+    const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => "");
+    // Log abbreviated page text for debugging
+    if (pageText.includes("can't complete") || pageText.includes("Log in to Upwork") || (pageText.includes("Sign up") && !pageText.includes("My Stats"))) {
+      logger.warn(`[Browser/Upwork] Page shows error or login required for "${keyword}"`);
+      _loggedIn = false; _lastSessionCheck = 0; // Invalidate session
+      // Try logging in
+      const loginLink = await page.$('a[href*="login"], button:has-text("Log In")');
+      if (loginLink) {
+        await loginLink.click().catch(() => {});
+        await humanDelay(2000, 3000);
+        const loginOk = await handleLogin(page);
+        if (loginOk) {
+          // Re-navigate after login
+          await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+          await humanDelay(3000, 5000);
+        }
+      }
+    }
+
+    const jobs = await scrapeCurrentPage(page, limit);
+    logger.info(`[Browser/Upwork] Found ${jobs.length} jobs for "${keyword}"`);
+    return jobs;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] searchJobs error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    // Only close page if we created it (not reused from scanJobs)
+    if (ownsPage && page) await page.close().catch(() => {});
+  }
+}
+
+/**
+ * Search multiple keywords, deduplicate results.
+ */
+export async function scanJobs(
+  keywords: string[],
+  filters: SearchFilters = {},
+  limit = 20
+): Promise<ScrapedJob[]> {
+  const allJobs: ScrapedJob[] = [];
+  const seen = new Set<string>();
+
+  // Open a single page and reuse it across all keyword searches
+  let sharedPage: Page | null = null;
+  try {
+    sharedPage = await newPage();
+
+    // Login once on the shared page
+    await sharedPage.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
+    const cfResult = await solveCloudflareWithRetry(sharedPage);
+    sharedPage = cfResult.page;
+    await ensureLoggedIn(sharedPage);
+
+    for (let i = 0; i < keywords.length; i++) {
+      const kw = keywords[i];
+
+      // If we've been getting consecutive CF blocks, do a longer cooldown
+      if (_cfConsecutiveBlocks >= 3) {
+        const cooldownMs = 60000 + Math.random() * 60000; // 60-120s
+        logger.warn(`[Browser/Upwork] ${_cfConsecutiveBlocks} consecutive CF blocks — cooling down ${Math.round(cooldownMs / 1000)}s`);
+        await new Promise(r => setTimeout(r, cooldownMs));
+        _cfConsecutiveBlocks = 0;
+      }
+
+      // Re-get page ref in case CDP reconnected
+      sharedPage = await getActivePage();
+      const jobs = await searchJobs(kw, filters, limit, sharedPage);
+
+      for (const job of jobs) {
+        if (!seen.has(job.id)) {
+          seen.add(job.id);
+          allJobs.push(job);
+        }
+      }
+
+      // Longer delay between searches to avoid triggering Cloudflare rate limits
+      if (i < keywords.length - 1) {
+        // If a proposal submission is in progress, wait for it to finish
+        if (_browserBusy) {
+          logger.info("[Browser/Upwork] Pausing scan — proposal submission in progress...");
+          while (_browserBusy) await new Promise(r => setTimeout(r, 2000));
+          logger.info("[Browser/Upwork] Resuming scan after proposal submission");
+          // Re-get page ref since submit may have navigated
+          sharedPage = await getActivePage();
+        }
+
+        // Close stale tabs every 5 keywords to reduce Chrome memory pressure
+        if (i % 5 === 4) {
+          try {
+            const br = await launch();
+            const openPages = await br.pages();
+            let closed = 0;
+            for (const p of openPages) {
+              if (p !== sharedPage) { await p.close().catch(() => {}); closed++; }
+            }
+            if (closed > 0) logger.info(`[Browser/Upwork] Cleaned up ${closed} stale tab(s)`);
+          } catch {}
+        }
+
+        const delayMs = 8000 + Math.random() * 12000; // 8-20s between keywords
+        logger.info(`[Browser/Upwork] Waiting ${Math.round(delayMs / 1000)}s before next keyword...`);
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  } finally {
+    if (sharedPage) await sharedPage.close().catch(() => {});
+  }
+
+  logger.info(`[Browser/Upwork] Total unique jobs: ${allJobs.length} across ${keywords.length} keywords`);
+  return allJobs;
+}
+
+/**
+ * Scrape Best Matches / Featured feed page.
+ * This is the curated feed Upwork shows at /nx/find-work/best-matches
+ */
+export async function scrapeBestMatches(limit = 20): Promise<ScrapedJob[]> {
+  let page: Page | null = null;
+  try {
+    page = await newPage();
+    await page.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
+    const cfResult = await solveCloudflareWithRetry(page);
+    page = cfResult.page;
+
+    if (!cfResult.passed) {
+      logger.warn("[Browser/Upwork] Cloudflare blocked on homepage");
+    }
+
+    await ensureLoggedIn(page);
+
+    // Navigate to Best Matches feed
+    page = await getActivePage();
+    await page.goto("https://www.upwork.com/nx/find-work/best-matches", { waitUntil: "networkidle2", timeout: 45000 });
+    await humanDelay(3000, 5000);
+
+    // Handle CF on feed page
+    const feedTitle = await page.title();
+    if (feedTitle.includes("Just a moment") || feedTitle.includes("Checking") || feedTitle.includes("Attention")) {
+      logger.info("[Browser/Upwork] Cloudflare on best-matches page — solving...");
+      const cfResult2 = await solveCloudflareWithRetry(page);
+      page = cfResult2.page;
+
+      if (cfResult2.passed) {
+        const currentUrl = page.url();
+        if (!currentUrl.includes("best-matches") && !currentUrl.includes("find-work")) {
+          await page.goto("https://www.upwork.com/nx/find-work/best-matches", { waitUntil: "networkidle2", timeout: 45000 });
+          await humanDelay(3000, 5000);
+        }
+      }
+    }
+
+    await page.waitForSelector('article.job-tile, article[data-ev-job-uid], a[href*="/jobs/"]', { timeout: 15000 }).catch(() => {
+      logger.warn("[Browser/Upwork] No job elements on best-matches page");
+    });
+    await humanDelay(1000, 2000);
+
+    const pageTitle = await page.title();
+    logger.info(`[Browser/Upwork] Best Matches page: "${pageTitle}"`);
+
+    const jobs = await scrapeCurrentPage(page, limit);
+    logger.info(`[Browser/Upwork] Found ${jobs.length} best-match jobs`);
+    return jobs;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] scrapeBestMatches error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
+}
+
+/**
+ * Profile data scraped from Upwork.
+ */
+export interface UpworkProfile {
+  name: string;
+  title: string;
+  hourlyRate: string;
+  location: string;
+  description: string;
+  totalJobs: number;
+  completedJobs: number;
+  inProgressJobs: number;
+  totalEarnings?: string;
+  jobSuccessScore?: string;
+  rating?: string;
+  hoursPerWeek?: string;
+  skills: string[];
+  linkedAccounts: string[];
+  availability: string;
+  profileUrl: string;
+  memberSince?: string;
+  connects?: number;
+  proposals?: { active: number; archived: number; invitations: number };
+  recentFeedback: { client: string; rating: string; comment: string }[];
+}
+
+/**
+ * Scrape the logged-in user's profile data.
+ */
+export async function getProfile(): Promise<UpworkProfile | null> {
+  let page: Page | null = null;
+
+  try {
+    page = await newPage();
+
+    // Navigate and handle CF
+    await page.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
+    const cfResult = await solveCloudflareWithRetry(page);
+    page = cfResult.page;
+
+    await ensureLoggedIn(page);
+
+    // Refresh page ref after login
+    page = await getActivePage();
+
+    // Find our profile URL from the nav
+    const profileUrl = await page.evaluate(() => {
+      const links = document.querySelectorAll('a[href*="/freelancers/~"]');
+      for (const l of Array.from(links)) {
+        const href = (l as HTMLAnchorElement).href;
+        if (href.match(/\/freelancers\/~[a-f0-9]+$/)) return href;
+      }
+      return "";
+    });
+
+    if (!profileUrl) {
+      logger.warn("[Browser/Upwork] Could not find profile URL");
+      return null;
+    }
+
+    logger.info(`[Browser/Upwork] Profile URL: ${profileUrl}`);
+
+    // Navigate to profile page
+    await page.goto(profileUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    await humanDelay(3000, 5000);
+
+    // Scrape profile data
+    const profile = await page.evaluate((url: string) => {
+      const text = document.body.innerText || "";
+
+      // Name
+      const nameEl = document.querySelector('h1, h2, [data-test="freelancer-name"]');
+      const name = nameEl?.textContent?.trim() || "";
+
+      // Title
+      const titleEl = document.querySelector('[data-test="freelancer-title"], [class*="profile-title"]');
+      const title = titleEl?.textContent?.trim() || "";
+
+      // Hourly rate
+      const rateMatch = text.match(/\$[\d,.]+\/hr/);
+      const hourlyRate = rateMatch ? rateMatch[0] : "";
+
+      // Location
+      const locEl = document.querySelector('[data-test="freelancer-location"], [itemprop="address"]');
+      const location = locEl?.textContent?.trim() || "";
+
+      // Description/overview
+      const descEl = document.querySelector('[data-test="freelancer-overview"], [class*="overview"] p, section p');
+      const description = descEl?.textContent?.trim().slice(0, 1000) || "";
+
+      // Job counts
+      const totalMatch = text.match(/(\d+)\s*Total jobs/i);
+      const completedMatch = text.match(/Completed jobs\s*\((\d+)\)/i);
+      const inProgressMatch = text.match(/In progress\s*\((\d+)\)/i);
+
+      // Rating
+      const ratingMatch = text.match(/Rating is ([\d.]+) out of 5/);
+      const rating = ratingMatch ? ratingMatch[1] : "";
+
+      // Hours per week
+      const hoursMatch = text.match(/(As Needed|Less than 30|More than 30)[^]*?(?:hrs\/week|Open to Offers)/i);
+      const hoursPerWeek = hoursMatch ? hoursMatch[0].trim() : "";
+
+      // Skills
+      const skillEls = document.querySelectorAll('[data-test="skill"], [class*="skill"] span, .air3-token');
+      const skills: string[] = [];
+      skillEls.forEach(s => {
+        const t = s.textContent?.trim();
+        if (t && t.length < 50 && !skills.includes(t)) skills.push(t);
+      });
+
+      // If skills empty, try to find from the Skills section
+      if (skills.length === 0) {
+        const skillSection = text.match(/Skills\n([\s\S]*?)(?:Project catalog|Portfolio|Work history|$)/);
+        if (skillSection) {
+          skillSection[1].split("\n").forEach(s => {
+            const t = s.trim();
+            if (t && t.length > 2 && t.length < 50) skills.push(t);
+          });
+        }
+      }
+
+      // Linked accounts
+      const linkedAccounts: string[] = [];
+      const linkedSection = text.match(/Linked accounts\n([\s\S]*?)(?:Skills|Portfolio|$)/);
+      if (linkedSection) {
+        linkedSection[1].split("\n").forEach(l => {
+          const t = l.trim();
+          if (t && t.length > 3 && t.length < 60) linkedAccounts.push(t);
+        });
+      }
+
+      // Recent feedback
+      const recentFeedback: { client: string; rating: string; comment: string }[] = [];
+      const feedbackMatches = text.matchAll(/Rating is ([\d.]+) out of 5[\s\S]*?"([^"]+)"/g);
+      for (const m of feedbackMatches) {
+        recentFeedback.push({ client: "", rating: m[1], comment: m[2].slice(0, 200) });
+      }
+
+      // Member since
+      const sinceMatch = text.match(/Member since\s+(\w+ \d{4})/i);
+
+      return {
+        name,
+        title,
+        hourlyRate,
+        location,
+        description,
+        totalJobs: totalMatch ? parseInt(totalMatch[1]) : 0,
+        completedJobs: completedMatch ? parseInt(completedMatch[1]) : 0,
+        inProgressJobs: inProgressMatch ? parseInt(inProgressMatch[1]) : 0,
+        rating,
+        hoursPerWeek,
+        skills,
+        linkedAccounts,
+        availability: hoursPerWeek || "Unknown",
+        profileUrl: url,
+        memberSince: sinceMatch ? sinceMatch[1] : undefined,
+        recentFeedback,
+      };
+    }, profileUrl);
+
+    // Now get connects and proposals info
+    await page.goto("https://www.upwork.com/nx/proposals/", { waitUntil: "networkidle2", timeout: 20000 }).catch(() => {});
+    await humanDelay(2000, 3000);
+
+    const proposalData = await page.evaluate(() => {
+      const text = document.body.innerText || "";
+      const activeMatch = text.match(/Active\s*(?:\((\d+)\))?/);
+      const archivedMatch = text.match(/Archived\s*(?:\((\d+)\))?/);
+      const invitationsMatch = text.match(/Invitations?\s*(?:to interview)?\s*\((\d+)\)/i);
+      const connectsMatch = text.match(/Available connects:\s*(\d+)|(\d+)\s*(?:available\s+)?connects/i);
+      return {
+        active: activeMatch ? parseInt(activeMatch[1] || "0") : 0,
+        archived: archivedMatch ? parseInt(archivedMatch[1] || "0") : 0,
+        invitations: invitationsMatch ? parseInt(invitationsMatch[1]) : 0,
+        connects: connectsMatch ? parseInt(connectsMatch[1] || connectsMatch[2] || "0") : undefined,
+      };
+    }).catch(() => ({ active: 0, archived: 0, invitations: 0, connects: undefined }));
+
+    const result: UpworkProfile = {
+      ...profile,
+      connects: proposalData.connects,
+      proposals: {
+        active: proposalData.active,
+        archived: proposalData.archived,
+        invitations: proposalData.invitations,
+      },
+    };
+
+    logger.info(`[Browser/Upwork] Profile scraped: ${result.name} | ${result.title} | ${result.hourlyRate} | ${result.totalJobs} jobs | ${result.skills.length} skills`);
+    return result;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] getProfile error: ${(e as Error).message}`);
+    return null;
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
+}
+
+/**
+ * Get an active Upwork page that's logged in.
+ * Reuses existing tabs, handles CF + login as needed.
+ */
+async function getActiveUpworkPage(): Promise<Page> {
+  const b = await launch();
+  let pages = await b.pages();
+
+  // Try to find an existing Upwork page that's logged in
+  let page = pages.find(p => {
+    const url = p.url();
+    return url.includes("upwork.com") && !url.includes("/login") && !url.includes("about:blank");
+  });
+
+  if (page) {
+    logger.info(`[Browser/Upwork] Reusing existing page: ${page.url().slice(0, 60)}`);
+    return page;
+  }
+
+  // No active Upwork page — try restoring cookies first, then navigate
+  page = pages.length > 0 ? pages[0] : await b.newPage();
+  if (hasSavedCookies()) {
+    await restoreCookies(page);
+  }
+  await page.goto("https://www.upwork.com", { waitUntil: "networkidle2", timeout: 30000 });
+  const cfResult = await solveCloudflareWithRetry(page);
+  page = cfResult.page;
+
+  await ensureLoggedIn(page);
+
+  // After login, re-get page reference
+  page = await getActivePage();
+
+  return page;
+}
+
+/**
+ * Wait for Upwork SPA content to actually render on page.
+ * Polls for visible text content (not just the shell).
+ */
+async function waitForContent(page: Page, maxWaitMs = 15000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const hasContent = await page.evaluate(() => {
+      const text = document.body.innerText || "";
+      // Check for signs of rendered content (not just the shell/header)
+      return text.length > 200 && (
+        text.includes("Posted") ||
+        text.includes("Budget") ||
+        text.includes("Description") ||
+        text.includes("Skills") ||
+        text.includes("proposals") ||
+        text.includes("Apply") ||
+        text.includes("Submit") ||
+        text.includes("Hourly") ||
+        text.includes("Fixed")
+      );
+    }).catch(() => false);
+
+    if (hasContent) {
+      logger.info("[Browser/Upwork] Page content rendered");
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  // Log what we actually see for debugging
+  const bodyLen = await page.evaluate(() => (document.body.innerText || "").length).catch(() => 0);
+  logger.warn(`[Browser/Upwork] Content wait timed out. Body text length: ${bodyLen}`);
+}
+
+/**
+ * Scrape detailed job info from a single job page.
+ */
+export interface JobDetails {
+  id: string;
+  title: string;
+  description: string;
+  url: string;
+  budget?: string;
+  jobType?: string;           // "Fixed-price" or "Hourly"
+  experienceLevel?: string;   // "Entry", "Intermediate", "Expert"
+  estimatedTime?: string;     // "1 to 3 months"
+  hoursPerWeek?: string;      // "30+ hrs/week"
+  projectLength?: string;
+  skills: string[];
+  proposals?: string;         // "10 to 15"
+  connectsRequired?: number;
+  clientInfo: {
+    name?: string;
+    location?: string;
+    rating?: string;
+    totalSpent?: string;
+    hires?: string;
+    activeJobs?: string;
+    paymentVerified?: boolean;
+    memberSince?: string;
+    hireRate?: number;          // Freelancer Plus: client hire rate %
+  };
+  // Freelancer Plus competitive insights
+  plusInsights?: {
+    bidRange?: { low?: number; avg?: number; high?: number };
+    avgBid?: number;
+    interviewing?: number;
+    invitesSent?: number;
+    unansweredInvites?: number;
+    competitorBids?: number[];
+  };
+  posted?: string;
+  attachments?: string[];
+  questions?: string[];       // screening questions
+}
+
+export async function getJobDetails(jobUrl: string): Promise<JobDetails | null> {
+  let page: Page | null = null;
+
+  try {
+    // Get active logged-in page
+    page = await getActiveUpworkPage();
+
+    // Navigate to job
+    logger.info(`[Browser/Upwork] Navigating to job: ${jobUrl.slice(0, 80)}`);
+    await page.goto(jobUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    await humanDelay(2000, 3000);
+
+    // Wait for SPA content to render
+    await waitForContent(page);
+    await page.screenshot({ path: "debug-job-details.png" }).catch(() => {});
+
+    const details = await page.evaluate((url: string) => {
+      const text = document.body.innerText || "";
+
+      // ID from URL
+      const idMatch = url.match(/~0?([a-f0-9]{10,})/);
+      const id = idMatch ? idMatch[1] : "";
+
+      // Title — find the main heading (skip nav/logo h1s)
+      let title = "";
+      const headings = document.querySelectorAll("h1, h2, [data-test='job-title']");
+      for (const h of Array.from(headings)) {
+        const t = h.textContent?.trim() || "";
+        if (t.length > 10 && !t.toLowerCase().includes("upwork")) {
+          title = t;
+          break;
+        }
+      }
+
+      // Description — try multiple selectors, fall back to body text extraction
+      let description = "";
+      const descEl = document.querySelector('[data-test="description"], [class*="description"] p, [class*="job-description"], section p');
+      if (descEl) {
+        description = descEl.textContent?.trim().slice(0, 2000) || "";
+      }
+      if (!description) {
+        // Extract from body text between "Summary" and next section
+        const summaryIdx = text.indexOf("Summary");
+        if (summaryIdx > -1) {
+          const afterSummary = text.slice(summaryIdx + 7, summaryIdx + 2007);
+          const endIdx = afterSummary.search(/\n(Skills and Expertise|Activity on this job|About the client)/);
+          description = afterSummary.slice(0, endIdx > 0 ? endIdx : 1000).trim();
+        }
+      }
+
+      // Budget / rate
+      const budgetMatch = text.match(/Est\. budget:\s*\$[\d,.]+|\$[\d,.]+\s*-\s*\$[\d,.]+\s*\/hr|Fixed[- ]price\s*\$[\d,.]+/i);
+      const budget = budgetMatch ? budgetMatch[0] : "";
+
+      // Job type
+      const jobType = text.includes("Hourly") ? "Hourly" : text.includes("Fixed") ? "Fixed-price" : "";
+
+      // Experience level
+      const expMatch = text.match(/(Entry Level|Intermediate|Expert)/i);
+      const experienceLevel = expMatch ? expMatch[1] : "";
+
+      // Time/duration
+      const timeMatch = text.match(/Est\. time:\s*([^\n]+)/i);
+      const estimatedTime = timeMatch ? timeMatch[1].trim() : "";
+
+      // Hours per week
+      const hoursMatch = text.match(/(\d+\+?\s*hrs\/week|Less than \d+ hrs\/week)/i);
+      const hoursPerWeek = hoursMatch ? hoursMatch[0] : "";
+
+      // Skills
+      const skills: string[] = [];
+      document.querySelectorAll('[data-test="skill"], .air3-token, a[href*="skill"]').forEach(s => {
+        const t = s.textContent?.trim();
+        if (t && t.length < 50 && !skills.includes(t)) skills.push(t);
+      });
+
+      // Proposals
+      const proposalMatch = text.match(/Proposals:\s*([^\n]+)/i) || text.match(/(\d+ to \d+) proposals?/i);
+      const proposals = proposalMatch ? proposalMatch[1].trim() : "";
+
+      // Connects required
+      const connectsMatch = text.match(/(\d+)\s*Connects?\s*(?:required|to submit)/i) || text.match(/Send a proposal for:?\s*(\d+)\s*Connects/i) || text.match(/for:?\s*(\d+)\s*Connects/i);
+      const connectsRequired = connectsMatch ? parseInt(connectsMatch[1]) : undefined;
+
+      // Client info
+      const paymentVerified = text.includes("Payment verified");
+      const ratingMatch = text.match(/Rating is ([\d.]+) out of 5/);
+      const spentMatch = text.match(/\$([\d,.]+[KkMm]?\+?)\s*(?:total )?spent/i);
+      const hiresMatch = text.match(/(\d+)\s*hires?/i);
+      const locationMatch = text.match(/Location\s*\n?\s*([A-Z][a-zA-Z\s,]+)/);
+      const memberMatch = text.match(/Member since\s*\n?\s*(\w+ \d{1,2},?\s*\d{4})/i);
+
+      // Client hire rate (Freelancer Plus) — "X% hire rate" or "Hire rate: X%"
+      const hireRateMatch = text.match(/(\d+)%\s*hire\s*rate/i) || text.match(/hire\s*rate[:\s]*(\d+)%/i);
+      const hireRate = hireRateMatch ? parseInt(hireRateMatch[1]) : undefined;
+
+      // ── Freelancer Plus competitive insights ──
+      // Bid range: "Bid range: $X - $Y" or "Low $X  Avg $Y  High $Z"
+      let bidLow: number | undefined, bidAvg: number | undefined, bidHigh: number | undefined;
+      const bidRangeFullMatch = text.match(/(?:Low|Min)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:Avg|Average|Mid)[:\s]*\$([\d,.]+)[\s\S]{0,40}(?:High|Max)[:\s]*\$([\d,.]+)/i);
+      if (bidRangeFullMatch) {
+        bidLow = parseFloat(bidRangeFullMatch[1].replace(/,/g, ""));
+        bidAvg = parseFloat(bidRangeFullMatch[2].replace(/,/g, ""));
+        bidHigh = parseFloat(bidRangeFullMatch[3].replace(/,/g, ""));
+      } else {
+        const bidRangeSimple = text.match(/Bid range[:\s]*\$([\d,.]+)\s*[-–]\s*\$([\d,.]+)/i);
+        if (bidRangeSimple) {
+          bidLow = parseFloat(bidRangeSimple[1].replace(/,/g, ""));
+          bidHigh = parseFloat(bidRangeSimple[2].replace(/,/g, ""));
+          bidAvg = (bidLow + bidHigh) / 2;
+        }
+      }
+      // Avg bid standalone
+      const avgBidMatch = text.match(/(?:Avg|Average)\s*(?:bid|hourly\s*rate)[:\s]*\$([\d,.]+)/i);
+      const avgBid = avgBidMatch ? parseFloat(avgBidMatch[1].replace(/,/g, "")) : bidAvg;
+
+      // Interviewing count
+      const interviewingMatch = text.match(/Interviewing[:\s]*(\d+)/i);
+      const interviewing = interviewingMatch ? parseInt(interviewingMatch[1]) : undefined;
+
+      // Invites sent
+      const invitesSentMatch = text.match(/Invites?\s*sent[:\s]*(\d+)/i);
+      const invitesSent = invitesSentMatch ? parseInt(invitesSentMatch[1]) : undefined;
+
+      // Unanswered invites
+      const unansweredMatch = text.match(/Unanswered\s*invites?[:\s]*(\d+)/i);
+      const unansweredInvites = unansweredMatch ? parseInt(unansweredMatch[1]) : undefined;
+
+      // Posted time
+      const postedMatch = text.match(/Posted\s+(\w+ ago|\d+ \w+ ago|yesterday|today)/i);
+
+      // Screening questions
+      const questions: string[] = [];
+      const qSection = text.match(/Screening questions[\s\S]*?(?:About the client|Activity on this job|$)/i);
+      if (qSection) {
+        qSection[0].split("\n").forEach(line => {
+          const q = line.trim();
+          if (q.endsWith("?") && q.length > 10) questions.push(q);
+        });
+      }
+
+      // Build Plus insights object (only if we found any data)
+      const hasPlusData = bidLow || avgBid || interviewing || invitesSent || unansweredInvites;
+      const plusInsights = hasPlusData ? {
+        bidRange: (bidLow || bidHigh) ? { low: bidLow, avg: bidAvg, high: bidHigh } : undefined,
+        avgBid,
+        interviewing,
+        invitesSent,
+        unansweredInvites,
+      } : undefined;
+
+      return {
+        id,
+        title,
+        description,
+        url,
+        budget,
+        jobType,
+        experienceLevel,
+        estimatedTime,
+        hoursPerWeek,
+        skills,
+        proposals,
+        connectsRequired,
+        clientInfo: {
+          location: locationMatch ? locationMatch[1].trim() : undefined,
+          rating: ratingMatch ? ratingMatch[1] : undefined,
+          totalSpent: spentMatch ? "$" + spentMatch[1] : undefined,
+          hires: hiresMatch ? hiresMatch[1] : undefined,
+          paymentVerified,
+          memberSince: memberMatch ? memberMatch[1] : undefined,
+          hireRate,
+        },
+        plusInsights,
+        posted: postedMatch ? postedMatch[1] : undefined,
+        questions,
+      };
+    }, jobUrl);
+
+    const plusInfo = details.plusInsights ? ` | Plus: bid $${details.plusInsights.avgBid || "?"}, ${details.plusInsights.interviewing || 0} interviewing` : "";
+    const hireInfo = details.clientInfo.hireRate ? ` | Hire rate: ${details.clientInfo.hireRate}%` : "";
+    logger.info(`[Browser/Upwork] Job details: "${details.title}" | ${details.budget} | ${details.proposals} proposals | ${details.connectsRequired || "?"} connects${hireInfo}${plusInfo}`);
+    return details;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] getJobDetails error: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export async function submitProposal(
+  jobUrl: string,
+  coverLetter: string,
+  options?: {
+    dryRun?: boolean;              // fill form but don't click submit
+    answerQuestions?: Record<string, string>;  // screening question answers
+    attachments?: string[];        // file paths to attach
+    boostConnects?: number;        // extra connects to boost ranking (0 = no boost)
+    paymentMode?: "milestone" | "project"; // "By milestone" or "By project"
+    milestones?: { description: string; amount: number; dueDate?: string }[];
+    duration?: string;             // e.g. "1 to 3 months", "Less than 1 month"
+    specializedProfile?: string;   // profile name to select from combobox
+    hourlyRate?: number;           // for hourly jobs
+    clientBudget?: string;         // raw budget string from job listing e.g. "$15.00 - $35.00/hr" or "$500"
+    jobTitle?: string;             // for AI-powered screening question answers
+    jobDescription?: string;       // for AI-powered screening question answers
+  }
+): Promise<boolean> {
+  let page: Page | null = null;
+  let dedicatedTab = false; // track if we opened a new tab
+
+  try {
+    // Set busy flag so scan loop pauses
+    setBrowserBusy(true);
+
+    const b = await launch();
+    const existingPages = await b.pages();
+    const upworkPage = existingPages.find(p => p.url().includes("upwork.com") && !p.url().includes("about:blank"));
+
+    // For dry-runs, reuse the user's existing logged-in Upwork tab. Spawning a fresh tab via
+    // CDP causes Upwork's SPA to render a near-blank page (likely automation detection on the
+    // brand-new context), so the Apply button never appears. The user's tab is already
+    // authenticated and trusted, so navigating it directly works.
+    //
+    // For real submissions we still want a dedicated tab so we don't yank the user's UI mid-task.
+    if (options?.dryRun && upworkPage) {
+      logger.info(`[Browser/Upwork] Dry-run: reusing existing Upwork tab at ${upworkPage.url().slice(0, 80)}`);
+      page = upworkPage;
+      dedicatedTab = false;
+    } else {
+      // Production / no existing tab: open a DEDICATED new tab. Copy cookies from the existing
+      // tab (if any) so the new tab is authenticated.
+      let cookies: any[] = [];
+      if (upworkPage) {
+        cookies = await upworkPage.cookies().catch(() => []);
+      }
+
+      page = await b.newPage();
+      dedicatedTab = true;
+
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => false });
+        Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      });
+
+      if (cookies.length > 0) {
+        await page.setCookie(...cookies);
+      } else if (hasSavedCookies()) {
+        await restoreCookies(page);
+      }
+    }
+
+    // Force viewport — when Puppeteer attaches via CDP to existing Chrome the page can render
+    // off-screen with no visible width, which hid Upwork's job content + Apply button.
+    await page.setViewport({ width: 1366, height: 768 }).catch(() => {});
+
+    // Set realistic headers (same as engine.newPage)
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+
+    // Auto-dismiss any browser dialogs (alert/confirm/prompt)
+    // Use a named handler so we can clean it up in the finally block
+    const dialogHandler = async (dialog: any) => {
+      logger.info(`[Browser/Upwork] Dialog dismissed: ${dialog.type()} — "${dialog.message().slice(0, 100)}"`);
+      await dialog.dismiss().catch(() => {});
+    };
+    page.on("dialog", dialogHandler);
+
+    // Navigate to job using Chrome's native navigation (less detectable than page.goto)
+    const jobId = jobUrl.match(/~(\w+)/)?.[1] || Date.now().toString();
+    logger.info(`[Browser/Upwork] Navigating to job for proposal: ${jobUrl.slice(0, 80)}`);
+    // Live state for the dashboard's "submitting now" card.
+    setInFlight({ jobId, jobTitle: options?.jobTitle || jobUrl.slice(0, 80), jobUrl });
+    setInFlightStep("navigating");
+    await page.evaluate((url: string) => { window.location.href = url; }, jobUrl);
+    // Tightened from 30s → 15s. The outer submit timeout is 90s; blowing 30s on a single
+    // navigate left almost no budget for Cloudflare + form fill + verify.
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {});
+    await humanDelay(800, 1500);
+
+    // ── Solve Cloudflare if present ──────────────────────
+    setInFlightStep("cloudflare");
+    const cfResult = await solveCloudflareWithRetry(page);
+    if (cfResult.page !== page) {
+      page = cfResult.page;
+      // After CDP reconnect, check if we're already on the job page
+      const currentUrl = await page.url();
+      if (!currentUrl.includes(jobId)) {
+        logger.info("[Browser/Upwork] Page changed after Cloudflare — navigating via JS");
+        await page.evaluate((url: string) => { window.location.href = url; }, jobUrl);
+        await new Promise(r => setTimeout(r, 8000)); // wait for SPA to load
+      }
+    }
+    if (!cfResult.passed) {
+      logger.error("[Browser/Upwork] Cloudflare challenge failed — cannot access job page");
+      setSubmitFailure("cloudflare", "Cloudflare challenge could not be solved within the retry budget");
+      return false;
+    }
+
+    // Wait for SPA content to render
+    await waitForContent(page);
+    await page.screenshot({ path: `debug-proposal-job-${jobId}.png` }).catch(() => {});
+
+    // ── Pre-check: is the job still open? ──────────────
+    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 2000)).catch((e) => {
+      logger.warn(`[Browser/Upwork] page.evaluate failed (pre-check): ${(e as Error).message}`);
+      return null;
+    });
+    if (pageText === null) {
+      logger.error("[Browser/Upwork] Cannot read page content — CDP session may be invalid");
+      return false;
+    }
+    if (
+      pageText.includes("client is suspended") ||
+      pageText.includes("no longer available") ||
+      pageText.includes("has been closed") ||
+      pageText.includes("Job not found") ||
+      /\/freelance-jobs\/apply\//.test(await page.url())   // Upwork redirects expired jobs to this path
+    ) {
+      const url = (await page.url()).slice(0, 120);
+      logger.error(`[Browser/Upwork] Job is not available (suspended/closed/removed/notfound) — URL: ${url}`);
+      setSubmitFailure("job_not_found", `Job page redirected or shows not-found state: ${url}`);
+      await page.screenshot({ path: `debug-proposal-unavailable-${Date.now()}.png` }).catch(() => {});
+      return false;
+    }
+
+    // ── Click "Apply Now" ──────────────────────────────
+    setInFlightStep("applying");
+    // Selectors observed live (2026-04, scripts/diag-find-apply.ts): Upwork uses
+    //   id="submit-proposal-button" / data-cy="submit-proposal-button" / aria-label="Apply now"
+    // Older [data-test="apply-button"] kept as fallback for legacy job pages.
+    const applySelectors = [
+      '#submit-proposal-button',
+      'button[data-cy="submit-proposal-button"]',
+      'button[aria-label="Apply now"]',
+      'button[data-test="apply-button"]',
+      'a[href*="proposals/job"]',
+    ];
+    let applied = false;
+    for (const sel of applySelectors) {
+      const btn = await page.$(sel);
+      if (btn) {
+        // Check if button is disabled
+        const isDisabled = await page.evaluate((el: Element) => {
+          return (el as HTMLButtonElement).disabled || el.getAttribute("aria-disabled") === "true"
+            || el.classList.contains("disabled") || getComputedStyle(el).pointerEvents === "none";
+        }, btn);
+        if (isDisabled) {
+          logger.error(`[Browser/Upwork] Apply button found but is disabled: ${sel}`);
+          setSubmitFailure("apply_disabled", `Apply button disabled — already applied, job paused, or client suspended`);
+          return false;
+        }
+        await btn.click();
+        applied = true;
+        logger.info(`[Browser/Upwork] Clicked apply: ${sel}`);
+        break;
+      }
+    }
+    if (!applied) {
+      applied = await page.evaluate(() => {
+        const buttons = document.querySelectorAll("button, a");
+        for (const b of Array.from(buttons)) {
+          const t = (b.textContent?.trim() || "").toLowerCase();
+          if (t.includes("apply now") || t.includes("submit a proposal") || t.includes("submit proposal")) {
+            (b as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (applied) logger.info("[Browser/Upwork] Clicked apply via text search");
+    }
+
+    if (!applied) {
+      // Check if the Apply button exists but is disabled (client suspended, job closed, etc.)
+      const reason = await page.evaluate(() => {
+        const btns = document.querySelectorAll("button, a");
+        for (const b of Array.from(btns)) {
+          const t = (b.textContent?.trim() || "").toLowerCase();
+          if (t.includes("apply now") || t.includes("submit a proposal")) {
+            if ((b as HTMLButtonElement).disabled || b.getAttribute("aria-disabled") === "true") {
+              return "Apply button is disabled (job may be closed or client suspended)";
+            }
+          }
+        }
+        // Check for common error banners
+        const bodyText = document.body.innerText;
+        if (bodyText.includes("client is suspended")) return "Client is suspended";
+        if (bodyText.includes("no longer available")) return "Job no longer available";
+        if (bodyText.includes("has been closed")) return "Job has been closed";
+        return "Apply button not found on page";
+      });
+      logger.error(`[Browser/Upwork] Cannot apply: ${reason}`);
+      // Map the discovered reason to a typed failure category so the dashboard / reinforcement
+      // loop can distinguish "this job was closed" from "Upwork's UI changed and we can't find the button".
+      const lower = reason.toLowerCase();
+      if (lower.includes("client is suspended") || lower.includes("no longer available") || lower.includes("has been closed")) {
+        setSubmitFailure("job_not_found", reason);
+      } else if (lower.includes("disabled")) {
+        setSubmitFailure("apply_disabled", reason);
+      } else {
+        setSubmitFailure("puppeteer_error", reason);
+      }
+      await page.screenshot({ path: `debug-proposal-no-apply-${Date.now()}.png` }).catch(() => {});
+      return false;
+    }
+
+    // Wait for navigation to proposal form
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 12000 }).catch(() => {}),
+      humanDelay(3000, 5000),
+    ]);
+
+    // Re-get page if navigated to new tab
+    const bNav = await launch();
+    const navPages = await bNav.pages();
+    const proposalPage = navPages.find(p => p.url().includes("proposals")) || page;
+    if (proposalPage !== page) {
+      page = proposalPage;
+      logger.info(`[Browser/Upwork] Switched to proposal page: ${page.url().slice(0, 80)}`);
+    }
+
+    // Solve Cloudflare on proposal form page if needed.
+    // Tighter budget here (30s) — the initial nav already took up to 60s of CF budget and
+    // hitting CF a second time on the form is rare. Total CF budget across both checks ≤ 90s.
+    const cfForm = await solveCloudflareWithRetry(page, 2, 30_000);
+    if (cfForm.page !== page) page = cfForm.page;
+    if (!cfForm.passed) {
+      logger.error("[Browser/Upwork] Cloudflare on proposal form could not be solved within budget");
+      setSubmitFailure("cloudflare", "Cloudflare challenge on proposal form");
+      return false;
+    }
+
+    await waitForContent(page);
+
+    // Verify we're actually on the proposal form
+    const onProposalForm = await page.evaluate(() => {
+      const url = window.location.href;
+      const hasTextarea = document.querySelectorAll("textarea").length > 0;
+      const bodyText = document.body.innerText.toLowerCase();
+      const hasFormIndicators = bodyText.includes("cover letter") || bodyText.includes("proposal") || bodyText.includes("connects");
+      return (url.includes("proposals/job") || url.includes("apply")) && (hasTextarea || hasFormIndicators);
+    });
+
+    if (!onProposalForm) {
+      const currentUrl = page.url();
+      logger.error(`[Browser/Upwork] Not on proposal form after clicking Apply — URL: ${currentUrl.slice(0, 100)}`);
+      await page.screenshot({ path: `debug-proposal-noform-${Date.now()}.png` }).catch(() => {});
+      return false;
+    }
+
+    await page.screenshot({ path: `debug-proposal-form-${jobId}.png` }).catch(() => {});
+
+    // Log form inventory + capture "X proposals already submitted" — Upwork displays this on
+    // the apply form so freelancers know how saturated the job is. We persist it as
+    // proposals_when_submitted so the dashboard can show "we got there at proposal #N" and
+    // correlate first-to-apply position with response/win rate.
+    const formInfo = await page.evaluate(() => {
+      const text = document.body.innerText || "";
+      // Match patterns like:
+      //   "12 proposals" / "Less than 5" / "5 to 10" / "20+"
+      //   appearing near a heading like "Activity on this job" or "Proposals"
+      let proposalsAtSubmit: number | null = null;
+      // Look near "Activity on this job" / "Proposals:" / "proposals" tokens
+      const blocks = Array.from(document.querySelectorAll("section, aside, div"))
+        .map(el => (el as HTMLElement).innerText || "")
+        .filter(t => t.length < 600 && /proposals?/i.test(t));
+      for (const b of blocks) {
+        const range = b.match(/(\d+)\s*to\s*(\d+)\s*proposals?/i);
+        const plus  = b.match(/(\d+)\s*\+\s*proposals?/i);
+        const lt    = b.match(/less than\s*(\d+)/i);
+        const exact = b.match(/^\s*(\d+)\s*proposals?\b/im);
+        if (range) { proposalsAtSubmit = parseInt(range[1], 10); break; }
+        if (plus)  { proposalsAtSubmit = parseInt(plus[1], 10);  break; }
+        if (lt)    { proposalsAtSubmit = Math.max(0, parseInt(lt[1], 10) - 1); break; }
+        if (exact) { proposalsAtSubmit = parseInt(exact[1], 10); break; }
+      }
+      // Fallback: scan whole page text
+      if (proposalsAtSubmit === null) {
+        const m = text.match(/(\d+)\s*proposals?\b/i);
+        if (m) proposalsAtSubmit = parseInt(m[1], 10);
+      }
+      return {
+        textareas: document.querySelectorAll("textarea").length,
+        textInputs: document.querySelectorAll('input[type="text"], input:not([type])').length,
+        numberInputs: document.querySelectorAll('input[type="number"]').length,
+        radios: document.querySelectorAll('input[type="radio"]').length,
+        comboboxes: document.querySelectorAll('[role="combobox"]').length,
+        url: window.location.href,
+        proposalsAtSubmit,
+      };
+    });
+    logger.info(`[Browser/Upwork] Form: ${formInfo.textareas} textareas, ${formInfo.textInputs} text, ${formInfo.numberInputs} number, ${formInfo.radios} radios, ${formInfo.comboboxes} comboboxes | ${formInfo.url.slice(0, 80)}`);
+    if (formInfo.proposalsAtSubmit !== null) {
+      _lastProposalsAtSubmit = formInfo.proposalsAtSubmit;
+      logger.info(`[Browser/Upwork] Proposals already submitted on this job: ${formInfo.proposalsAtSubmit}`);
+    }
+    setInFlightStep("form_open");
+
+    // ── 0. Auto-fill required fields if not explicitly provided ──
+    // Detect job type (fixed vs hourly) and fill bid/rate + duration
+    const jobType = await page.evaluate(() => {
+      const text = document.body.innerText.toLowerCase();
+      if (text.includes("hourly rate") || text.includes("your rate")) return "hourly";
+      if (text.includes("bid") || text.includes("total amount") || text.includes("what is the full amount")) return "fixed";
+      return "unknown";
+    });
+    logger.info(`[Browser/Upwork] Detected job type: ${jobType}`);
+
+    // Auto-fill bid amount and milestone description for any fixed-price job
+    // (runs even when milestones option is passed, as the explicit milestone fill may fail)
+    if (!options?.hourlyRate) {
+      // Try to get budget from page
+      const budgetInfo = await page.evaluate(() => {
+        const text = document.body.innerText;
+        const match = text.match(/\$[\d,]+(?:\.\d{2})?/g);
+        return match || [];
+      });
+      const budgetAmount = budgetInfo.find(b => {
+        const n = parseFloat(b.replace(/[$,]/g, ""));
+        return n >= 100 && n <= 50000;
+      });
+
+      if (jobType === "fixed" || jobType === "unknown") {
+        // Find the bid/amount input — look for inputs with $ placeholder or in amount context
+        const bidFilled = await page.evaluate((budget: string | undefined) => {
+          const inputs = document.querySelectorAll('input');
+          for (const inp of Array.from(inputs)) {
+            const el = inp as HTMLInputElement;
+            if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") continue;
+            const label = (el.getAttribute("aria-label") || "").toLowerCase();
+            const placeholder = (el.placeholder || "").toLowerCase();
+            const parentText = (el.closest("div, section")?.textContent || "").toLowerCase();
+            // Match: $0.00 placeholder, "bid", "amount", "total", "price"
+            const isAmountField = placeholder.includes("$") || placeholder.includes("0.00")
+                || label.includes("bid") || label.includes("amount") || label.includes("price")
+                || parentText.includes("what is the full amount") || parentText.includes("your bid")
+                || parentText.includes("total price");
+            if (isAmountField && (el.value === "" || el.value === "$0.00" || el.value === "0" || el.value === "0.00")) {
+              let val = budget ? budget.replace(/[$,]/g, "") : "500";
+              // Bid slightly under client budget to look competitive
+              const numVal = parseFloat(val);
+              if (numVal >= 1000) val = String(Math.round(numVal - 75));
+              else if (numVal >= 300) val = String(Math.round(numVal * 0.95));
+              // Use native input setter to trigger React state update
+              const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+              if (nativeInputValueSetter) nativeInputValueSetter.call(el, val);
+              else el.value = val;
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+              el.dispatchEvent(new Event("blur", { bubbles: true }));
+              return val;
+            }
+          }
+          return null;
+        }, budgetAmount);
+        if (bidFilled) logger.info(`[Browser/Upwork] Auto-filled bid amount: $${bidFilled}`);
+        else {
+          // Fallback: use keyboard to type into the $ input
+          const amtInput = await page.$('input[placeholder*="$"], input[placeholder*="0.00"]');
+          if (amtInput) {
+            await amtInput.click({ clickCount: 3 }); // select all
+            let val = budgetAmount ? budgetAmount.replace(/[$,]/g, "") : "500";
+            const numVal = parseFloat(val);
+            if (numVal >= 1000) val = String(Math.round(numVal - 75));
+            else if (numVal >= 300) val = String(Math.round(numVal * 0.95));
+            await page.keyboard.type(val, { delay: 30 });
+            logger.info(`[Browser/Upwork] Auto-typed bid amount: $${val} (keyboard fallback)`);
+          }
+        }
+        await humanDelay(300, 500);
+
+        // Auto-fill milestone description if required (Upwork needs it even in "By project" mode)
+        const descFilled = await page.evaluate(() => {
+          const inputs = document.querySelectorAll('input');
+          for (const inp of Array.from(inputs)) {
+            const el = inp as HTMLInputElement;
+            const label = (el.getAttribute("aria-label") || "").toLowerCase();
+            const placeholder = (el.placeholder || "").toLowerCase();
+            if ((label.includes("description") || placeholder.includes("description")) && !el.value) {
+              const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+              if (nativeInputValueSetter) nativeInputValueSetter.call(el, "Full project delivery");
+              else el.value = "Full project delivery";
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+              el.dispatchEvent(new Event("blur", { bubbles: true }));
+              return true;
+            }
+          }
+          return false;
+        });
+        if (descFilled) logger.info("[Browser/Upwork] Auto-filled milestone description: 'Full project delivery'");
+        await humanDelay(200, 400);
+      } else if (jobType === "hourly") {
+        // Compute smart hourly rate based on client budget
+        let targetRate = options?.hourlyRate ? String(options.hourlyRate) : "";
+        if (!targetRate) {
+          // Parse client budget from page or options
+          const budgetStr = options?.clientBudget || "";
+          const pagebudget = await page.evaluate(() => {
+            const text = document.body.innerText;
+            // Look for "Client's budget: $X - $Y" pattern on the form
+            const m = text.match(/Client.s budget:\s*\$([\d,.]+)\s*-\s*\$([\d,.]+)/i);
+            if (m) return { min: m[1], max: m[2] };
+            // Fallback: hourly range pattern
+            const h = text.match(/\$([\d,.]+)\s*-\s*\$([\d,.]+)\s*\/?\s*hr/i);
+            if (h) return { min: h[1], max: h[2] };
+            return null;
+          });
+
+          let budgetMax = 0;
+          let budgetMin = 0;
+          if (pagebudget) {
+            budgetMin = parseFloat(pagebudget.min.replace(/,/g, ""));
+            budgetMax = parseFloat(pagebudget.max.replace(/,/g, ""));
+          } else if (budgetStr) {
+            const matches = budgetStr.match(/\$([\d,.]+)/g) || [];
+            const nums = matches.map(m => parseFloat(m.replace(/[$,]/g, "")));
+            if (nums.length >= 2) { budgetMin = nums[0]; budgetMax = nums[1]; }
+            else if (nums.length === 1) { budgetMax = nums[0]; budgetMin = nums[0]; }
+          }
+
+          if (budgetMax > 0) {
+            // Bid at the top of client's range (credible but competitive)
+            targetRate = String(Math.round(budgetMax));
+            logger.info(`[Browser/Upwork] Client budget: $${budgetMin}-$${budgetMax}/hr → bidding $${targetRate}/hr`);
+          } else {
+            targetRate = "50"; // fallback if no budget info
+            logger.info(`[Browser/Upwork] No client budget found — using default $${targetRate}/hr`);
+          }
+        }
+
+        // Fill hourly rate using Puppeteer keyboard input (Vue doesn't respond to nativeSetter)
+        await humanDelay(500, 1000);
+        await page.screenshot({ path: `debug-pre-rate-${jobId}.png` }).catch(() => {});
+        logger.info("[Browser/Upwork] About to tag rate input...");
+        const rateSelector = await page.evaluate(() => {
+          const inputs = document.querySelectorAll('input[type="text"]');
+          for (let i = 0; i < inputs.length; i++) {
+            const el = inputs[i] as HTMLInputElement;
+            const currencyDiv = el.closest('.air3-currency');
+            if (!currencyDiv) continue;
+            const suffix = currencyDiv.textContent || "";
+            if (!suffix.includes("/hr")) continue;
+            // Tag it with a data attribute so we can target it with Puppeteer
+            el.setAttribute("data-rate-input", "true");
+            return true;
+          }
+          return false;
+        });
+        if (rateSelector) {
+          const rateInput = await page.$('input[data-rate-input="true"]');
+          if (rateInput) {
+            await rateInput.click({ clickCount: 3 }); // triple-click to select all
+            await humanDelay(100, 200);
+            await page.keyboard.type(targetRate, { delay: 50 });
+            await humanDelay(100, 200);
+            await page.keyboard.press("Tab"); // trigger blur/validation
+            logger.info(`[Browser/Upwork] Set hourly rate: $${targetRate}/hr (keyboard input)`);
+          } else {
+            logger.warn("[Browser/Upwork] Rate input tagged but not found by selector");
+          }
+        } else {
+          logger.warn("[Browser/Upwork] Could not find hourly rate input to fill");
+        }
+
+        // Fill rate-increase comboboxes if present (frequency + percent)
+        // Use air3-dropdown-toggle class which is specific to Upwork form comboboxes
+        const rateIncreaseTargets = [
+          { placeholder: "Select a frequency", label: "frequency" },
+          { placeholder: "Select a percent", label: "percent" },
+        ];
+
+        for (const target of rateIncreaseTargets) {
+          // Open dropdown and select first option via full mouse event dispatch
+          // (Angular air3-dropdown requires mousedown+mouseup+click sequence)
+          const selected = await page.evaluate((placeholder: string) => {
+            // Find the combobox with matching placeholder
+            const combos = document.querySelectorAll('[role="combobox"].air3-dropdown-toggle');
+            let targetCombo: HTMLElement | null = null;
+            for (const c of Array.from(combos)) {
+              const titleEl = c.querySelector('.air3-dropdown-toggle-title');
+              const text = (titleEl || c).textContent?.trim() || "";
+              if (text === placeholder) {
+                targetCombo = c as HTMLElement;
+                break;
+              }
+            }
+            if (!targetCombo) return null;
+
+            // Open the dropdown
+            targetCombo.scrollIntoView({ block: "center" });
+            targetCombo.click();
+            return "opened";
+          }, target.placeholder);
+
+          if (!selected) {
+            logger.info(`[Browser/Upwork] Rate-increase ${target.label} combobox not found — skipping`);
+            continue;
+          }
+          await humanDelay(600, 900);
+
+          // Select the first option by dispatching full mouse event sequence
+          const optionText = await page.evaluate(() => {
+            const openDropdown = document.querySelector('.air3-dropdown.open');
+            if (!openDropdown) return null;
+            const options = openDropdown.querySelectorAll('[role="option"]');
+            if (!options.length) return null;
+            const firstOption = options[0] as HTMLElement;
+            const text = firstOption.textContent?.trim() || "";
+            // Dispatch full mouse event sequence (required for Angular)
+            firstOption.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+            firstOption.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+            firstOption.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+            return text;
+          });
+
+          if (optionText) {
+            logger.info(`[Browser/Upwork] Auto-selected rate-increase ${target.label}: "${optionText}"`);
+          } else {
+            logger.warn(`[Browser/Upwork] Could not select rate-increase ${target.label} option`);
+            // Close dropdown
+            await page.evaluate(() => document.body.click());
+          }
+          await humanDelay(300, 500);
+        }
+      }
+      await humanDelay(300, 500);
+    }
+
+    // Auto-select duration if not already set
+    if (!options?.duration) {
+      const durationSet = await page.evaluate(() => {
+        const combos = document.querySelectorAll('[role="combobox"]');
+        for (const c of Array.from(combos)) {
+          const parent = c.closest("div, section");
+          const txt = (parent?.textContent || "").toLowerCase();
+          if (txt.includes("how long") || txt.includes("duration") || txt.includes("project take")) {
+            const currentVal = (c as HTMLElement).textContent?.trim().toLowerCase() || "";
+            if (currentVal.includes("select") || currentVal === "") {
+              (c as HTMLElement).click();
+              return "clicked";
+            }
+            return "already_set";
+          }
+        }
+        return "not_found";
+      });
+
+      if (durationSet === "clicked") {
+        await humanDelay(500, 800);
+        const selected = await page.evaluate(() => {
+          const items = document.querySelectorAll('[role="option"], li[id]');
+          for (const item of Array.from(items)) {
+            const t = item.textContent?.toLowerCase() || "";
+            // Prefer "1 to 3 months" as default
+            if (t.includes("1 to 3") || t.includes("1-3")) {
+              (item as HTMLElement).click();
+              return item.textContent?.trim() || "";
+            }
+          }
+          // Fallback: select first option
+          if (items.length > 0) {
+            (items[0] as HTMLElement).click();
+            return items[0].textContent?.trim() || "first option";
+          }
+          return "";
+        });
+        if (selected) logger.info(`[Browser/Upwork] Auto-selected duration: "${selected}"`);
+        await humanDelay(300, 500);
+      }
+    }
+
+    // Auto-answer screening questions if any exist and not provided
+    if (!options?.answerQuestions) {
+      // Find all textareas that aren't the cover letter (screening questions use extra textareas)
+      const emptyTextareas = await page.evaluate(() => {
+        const coverLetterSels = ['textarea[data-test="cover-letter"]', 'textarea[aria-label*="cover" i]', 'textarea[placeholder*="cover" i]'];
+        const allTextareas = Array.from(document.querySelectorAll("textarea"));
+        const empty: { index: number; label: string }[] = [];
+        allTextareas.forEach((ta, i) => {
+          // Skip cover letter textarea
+          for (const sel of coverLetterSels) {
+            if (ta.matches(sel)) return;
+          }
+          // If it's an empty textarea (not cover letter), it's likely a screening question
+          if (!ta.value || ta.value.trim() === "") {
+            const parent = ta.closest("div, fieldset, section");
+            const label = parent?.textContent?.trim().slice(0, 200) || `textarea-${i}`;
+            empty.push({ index: i, label });
+          }
+        });
+        return empty;
+      });
+
+      // Also detect question blocks (fieldset, data-test, etc.)
+      const questionBlocks = await page.evaluate(() => {
+        const qs: { text: string; type: string }[] = [];
+        const blocks = document.querySelectorAll('[data-test*="question"], fieldset, [class*="question"], [class*="screening"]');
+        for (const b of Array.from(blocks)) {
+          const text = b.textContent?.trim().slice(0, 300) || "";
+          const hasTextarea = b.querySelector("textarea") !== null;
+          const hasInput = b.querySelector("input[type='text']") !== null;
+          if (text && (hasTextarea || hasInput)) {
+            qs.push({ text, type: hasTextarea ? "textarea" : "input" });
+          }
+        }
+        return qs;
+      });
+
+      const totalQuestions = Math.max(emptyTextareas.length, questionBlocks.length);
+      if (totalQuestions > 0) {
+        logger.info(`[Browser/Upwork] Found ${totalQuestions} screening question(s) — auto-answering`);
+
+        // Answer via question blocks — use AI for specific answers when possible
+        for (let i = 0; i < questionBlocks.length; i++) {
+          const q = questionBlocks[i];
+          let answer = "Yes, I have relevant experience with similar projects. Happy to discuss specifics on a call.";
+          if (options?.jobTitle && options?.jobDescription) {
+            try {
+              answer = await answerScreeningQuestion(q.text, { title: options.jobTitle, description: options.jobDescription });
+              logger.info(`[Browser/Upwork] AI-generated answer for Q${i + 1}: ${answer.slice(0, 80)}...`);
+            } catch (e) {
+              logger.warn(`[Browser/Upwork] AI screening answer failed, using fallback: ${(e as Error).message}`);
+            }
+          }
+          const inputSel = q.type === "textarea" ? "textarea" : "input[type='text']";
+          const blocks = await page.$$('[data-test*="question"], fieldset, [class*="question"], [class*="screening"]');
+          if (blocks[i]) {
+            const input = await blocks[i].$(inputSel);
+            if (input) {
+              await input.click({ clickCount: 3 });
+              await fastType(page, answer);
+              logger.info(`[Browser/Upwork] Answered Q${i + 1}: "${q.text.slice(0, 60)}..."`);
+            }
+          }
+        }
+
+        // Fallback: fill any remaining empty textareas (not cover letter)
+        if (emptyTextareas.length > questionBlocks.length) {
+          const allTextareas = await page.$$("textarea");
+          for (const et of emptyTextareas) {
+            const ta = allTextareas[et.index];
+            if (!ta) continue;
+            const val = await ta.evaluate((el: HTMLTextAreaElement) => el.value);
+            if (val && val.trim()) continue; // already filled
+            let answer = "Yes, I have relevant experience with similar projects. Happy to discuss specifics on a call.";
+            if (options?.jobTitle && options?.jobDescription) {
+              try {
+                answer = await answerScreeningQuestion(et.label, { title: options.jobTitle, description: options.jobDescription });
+              } catch {}
+            }
+            await ta.click({ clickCount: 3 });
+            await fastType(page, answer);
+            logger.info(`[Browser/Upwork] Answered extra Q: "${et.label.slice(0, 60)}..."`);
+          }
+        }
+        await humanDelay(300, 500);
+      }
+    }
+
+    // ── 1. Specialized profile (custom combobox) ───────
+    if (options?.specializedProfile) {
+      logger.info(`[Browser/Upwork] Setting specialized profile: ${options.specializedProfile}`);
+      const clicked = await page.evaluate(() => {
+        const combos = document.querySelectorAll('[role="combobox"]');
+        for (const c of Array.from(combos)) {
+          const parent = c.closest("div, section");
+          const txt = parent?.textContent?.toLowerCase() || "";
+          if (txt.includes("specialized profile") || txt.includes("propose with")) {
+            (c as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (clicked) {
+        await humanDelay(500, 800);
+        await page.evaluate((name: string) => {
+          const items = document.querySelectorAll('[role="option"], li');
+          for (const item of Array.from(items)) {
+            if (item.textContent?.toLowerCase().includes(name.toLowerCase())) {
+              (item as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        }, options.specializedProfile);
+        logger.info(`[Browser/Upwork] Selected profile: ${options.specializedProfile}`);
+      }
+      await humanDelay(300, 500);
+    }
+
+    // ── 2. Payment mode (By milestone / By project) ────
+    if (options?.paymentMode) {
+      const radioValue = options.paymentMode === "milestone" ? "milestone" : "default";
+      await page.evaluate((val: string) => {
+        const radios = document.querySelectorAll('input[name="milestoneMode"]');
+        for (const r of Array.from(radios)) {
+          if ((r as HTMLInputElement).value === val) {
+            (r as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      }, radioValue);
+      logger.info(`[Browser/Upwork] Set payment mode: ${options.paymentMode}`);
+      await humanDelay(500, 800);
+    }
+
+    // ── 3. Milestones (fixed-price: description, due date, amount) ──
+    if (options?.milestones?.length) {
+      // First ensure we're in milestone mode
+      await page.evaluate(() => {
+        const radio = document.querySelector('input[name="milestoneMode"][value="milestone"]') as HTMLInputElement;
+        if (radio && !radio.checked) radio.click();
+      });
+      await humanDelay(300, 500);
+
+      for (let i = 0; i < options.milestones.length; i++) {
+        const ms = options.milestones[i];
+
+        // Need to add extra milestones beyond the first
+        if (i > 0) {
+          const addClicked = await page.evaluate(() => {
+            const btns = document.querySelectorAll("button");
+            for (const b of Array.from(btns)) {
+              if (b.textContent?.toLowerCase().includes("add milestone")) {
+                b.click();
+                return true;
+              }
+            }
+            return false;
+          });
+          if (addClicked) {
+            await humanDelay(500, 800);
+            logger.info(`[Browser/Upwork] Added milestone row ${i + 1}`);
+          }
+        }
+
+        // Find all milestone description inputs (text inputs in milestone rows)
+        // Milestone rows: each has Description (text), Due date (button), Amount (text with $)
+        const descFilled = await page.evaluate((idx: number, desc: string) => {
+          // Get all visible text inputs that are in the milestone section
+          const milestoneSection = document.body.innerText.toLowerCase().includes("how many milestones");
+          if (!milestoneSection) return false;
+
+          // Description inputs: text inputs without $ placeholder
+          const allInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+          const descInputs = allInputs.filter(inp => {
+            const input = inp as HTMLInputElement;
+            if (input.type === "hidden") return false;
+            const ph = input.placeholder || "";
+            // Description inputs don't have $ or amount
+            return !ph.includes("$") && !ph.includes("amount");
+          });
+
+          if (descInputs[idx]) {
+            const el = descInputs[idx] as HTMLInputElement;
+            el.setAttribute("data-ms-desc", String(idx));
+            return true;
+          }
+          return false;
+        }, i, ms.description);
+
+        if (descFilled) {
+          const descEl = await page.$(`input[data-ms-desc="${i}"]`);
+          if (descEl) {
+            await descEl.click({ clickCount: 3 });
+            await humanDelay(50, 100);
+            await page.keyboard.type(ms.description, { delay: 15 });
+          }
+        } else {
+          const descInputs = await page.$$('input[type="text"]:not([placeholder*="$"])');
+          if (descInputs[i]) {
+            await descInputs[i].click({ clickCount: 3 });
+            await humanDelay(50, 100);
+            await page.keyboard.type(ms.description, { delay: 15 });
+          }
+        }
+
+        // Amount input: inputs with $ placeholder
+        const amtTagged = await page.evaluate((idx: number) => {
+          const amtInputs = Array.from(document.querySelectorAll('input')).filter(inp => {
+            return inp.placeholder?.includes("$") || inp.id?.includes("milestone-amount");
+          });
+          if (amtInputs[idx]) {
+            amtInputs[idx].setAttribute("data-ms-amt", String(idx));
+            return true;
+          }
+          return false;
+        }, i);
+
+        if (amtTagged) {
+          const amtEl = await page.$(`input[data-ms-amt="${i}"]`);
+          if (amtEl) {
+            await amtEl.click({ clickCount: 3 });
+            await humanDelay(50, 100);
+            await page.keyboard.type(String(ms.amount), { delay: 30 });
+          }
+        } else {
+          const amtInput = await page.$(`#milestone-amount-${i + 1}`);
+          if (amtInput) {
+            await amtInput.click({ clickCount: 3 });
+            await humanDelay(50, 100);
+            await page.keyboard.type(String(ms.amount), { delay: 30 });
+          }
+        }
+
+        // Due date (optional): click the date picker button, type date
+        if (ms.dueDate) {
+          const dateBtns = await page.$$('button[data-test="button"]');
+          if (dateBtns[i]) {
+            await dateBtns[i].click();
+            await humanDelay(300, 500);
+            // Type date into whatever input appears
+            await page.keyboard.type(ms.dueDate, { delay: 30 });
+            await page.keyboard.press("Enter");
+            await humanDelay(300, 500);
+          }
+        }
+
+        logger.info(`[Browser/Upwork] Milestone ${i + 1}: "${ms.description}" $${ms.amount}${ms.dueDate ? ` due ${ms.dueDate}` : ""}`);
+        await humanDelay(300, 500);
+      }
+
+      // Verify total
+      const total = await page.evaluate(() => {
+        const text = document.body.innerText;
+        const match = text.match(/Total price of project\s*\$?([\d,.]+)/i);
+        return match ? match[1] : "";
+      });
+      if (total) logger.info(`[Browser/Upwork] Total project price: $${total}`);
+    }
+
+    // ── 4. Hourly rate (for hourly jobs) ───────────────
+    if (options?.hourlyRate) {
+      const rateInput = await page.$('input[aria-label*="rate" i]') || await page.$('input[data-test*="rate"]');
+      if (rateInput) {
+        await rateInput.focus();
+        await page.keyboard.down("Control");
+        await page.keyboard.press("a");
+        await page.keyboard.up("Control");
+        await page.keyboard.type(String(options.hourlyRate), { delay: 40 });
+        logger.info(`[Browser/Upwork] Set hourly rate: $${options.hourlyRate}/hr`);
+      }
+      await humanDelay(300, 500);
+    }
+
+    // ── 5. Duration dropdown (custom combobox) ─────────
+    if (options?.duration) {
+      logger.info(`[Browser/Upwork] Setting duration: ${options.duration}`);
+      // Upwork uses a custom combobox for duration, not a native <select>
+      const opened = await page.evaluate(() => {
+        const combos = document.querySelectorAll('[role="combobox"]');
+        for (const c of Array.from(combos)) {
+          const parent = c.closest("div, section");
+          const txt = parent?.textContent?.toLowerCase() || "";
+          if (txt.includes("how long") || txt.includes("duration") || txt.includes("project take")) {
+            (c as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (opened) {
+        await humanDelay(500, 800);
+        const selected = await page.evaluate((dur: string) => {
+          const items = document.querySelectorAll('[role="option"], li[id]');
+          for (const item of Array.from(items)) {
+            if (item.textContent?.toLowerCase().includes(dur.toLowerCase())) {
+              (item as HTMLElement).click();
+              return item.textContent?.trim() || "";
+            }
+          }
+          return "";
+        }, options.duration);
+        if (selected) {
+          logger.info(`[Browser/Upwork] Duration set: "${selected}"`);
+        } else {
+          // Log available options for debugging
+          const opts = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('[role="option"], li[id]'))
+              .map(el => el.textContent?.trim())
+              .filter(Boolean);
+          });
+          logger.warn(`[Browser/Upwork] Duration "${options.duration}" not found. Available: ${opts.join(", ")}`);
+        }
+      } else {
+        logger.warn("[Browser/Upwork] Duration combobox not found");
+      }
+      await humanDelay(300, 500);
+    }
+
+    // ── 6. Cover letter ────────────────────────────────
+    const coverSelectors = [
+      'textarea[data-test="cover-letter"]',
+      'textarea[aria-label*="cover" i]',
+      'textarea[placeholder*="cover" i]',
+      "textarea",
+    ];
+    for (const sel of coverSelectors) {
+      const textarea = await page.$(sel);
+      if (textarea) {
+        await textarea.click({ clickCount: 3 }); // select all
+        await humanDelay(200, 400);
+        // Use CDP insertText for instant paste (keyboard.type is too slow on heavy pages)
+        await fastType(page, coverLetter);
+        logger.info(`[Browser/Upwork] Cover letter: ${coverLetter.length} chars via ${sel}`);
+        break;
+      }
+    }
+    await humanDelay(500, 800);
+
+    // ── 7. Screening questions ─────────────────────────
+    if (options?.answerQuestions && Object.keys(options.answerQuestions).length > 0) {
+      const questionBlocks = await page.$$('[data-test*="question"], [class*="question"], fieldset');
+      for (const block of questionBlocks) {
+        const qText = await block.evaluate(el => el.textContent?.trim().slice(0, 300) || "");
+        for (const [question, answer] of Object.entries(options.answerQuestions)) {
+          if (qText.toLowerCase().includes(question.toLowerCase())) {
+            const input = await block.$("textarea, input[type='text']");
+            if (input) {
+              await input.click({ clickCount: 3 });
+              await fastType(page, answer);
+              logger.info(`[Browser/Upwork] Answered: "${question.slice(0, 50)}..."`);
+            }
+            break;
+          }
+        }
+      }
+      await humanDelay(500, 800);
+    }
+
+    // ── 8. Attachments ─────────────────────────────────
+    if (options?.attachments?.length) {
+      const fileInput = await page.$('input[type="file"]');
+      if (fileInput) {
+        await fileInput.uploadFile(...options.attachments);
+        logger.info(`[Browser/Upwork] Attached ${options.attachments.length} file(s)`);
+        await humanDelay(1000, 2000);
+      }
+    }
+
+    // ── 9. Boost proposal (connects bidding) ───────────
+    if (options?.boostConnects && options.boostConnects > 0) {
+      // The boost section has a number input for extra connects and a "Set bid" button
+      const boostInput = await page.$('input[type="number"]');
+      if (boostInput) {
+        await boostInput.focus();
+        await page.keyboard.down("Control");
+        await page.keyboard.press("a");
+        await page.keyboard.up("Control");
+        await humanDelay(200, 300);
+        await page.keyboard.type(String(options.boostConnects), { delay: 40 });
+        logger.info(`[Browser/Upwork] Boost bid: ${options.boostConnects} connects`);
+
+        // Click "Set bid" button
+        const setBidClicked = await page.evaluate(() => {
+          const btns = document.querySelectorAll("button");
+          for (const b of Array.from(btns)) {
+            if (b.textContent?.trim().toLowerCase() === "set bid") {
+              b.click();
+              return true;
+            }
+          }
+          return false;
+        });
+        if (setBidClicked) {
+          logger.info("[Browser/Upwork] Clicked 'Set bid' for boost");
+          await humanDelay(500, 800);
+        }
+
+        // Log the connects summary
+        const summary = await page.evaluate(() => {
+          const text = document.body.innerText;
+          const bidToBoost = text.match(/Bid to boost:\s*(\d+\s*Connects)/i);
+          const required = text.match(/Required for proposal:\s*(\d+\s*Connects)/i);
+          const total = text.match(/Total:\s*(\d+\s*Connects)/i);
+          return {
+            boost: bidToBoost?.[1] || "",
+            required: required?.[1] || "",
+            total: total?.[1] || "",
+          };
+        });
+        if (summary.total) {
+          logger.info(`[Browser/Upwork] Connects: boost=${summary.boost}, required=${summary.required}, total=${summary.total}`);
+        }
+      }
+    }
+
+    await page.screenshot({ path: `debug-proposal-filled-${jobId}.png` }).catch(() => {});
+
+    // ── DRY RUN — stop here ────────────────────────────
+    if (options?.dryRun) {
+      const finalInfo = await page.evaluate(() => {
+        const text = document.body.innerText;
+        // Check for existing validation errors
+        const errors: string[] = [];
+        document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"], .air3-alert, [class*="invalid"]').forEach(el => {
+          const t = el.textContent?.trim();
+          if (t && t.length < 200 && !errors.includes(t)) {
+            // Filter out non-blocking messages
+            if (t.match(/your bid is set to/i)) return;
+            // Rate-increase fields are optional — shown as errors but don't block submit
+            if (t.match(/rate-increase (frequency|percent)/i)) return;
+            // Connects upsell promo — not an actual error
+            if (t.match(/buy more connects|rank in.*place|boost your proposal/i)) return;
+            errors.push(t);
+          }
+        });
+        // Check for empty required fields
+        const warnings: string[] = [];
+        document.querySelectorAll("textarea").forEach(ta => {
+          if (!ta.value || ta.value.trim() === "") warnings.push("Empty textarea found (cover letter or screening Q?)");
+        });
+        const inputs = document.querySelectorAll('input[type="text"], input[type="number"], input:not([type])');
+        inputs.forEach(inp => {
+          const el = inp as HTMLInputElement;
+          if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") return;
+          const ph = el.placeholder || el.getAttribute("aria-label") || "";
+          if ((ph.includes("$") || ph.includes("amount") || ph.includes("description")) && (!el.value || el.value === "0" || el.value === "0.00")) {
+            warnings.push(`Empty required field: ${ph || el.name || "unknown"}`);
+          }
+        });
+        // Check submit button — try multiple patterns
+        const btns = Array.from(document.querySelectorAll("button"));
+        let submitBtn = "";
+        let submitDisabled = false;
+        const allBtnTexts: string[] = [];
+        for (const b of btns) {
+          const t = b.textContent?.trim() || "";
+          if (t.length > 0 && t.length < 80) allBtnTexts.push(t);
+          const tl = t.toLowerCase();
+          if ((tl.includes("send for") && tl.includes("connects"))
+              || tl.includes("submit proposal")
+              || (tl.includes("submit") && tl.includes("connect"))
+              || tl === "submit") {
+            submitBtn = t;
+            submitDisabled = b.disabled || b.getAttribute("aria-disabled") === "true";
+            break;
+          }
+        }
+        // Fallback: check data-test selectors
+        if (!submitBtn) {
+          const fallbackBtn = document.querySelector('button[data-test="submit-proposal"], button[type="submit"]') as HTMLButtonElement | null;
+          if (fallbackBtn) {
+            submitBtn = fallbackBtn.textContent?.trim() || "(submit via selector)";
+            submitDisabled = fallbackBtn.disabled || fallbackBtn.getAttribute("aria-disabled") === "true";
+          }
+        }
+        return {
+          totalPrice: (text.match(/Total price of project\s*\$?([\d,.]+)/i) || [])[1] || "",
+          youReceive: (text.match(/You.ll Receive[\s\S]*?\$([\d,.]+)/i) || [])[1] || "",
+          connectsTotal: (text.match(/Total:\s*(\d+\s*Connects)/i) || [])[1] || "",
+          connectsRequired: parseInt((text.match(/requires\s*(\d+)\s*Connects/i) || [])[1] || "0") || 0,
+          connectsAfter: parseInt((text.match(/(\d+)\s*Connects\s*remaining/i) || [])[1] || "0") || 0,
+          submitBtn,
+          submitDisabled,
+          errors,
+          warnings,
+          allBtnTexts,
+        };
+      });
+
+      const hasErrors = finalInfo.errors.length > 0;
+      const hasWarnings = finalInfo.warnings.length > 0;
+      const status = hasErrors ? "FAIL" : hasWarnings ? "WARN" : "PASS";
+
+      logger.info(`[Browser/Upwork] DRY RUN [${status}] — total=$${finalInfo.totalPrice || "?"}, receive=$${finalInfo.youReceive || "?"}, ${finalInfo.connectsTotal || "? connects"}`);
+      logger.info(`[Browser/Upwork] Submit button: "${finalInfo.submitBtn}"${finalInfo.submitDisabled ? " (DISABLED)" : ""}`);
+      if (!finalInfo.submitBtn) logger.warn(`[Browser/Upwork] All button texts: ${finalInfo.allBtnTexts.join(" | ")}`);
+      if (hasErrors) logger.error(`[Browser/Upwork] DRY RUN errors: ${finalInfo.errors.join(" | ")}`);
+      if (hasWarnings) logger.warn(`[Browser/Upwork] DRY RUN warnings: ${finalInfo.warnings.join(" | ")}`);
+      // Track connects balance
+      if (finalInfo.connectsAfter > 0) {
+        _connectsRemaining = finalInfo.connectsAfter + finalInfo.connectsRequired;
+        logger.info(`[Browser/Upwork] Connects: ${finalInfo.connectsRequired} required, ${_connectsRemaining} available`);
+      }
+      return !hasErrors && !!finalInfo.submitBtn && !finalInfo.submitDisabled;
+    }
+
+    // ── Submit ─────────────────────────────────────────
+    setInFlightStep("submitting");
+    let submitted = false;
+    // Primary: find the green submit button — matches "Send for X Connects" or "Submit proposal".
+    // We also pull out the numeric X so we can record actual connect spend per proposal.
+    const submitInfo = await page.evaluate(() => {
+      const btns = document.querySelectorAll("button");
+      for (const b of Array.from(btns)) {
+        const t = b.textContent?.trim() || "";
+        const lower = t.toLowerCase();
+        if (((lower.includes("send for") && lower.includes("connects"))
+            || lower === "submit proposal"
+            || lower === "submit a proposal") && !(b as HTMLButtonElement).disabled) {
+          // Parse "Send for 16 Connects" → 16
+          const match = t.match(/(\d+)\s*connects/i);
+          const cost = match ? parseInt(match[1], 10) : null;
+          (b as HTMLButtonElement).click();
+          return { clicked: true, buttonText: t, connectsCost: cost };
+        }
+      }
+      return { clicked: false, buttonText: "", connectsCost: null };
+    });
+    submitted = submitInfo.clicked;
+    if (submitted) {
+      // Record cost in the module-level "last submission" so processJobs can persist it.
+      _lastSubmitConnectsCost = submitInfo.connectsCost ?? _lastSubmitConnectsCost;
+      // Decrement cached balance so the budget check stays honest until next refresh.
+      if (typeof submitInfo.connectsCost === "number" && _connectsRemaining !== null) {
+        _connectsRemaining = Math.max(0, _connectsRemaining - submitInfo.connectsCost);
+      }
+      logger.info(`[Browser/Upwork] Submitted: "${submitInfo.buttonText}" — cost ${submitInfo.connectsCost ?? "?"} connects, ${_connectsRemaining ?? "?"} remaining`);
+    } else {
+      // Fallback selectors
+      for (const sel of ['button[data-test="submit-proposal"]', 'button[type="submit"]']) {
+        const btn = await page.$(sel);
+        if (btn) {
+          const vis = await page.evaluate((el: Element) => el.getBoundingClientRect().width > 0, btn);
+          if (vis) { await btn.click(); submitted = true; break; }
+        }
+      }
+    }
+
+    await humanDelay(1500, 2500);
+
+    // Handle "3 things you need to know" confirmation modal or any other popup
+    // Poll for up to 8 seconds — modal may take time to render after clicking submit
+    let modalHandled: string | null = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      // Step 1: Detect modal and check any confirmation checkbox
+      const modalState = await page.evaluate(() => {
+        const bodyText = document.body.innerText.toLowerCase();
+
+        const hasModal = bodyText.includes("things you need to know") ||
+          bodyText.includes("before you submit") ||
+          bodyText.includes("are you sure") ||
+          document.querySelector('[role="dialog"]') !== null ||
+          document.querySelector(".air3-modal") !== null;
+
+        if (!hasModal) return "no-modal";
+
+        // Check any unchecked confirmation checkboxes (e.g. "Yes, I understand")
+        const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[];
+        let checkedAny = false;
+        for (const cb of checkboxes) {
+          if (!cb.checked) {
+            cb.click();
+            checkedAny = true;
+          }
+        }
+        return checkedAny ? "checkbox-clicked" : "modal-ready";
+      });
+
+      if (modalState === "no-modal") {
+        // No modal — check if we already succeeded
+        const url = page.url();
+        const text = await page.evaluate(() => document.body.innerText.slice(0, 500).toLowerCase()).catch(() => "");
+        if (text.includes("proposal submitted") || text.includes("proposal sent") ||
+            (url.includes("/proposals/") && !url.includes("/proposals/job/"))) {
+          logger.info("[Browser/Upwork] No modal — submission already succeeded");
+          break;
+        }
+        await humanDelay(800, 1200);
+        continue;
+      }
+
+      if (modalState === "checkbox-clicked") {
+        logger.info("[Browser/Upwork] Checked confirmation checkbox in modal");
+        await humanDelay(500, 800); // Let React update the Continue button state
+      }
+
+      // Step 2: Click Continue button (now enabled after checkbox)
+      modalHandled = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll("button"));
+        for (const b of btns) {
+          const t = (b.textContent?.trim().toLowerCase() || "");
+          const rect = b.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (t.includes("send for") || t.includes("cancel")) continue;
+          const isDisabled = (b as HTMLButtonElement).disabled || b.getAttribute("aria-disabled") === "true";
+
+          if ((t === "continue" || t === "yes, continue" || t === "ok" ||
+               t === "yes" || t === "agree" || t === "i understand" ||
+               t.includes("continue")) && !isDisabled) {
+            b.click();
+            return t;
+          }
+        }
+        return "modal-visible-no-button";
+      });
+
+      if (modalHandled && modalHandled !== "modal-visible-no-button") {
+        logger.info(`[Browser/Upwork] Clicked '${modalHandled}' on confirmation modal (attempt ${attempt + 1})`);
+        await humanDelay(3000, 5000);
+        break;
+      } else {
+        logger.warn(`[Browser/Upwork] Modal visible but Continue still disabled (attempt ${attempt + 1})`);
+        await humanDelay(500, 800);
+      }
+    }
+
+    await page.screenshot({ path: `debug-proposal-submitted-${jobId}.png` }).catch(() => {});
+
+    const resultUrl = page.url();
+    const resultText = await page.evaluate(() => document.body.innerText.slice(0, 800)).catch(() => "");
+
+    // Verify submission by checking multiple signals
+    const isSuccess =
+      resultText.toLowerCase().includes("proposal submitted") ||
+      resultText.toLowerCase().includes("proposal sent") ||
+      resultText.includes("Success") ||
+      resultUrl.includes("/proposals/") && !resultUrl.includes("/proposals/job/");
+
+    if (isSuccess) {
+      // Handle "Enhance your proposal" / boost upsell modal if it appears
+      try {
+        await humanDelay(1500, 2500);
+        const enhanceHandled = await page.evaluate(() => {
+          const bodyText = document.body.innerText.toLowerCase();
+          // Check for enhance/boost modal
+          if (bodyText.includes("enhance your proposal") || bodyText.includes("boost your proposal") ||
+              bodyText.includes("get more visibility") || bodyText.includes("boosted proposal")) {
+            // Try to extract the boost cost from modal body text. Typical phrasing:
+            // "Boost for 16 Connects" / "Use 24 Connects to boost"
+            const boostCostMatch = bodyText.match(/(\d+)\s*connects/i);
+            const boostCost = boostCostMatch ? parseInt(boostCostMatch[1], 10) : null;
+
+            const btns = Array.from(document.querySelectorAll("button"));
+            for (const b of btns) {
+              const t = b.textContent?.trim().toLowerCase() || "";
+              if ((t.includes("enhance") || t.includes("boost") || t.includes("get boosted")) && !(b as HTMLButtonElement).disabled) {
+                (b as HTMLButtonElement).click();
+                return { result: "clicked-enhance", cost: boostCost };
+              }
+            }
+            for (const b of btns) {
+              const t = b.textContent?.trim().toLowerCase() || "";
+              if (t.includes("no thanks") || t.includes("skip") || t.includes("maybe later") || t.includes("not now")) {
+                (b as HTMLButtonElement).click();
+                return { result: "dismissed", cost: null };
+              }
+            }
+            return { result: "enhance-modal-visible", cost: boostCost };
+          }
+          return { result: "no-enhance-modal", cost: null };
+        });
+        if (enhanceHandled.result === "clicked-enhance") {
+          if (typeof enhanceHandled.cost === "number") {
+            _lastSubmitConnectsCost = (_lastSubmitConnectsCost || 0) + enhanceHandled.cost;
+            if (_connectsRemaining !== null) {
+              _connectsRemaining = Math.max(0, _connectsRemaining - enhanceHandled.cost);
+            }
+          }
+          logger.info(`[Browser/Upwork] Boost: spent ${enhanceHandled.cost ?? "?"} connects (total job cost: ${_lastSubmitConnectsCost ?? "?"}, ${_connectsRemaining ?? "?"} remaining)`);
+          await humanDelay(2000, 3000);
+        } else if (enhanceHandled.result === "dismissed") {
+          logger.info("[Browser/Upwork] Dismissed enhance modal");
+        } else if (enhanceHandled.result === "enhance-modal-visible") {
+          logger.warn("[Browser/Upwork] Enhance modal visible but no button found");
+        }
+      } catch (enhanceErr) {
+        logger.warn(`[Browser/Upwork] Enhance modal check failed: ${(enhanceErr as Error).message}`);
+      }
+
+      // Hard verification: navigate to proposals page and confirm it's listed
+      logger.info("[Browser/Upwork] Submission looks successful — verifying on proposals page...");
+      setInFlightStep("verifying");
+      try {
+        await page.goto("https://www.upwork.com/nx/proposals/", { waitUntil: "networkidle2", timeout: 15000 });
+        await humanDelay(2000, 3000);
+        const proposalsPageText = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => "");
+        // Extract the job title slug from the URL to match against proposals page
+        const titleSlug = jobUrl.split("/").pop()?.replace(/~\w+$/, "").replace(/-/g, " ").toLowerCase().slice(0, 30) || "";
+        const proposalCount = (proposalsPageText.match(/Submitted proposals\s*\((\d+)\)/i) || [])[1];
+        const activeCount = (proposalsPageText.match(/Active proposals\s*\((\d+)\)/i) || [])[1];
+        logger.info(`[Browser/Upwork] Proposals page: ${proposalCount || "?"} submitted, ${activeCount || "?"} active`);
+
+        if (proposalsPageText.toLowerCase().includes("submitted proposals  (0)") && proposalsPageText.toLowerCase().includes("active proposals  (0)")) {
+          logger.error("[Browser/Upwork] VERIFICATION FAILED: Proposals page shows 0 submitted and 0 active — proposal did NOT go through");
+          await page.screenshot({ path: `debug-proposal-verify-fail-${jobId}.png` }).catch(() => {});
+          return false;
+        }
+        logger.info("[Browser/Upwork] Proposal verified on proposals page!");
+        // Parse remaining connects from proposals page
+        const connectsText = await page.evaluate(() => {
+          const text = document.body.innerText;
+          const m = text.match(/Available\s*(?:connects|Connects)[:\s]*(\d+)/i)
+                 || text.match(/(\d+)\s*(?:connects|Connects)\s*available/i);
+          return m ? parseInt(m[1]) : null;
+        }).catch(() => null);
+        if (connectsText !== null) {
+          _connectsRemaining = connectsText;
+          logger.info(`[Browser/Upwork] Connects remaining: ${_connectsRemaining}`);
+        }
+      } catch (verifyErr) {
+        logger.warn(`[Browser/Upwork] Could not verify on proposals page: ${(verifyErr as Error).message}`);
+        // Still return true since the submit page showed success
+      }
+      return true;
+    }
+
+    // Check for specific failure reasons
+    const failReasons = [
+      "client is suspended", "no longer available", "has been closed",
+      "not enough connects", "something went wrong",
+      "please fix the errors below",
+      "apply now", // still on job page = never submitted
+    ];
+    const failReason = failReasons.find(r => resultText.toLowerCase().includes(r));
+
+    // Extract specific validation errors from the page
+    const validationErrors = await page.evaluate(() => {
+      const errors: string[] = [];
+      // Look for red error messages near form fields
+      document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"], .air3-alert, [class*="invalid"]').forEach(el => {
+        const t = el.textContent?.trim();
+        if (t && t.length < 200 && !errors.includes(t)) errors.push(t);
+      });
+      // Scroll down and screenshot
+      window.scrollTo(0, document.body.scrollHeight / 2);
+      return errors;
+    }).catch(() => []);
+
+    if (failReason) {
+      logger.error(`[Browser/Upwork] Submission FAILED: "${failReason}"`);
+      if (validationErrors.length > 0) {
+        logger.error(`[Browser/Upwork] Validation errors: ${validationErrors.join(" | ")}`);
+      }
+      setSubmitFailure("validation_error", validationErrors.length > 0 ? validationErrors.join(" | ") : failReason);
+    } else {
+      logger.warn(`[Browser/Upwork] Submission status unclear — URL: ${resultUrl}`);
+      logger.warn(`[Browser/Upwork] Page text (first 300): ${resultText.slice(0, 300).replace(/\n/g, " ")}`);
+      if (validationErrors.length > 0) {
+        logger.error(`[Browser/Upwork] Validation errors found: ${validationErrors.join(" | ")}`);
+      }
+    }
+
+    // Take scrolled screenshots to see errors below the fold
+    await page.screenshot({ path: `debug-proposal-failed-mid-${jobId}.png` }).catch(() => {});
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await humanDelay(500, 800);
+    await page.screenshot({ path: `debug-proposal-failed-bot-${jobId}.png` }).catch(() => {});
+    return false;
+  } catch (e) {
+    const err = e as Error;
+    logger.error(`[Browser/Upwork] submitProposal error: ${err.message}`);
+    if (err.stack) logger.error(`[Browser/Upwork] Stack: ${err.stack.split("\n").slice(0, 3).join(" | ")}`);
+    if (page) {
+      await page.screenshot({ path: `debug-proposal-crash-${Date.now()}.png` }).catch(() => {});
+    }
+    return false;
+  } finally {
+    // Clean up event listeners and close the dedicated submission tab
+    if (page) {
+      page.removeAllListeners("dialog");
+    }
+    if (dedicatedTab && page) {
+      await page.close().catch(() => {});
+      logger.info("[Browser/Upwork] Closed dedicated submission tab");
+    }
+    setBrowserBusy(false);
+    clearInFlight();
+  }
+}
+
+// ── Notification Types ──────────────────────────────────
+
+export interface UpworkNotification {
+  id: string;
+  type: "interview_invite" | "message" | "offer" | "hire" | "proposal_viewed" | "proposal_declined" | "milestone" | "payment" | "feedback" | "job_alert" | "other";
+  title: string;
+  body: string;
+  time: string;
+  url?: string;
+  jobTitle?: string;
+  clientName?: string;
+  isUnread: boolean;
+  raw: string;
+}
+
+/**
+ * Check Upwork notifications — opens notification panel, scrapes all items.
+ * Uses a dedicated tab to avoid interfering with scan/submit.
+ */
+export async function checkNotifications(): Promise<UpworkNotification[]> {
+  let page: Page | null = null;
+  let dedicatedTab = false;
+
+  try {
+    setBrowserBusy(true);
+    const b = await launch();
+
+    // Copy cookies from existing Upwork page
+    const existingPages = await b.pages();
+    const upworkPage = existingPages.find(p => p.url().includes("upwork.com") && !p.url().includes("about:blank"));
+    let cookies: any[] = [];
+    if (upworkPage) {
+      cookies = await upworkPage.cookies().catch(() => []);
+    }
+
+    page = await b.newPage();
+    dedicatedTab = true;
+
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+    });
+
+    if (cookies.length > 0) {
+      await page.setCookie(...cookies);
+    } else if (hasSavedCookies()) {
+      await restoreCookies(page);
+    }
+
+    // Navigate directly to Upwork notifications page
+    logger.info("[Browser/Upwork] Checking notifications...");
+    await page.goto("https://www.upwork.com/nx/find-work/", { waitUntil: "networkidle2", timeout: 45000 });
+    await humanDelay(3000, 5000);
+
+    // Solve Cloudflare if needed
+    const cf = await solveCloudflareWithRetry(page);
+    if (cf.page !== page) page = cf.page;
+    if (!cf.passed) {
+      logger.error("[Browser/Upwork] Cloudflare blocked notification check");
+      return [];
+    }
+
+    // Wait for the SPA to fully render (nav bar must be visible)
+    await page.waitForSelector("header nav, nav[role='navigation'], [class*='navbar']", { timeout: 15000 }).catch(() => {});
+    await humanDelay(2000, 3000);
+
+    // Click notification bell — try multiple strategies
+    let bellClicked = false;
+
+    // Strategy 1: aria-label selectors
+    const bellSelectors = [
+      'button[aria-label*="notification" i]',
+      'button[aria-label*="Notification" i]',
+      'button[data-test="notification-bell"]',
+      '[data-cy="notification-bell"]',
+    ];
+    for (const sel of bellSelectors) {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        bellClicked = true;
+        logger.info(`[Browser/Upwork] Clicked notification bell: ${sel}`);
+        break;
+      }
+    }
+
+    // Strategy 2: find bell by nav position (7th item from user's XPath)
+    if (!bellClicked) {
+      bellClicked = await page.evaluate(() => {
+        // Look for nav buttons with badge/count or bell SVG
+        const navButtons = document.querySelectorAll("header nav ul li button, header button, nav button");
+        for (const btn of Array.from(navButtons)) {
+          const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+          const html = btn.innerHTML || "";
+          // Bell icon usually has a path with bell shape or "notification" in attributes
+          if (aria.includes("notif") || html.includes("bell") || btn.querySelector("[class*='bell']")) {
+            (btn as HTMLElement).click();
+            return true;
+          }
+        }
+        // XPath fallback: 7th li in the header nav
+        const navLis = document.querySelectorAll("header nav ul li, nav[role='navigation'] ul li");
+        for (let i = 5; i < Math.min(navLis.length, 9); i++) {
+          const btn = navLis[i].querySelector("button");
+          if (btn) {
+            const text = btn.textContent?.trim() || "";
+            const html = btn.innerHTML || "";
+            // Notification button usually has a number badge or SVG, not much text
+            if ((text.length < 5 || text.match(/^\d+$/)) && html.includes("svg")) {
+              btn.click();
+              return true;
+            }
+          }
+        }
+        return false;
+      });
+      if (bellClicked) logger.info("[Browser/Upwork] Clicked notification bell via fallback");
+    }
+
+    if (!bellClicked) {
+      // Strategy 3: Navigate directly to notifications page URL
+      logger.info("[Browser/Upwork] Bell not found — navigating to notifications page directly");
+      await page.goto("https://www.upwork.com/ab/notifications", { waitUntil: "networkidle2", timeout: 30000 });
+      await humanDelay(3000, 5000);
+      const cf2 = await solveCloudflareWithRetry(page);
+      if (cf2.page !== page) page = cf2.page;
+    } else {
+      // Wait for notification dropdown to appear
+      await humanDelay(2000, 3000);
+
+      // Try to click "See all" to get the full list
+      const seeAllClicked = await page.evaluate(() => {
+        const links = document.querySelectorAll("a, button");
+        for (const link of Array.from(links)) {
+          const t = (link.textContent?.trim() || "").toLowerCase();
+          if (t.includes("see all") || t.includes("view all") || t.includes("all notifications")) {
+            (link as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (seeAllClicked) {
+        logger.info("[Browser/Upwork] Clicked 'See all notifications'");
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {}),
+          humanDelay(4000, 6000),
+        ]);
+      }
+    }
+
+    await page.screenshot({ path: "debug-notifications.png" }).catch(() => {});
+
+    // Scrape notifications from the panel/page
+    const notifications = await page.evaluate(() => {
+      const results: Array<{
+        title: string; body: string; time: string; url: string;
+        isUnread: boolean; raw: string;
+      }> = [];
+
+      // Strategy 1: Notification dropdown items
+      const items = document.querySelectorAll(
+        '[class*="notification"] li, [class*="notification"] [role="listitem"], ' +
+        '[data-test*="notification"] li, .notification-item, .up-notification-item, ' +
+        '[class*="NotificationItem"], [class*="notif-item"]'
+      );
+
+      if (items.length > 0) {
+        items.forEach((item) => {
+          const text = item.textContent?.trim() || "";
+          if (text.length < 5) return;
+          const link = item.querySelector("a");
+          const url = link?.href || "";
+          const titleEl = item.querySelector("strong, b, [class*='title'], [class*='name']");
+          const title = titleEl?.textContent?.trim() || text.slice(0, 80);
+          const body = text.replace(title, "").trim().slice(0, 300);
+          const timeEl = item.querySelector("time, [class*='time'], [class*='date'], small");
+          const time = timeEl?.textContent?.trim() || "";
+          const isUnread = item.classList.contains("unread") ||
+            !!item.querySelector("[class*='unread'], [class*='new'], .badge") ||
+            item.getAttribute("aria-label")?.includes("unread") || false;
+          results.push({ title, body, time, url, isUnread, raw: text.slice(0, 500) });
+        });
+      }
+
+      // Strategy 2: If on full notifications page, find table/list rows
+      if (results.length === 0) {
+        const rows = document.querySelectorAll(
+          "tr[class*='notif'], div[class*='notif'], " +
+          "[class*='feed-item'], [class*='activity-item'], " +
+          "section[class*='notification'] > div"
+        );
+        rows.forEach((row) => {
+          const text = row.textContent?.trim() || "";
+          if (text.length < 5) return;
+          const link = row.querySelector("a");
+          const url = link?.href || "";
+          const title = text.slice(0, 80);
+          const time = (row.querySelector("time, small, [class*='time']")?.textContent?.trim()) || "";
+          results.push({ title, body: text.slice(80, 300), time, url, isUnread: false, raw: text.slice(0, 500) });
+        });
+      }
+
+      // Strategy 3: Generic — grab all text blocks in the notification area
+      if (results.length === 0) {
+        const container = document.querySelector(
+          "[class*='notification-list'], [class*='NotificationList'], " +
+          "[role='dialog'][class*='notif'], [class*='dropdown'][class*='notif']"
+        );
+        if (container) {
+          const children = container.children;
+          for (const child of Array.from(children)) {
+            const text = child.textContent?.trim() || "";
+            if (text.length < 10) continue;
+            const link = child.querySelector("a");
+            results.push({
+              title: text.slice(0, 80), body: text.slice(80, 300),
+              time: "", url: link?.href || "", isUnread: false, raw: text.slice(0, 500),
+            });
+          }
+        }
+      }
+
+      return results;
+    });
+
+    // Classify each notification
+    const classified: UpworkNotification[] = notifications.map((n, i) => {
+      const raw = n.raw.toLowerCase();
+      let type: UpworkNotification["type"] = "other";
+      let jobTitle: string | undefined;
+      let clientName: string | undefined;
+
+      // Job alert notifications (most common — "JobsNew job:" or "New job:" prefix)
+      if (raw.includes("new job:") || raw.includes("jobsnew job")) {
+        type = "job_alert";
+      } else if (raw.includes("invited you to") || raw.includes("interview") || raw.includes("invitation")) {
+        type = "interview_invite";
+      } else if (raw.includes("sent you a message") || raw.includes("new message") || raw.includes("messaged you")) {
+        type = "message";
+      } else if (raw.includes("sent you an offer") || raw.includes("offer received") || raw.includes("new offer")) {
+        type = "offer";
+      } else if (raw.includes("hired you") || raw.includes("you've been hired") || raw.includes("contract started")) {
+        type = "hire";
+      } else if (raw.includes("was viewed") || raw.includes("viewed your proposal") || raw.includes("proposal was viewed")) {
+        type = "proposal_viewed";
+      } else if (raw.includes("declined") || raw.includes("not selected") || raw.includes("proposal wasn't")) {
+        type = "proposal_declined";
+      } else if (raw.includes("milestone") || raw.includes("escrow")) {
+        type = "milestone";
+      } else if (raw.includes("payment") || raw.includes("paid") || raw.includes("earnings")) {
+        type = "payment";
+      } else if (raw.includes("feedback") || raw.includes("review") || raw.includes("rating")) {
+        type = "feedback";
+      }
+
+      // Extract job title from notification text
+      if (type === "job_alert") {
+        // "JobsNew job: Some Title Here 7:48 PM" or "New job: Some Title Here"
+        const alertMatch = n.raw.match(/(?:new job|jobsnew job)[:\s]+(.+?)(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)|$)/i);
+        if (alertMatch) jobTitle = alertMatch[1].trim();
+      } else if (type === "proposal_viewed") {
+        // "EngageYour proposal for Some Job Title was viewed."
+        const viewedMatch = n.raw.match(/proposal for\s+(.+?)\s+was viewed/i);
+        if (viewedMatch) jobTitle = viewedMatch[1].trim();
+      } else {
+        const jobMatch = n.raw.match(/(?:for|on|to)\s+"([^"]+)"/i) || n.raw.match(/(?:for|on)\s+(.{10,60})(?:\s+job|\s*$)/i);
+        if (jobMatch) jobTitle = jobMatch[1].trim();
+      }
+
+      // Extract client name — often first word/name before "invited" or "sent"
+      const clientMatch = n.raw.match(/^([A-Z][a-z]+ [A-Z][a-z]+|[A-Z][a-z]+)\s+(?:invited|sent|hired|viewed)/);
+      if (clientMatch) clientName = clientMatch[1];
+
+      return {
+        id: `notif-${Date.now()}-${i}`,
+        type,
+        title: n.title,
+        body: n.body,
+        time: n.time,
+        url: n.url || undefined,
+        jobTitle,
+        clientName,
+        isUnread: n.isUnread,
+        raw: n.raw,
+      };
+    });
+
+    // Dedup by URL (dropdown + full page can produce duplicates)
+    const seen = new Set<string>();
+    const deduped = classified.filter((n) => {
+      const key = n.url || n.raw.slice(0, 100);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    logger.info(`[Browser/Upwork] Found ${deduped.length} notifications (${deduped.filter(n => n.isUnread).length} unread, deduped from ${classified.length})`);
+    return deduped;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] checkNotifications error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (dedicatedTab && page) {
+      await page.close().catch(() => {});
+    }
+    setBrowserBusy(false);
+  }
+}
+
+// ── Archived Proposals ──────────────────────────────────
+
+export interface ArchivedProposal {
+  jobTitle: string;
+  jobUrl: string;
+  jobId: string;
+  status: "hired" | "archived" | "withdrawn" | "declined" | "closed";
+  clientName?: string;
+  budget?: string;
+  bidAmount?: string;
+  submittedDate?: string;
+  outcome?: string;
+  /** Raw text for debugging */
+  raw: string;
+}
+
+/**
+ * Scrape archived proposals from /nx/proposals/archived
+ * Returns both hired and lost proposals with metadata.
+ */
+export async function scrapeArchivedProposals(): Promise<ArchivedProposal[]> {
+  let page: Page | null = null;
+  setBrowserBusy(true);
+
+  let dedicatedTab = false;
+  try {
+    // Open a DEDICATED tab for archived scraping (don't steal the scan's page)
+    const b = await launch();
+    page = await b.newPage();
+    dedicatedTab = true;
+    if (hasSavedCookies()) {
+      await restoreCookies(page);
+    }
+
+    // Navigate to archived proposals
+    logger.info("[Browser/Upwork] Navigating to archived proposals (dedicated tab)...");
+    await page.goto("https://www.upwork.com/nx/proposals/archived", {
+      waitUntil: "networkidle2", timeout: 30000,
+    });
+    await humanDelay(3000, 5000);
+
+    // Check if we got redirected to login
+    const currentUrl = page.url();
+    if (currentUrl.includes("login") || currentUrl.includes("account-security")) {
+      logger.warn("[Browser/Upwork] Session expired — re-authenticating...");
+      await ensureLoggedIn(page);
+      await page.goto("https://www.upwork.com/nx/proposals/archived", {
+        waitUntil: "networkidle2", timeout: 30000,
+      });
+      await humanDelay(3000, 5000);
+      if (page.url().includes("login")) {
+        logger.error("[Browser/Upwork] Failed to authenticate for archived proposals");
+        return [];
+      }
+    }
+
+    // Wait for content to render
+    await page.waitForSelector("h1, [class*='proposal'], table, tr.details-row", { timeout: 15000 }).catch(() => {});
+
+
+    // Log total count from page header
+    const totalCount = await page.evaluate(() => {
+      const match = (document.body.innerText || "").match(/Archived proposals\s*\((\d+)\)/i);
+      return match ? parseInt(match[1]) : 0;
+    });
+    logger.info(`[Browser/Upwork] Archived proposals page: ${totalCount} total listed`);
+
+    // Scroll to load all proposals (lazy-loaded)
+    let prevCount = 0;
+    for (let scroll = 0; scroll < 30; scroll++) {
+      const count = await page.evaluate(() =>
+        document.querySelectorAll("tr.details-row, a.up-n-link, a[href*='/nx/proposals/']").length
+      );
+      if (count === prevCount && scroll > 3) break;
+      prevCount = count;
+      await page.evaluate(() => window.scrollBy(0, 800));
+      await humanDelay(400, 800);
+    }
+
+    // Scrape current page first, then paginate
+    let allProposals: Array<{
+      jobTitle: string; jobUrl: string; jobId: string;
+      status: string; clientName: string; budget: string;
+      bidAmount: string; submittedDate: string; outcome: string;
+      raw: string;
+    }> = [];
+
+    // Helper to scrape current page proposals
+    const scrapePage = async () => {
+      const pageProposals = await page!.evaluate(() => {
+        const results: Array<{
+          jobTitle: string; jobUrl: string; jobId: string;
+          status: string; clientName: string; budget: string;
+          bidAmount: string; submittedDate: string; outcome: string;
+          raw: string;
+        }> = [];
+        const links = document.querySelectorAll("a[href*='/nx/proposals/']");
+        for (const link of Array.from(links)) {
+          const href = (link as HTMLAnchorElement).href || "";
+          const proposalIdMatch = href.match(/\/proposals\/(\d{10,})/);
+          if (!proposalIdMatch) continue;
+          const jobTitle = link.textContent?.trim() || "";
+          if (jobTitle.length < 5) continue;
+          const row = link.closest("tr") || link.parentElement?.parentElement?.parentElement;
+          const rowText = row?.textContent?.trim() || jobTitle;
+          let status = "archived";
+          const lower = rowText.toLowerCase();
+          if (lower.includes("hired")) status = "hired";
+          else if (lower.includes("withdrawn") || lower.includes("you withdrew")) status = "withdrawn";
+          else if (lower.includes("declined") || lower.includes("not selected") || lower.includes("wasn't selected")) status = "declined";
+          else if (lower.includes("job is closed") || lower.includes("job closed") || lower.includes("no longer available")) status = "closed";
+          const dateMatch = rowText.match(/(?:Initiated|Received)\s+(\w+ \d{1,2},?\s*\d{4})/i) || rowText.match(/(\w+ \d{1,2},?\s*\d{4})/);
+          results.push({
+            jobTitle: jobTitle.slice(0, 200), jobUrl: href, jobId: proposalIdMatch[1],
+            status, clientName: "", budget: "", bidAmount: "",
+            submittedDate: dateMatch ? dateMatch[1] : "", outcome: status,
+            raw: rowText.slice(0, 500),
+          });
+        }
+        return results;
+      });
+      return pageProposals;
+    };
+
+    // Scrape page 1
+    allProposals.push(...await scrapePage());
+    logger.info(`[Browser/Upwork] Page 1: ${allProposals.length} proposals`);
+
+    // Navigate through pagination using the "next" arrow button
+    const totalPages = Math.ceil(totalCount / Math.max(allProposals.length, 10));
+    for (let pageNum = 2; pageNum <= Math.min(totalPages, 10); pageNum++) {
+      // Scroll to bottom to reveal pagination
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await humanDelay(800, 1500);
+      await page.evaluate(() => window.scrollBy(0, -300));
+      await humanDelay(500, 1000);
+
+      // Click the forward arrow in the FIRST pagination widget (archived proposals, "of 7")
+      // Pagination layout: [<prev] [page1] [page2] ... [next>]
+      // Buttons order: empty(prev), "go to page N"..., "Current page X of 7 X", ..., empty(next)
+      // We want the empty button AFTER the "Current page X of 7" button
+      const clicked = await page.evaluate(() => {
+        const realClick = (el: Element) => {
+          el.scrollIntoView({ block: "center", inline: "center" });
+          const rect = el.getBoundingClientRect();
+          const opts = { bubbles: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+          el.dispatchEvent(new MouseEvent("mousedown", opts));
+          el.dispatchEvent(new MouseEvent("mouseup", opts));
+          el.dispatchEvent(new MouseEvent("click", opts));
+        };
+
+        const allBtns = Array.from(document.querySelectorAll("button[class*='pagination']"));
+        const debug: string[] = [];
+
+        // Find the forward arrow: the button with aria-label containing "next" or "forward"
+        for (const btn of allBtns) {
+          const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+          debug.push(`"${(btn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 25)}" aria="${aria.slice(0, 20)}"`);
+          if (aria.includes("next") || aria.includes("forward")) {
+            // Make sure it's not disabled
+            if (btn.hasAttribute("disabled")) return "DISABLED next button — last page";
+            realClick(btn);
+            return `dispatched next-arrow aria="${aria}"`;
+          }
+        }
+
+        // Fallback: find "Current page X of 7" and click the button right after it
+        let foundArchivedCurrent = false;
+        for (let i = 0; i < allBtns.length; i++) {
+          const text = (allBtns[i].textContent || "").replace(/\s+/g, " ").trim();
+          if (text.match(/Current page \d+ of [2-9]\d*/)) {
+            foundArchivedCurrent = true;
+            // Next button after the current page (could be a page number or the arrow)
+            if (i + 1 < allBtns.length) {
+              const nextBtn = allBtns[i + 1];
+              if (!nextBtn.hasAttribute("disabled")) {
+                realClick(nextBtn);
+                return `dispatched btn after current: "${(nextBtn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30)}"`;
+              }
+            }
+          }
+        }
+
+        return `NOT_FOUND btns:[${debug.join(" | ")}]`;
+      });
+
+      logger.info(`[Browser/Upwork] Pagination: ${clicked}`);
+      if (clicked.includes("NOT_FOUND") || clicked.includes("DISABLED")) {
+        logger.info(`[Browser/Upwork] Pagination stopped: ${clicked}`);
+        break;
+      }
+
+      // Wait for Vue SPA to re-render after pagination click
+      const prevIds = new Set(allProposals.map(p => p.jobId));
+      await humanDelay(3000, 5000);
+
+      // Scroll to load all rows on new page
+      for (let s = 0; s < 5; s++) {
+        await page.evaluate(() => window.scrollBy(0, 800));
+        await humanDelay(300, 500);
+      }
+      const pageResults = await scrapePage();
+      // Filter out duplicates from previous pages before counting
+      const newResults = pageResults.filter(p => !prevIds.has(p.jobId));
+      allProposals.push(...newResults);
+      logger.info(`[Browser/Upwork] Page ${pageNum}: ${pageResults.length} scraped, ${newResults.length} new (total: ${allProposals.length})`);
+      if (newResults.length === 0) {
+        logger.info(`[Browser/Upwork] Page ${pageNum} had no new proposals — pagination may not have worked`);
+        break;
+      }
+    }
+
+    // Dedup by jobId
+    const seen = new Set<string>();
+    const deduped = allProposals.filter((p) => {
+      if (!p.jobId || seen.has(p.jobId)) return false;
+      seen.add(p.jobId);
+      return true;
+    });
+
+    logger.info(`[Browser/Upwork] Scraped ${deduped.length} archived proposals (${deduped.filter(p => p.status === "hired").length} hired)`);
+    return deduped as ArchivedProposal[];
+  } catch (e) {
+    logger.error(`[Browser/Upwork] scrapeArchivedProposals error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (dedicatedTab && page) {
+      await page.close().catch(() => {});
+    }
+    setBrowserBusy(false);
+  }
+}
+
+// ── Active "My Proposals" page (outcome-tracking-001) ─────────────────────
+
+export interface MyProposalRow {
+  proposalId: string;
+  jobTitle: string;
+  jobUrl: string;
+  /** Most-informative status read from the row text. */
+  status: "viewed" | "declined" | "hired" | "messaged" | "submitted" | "unknown";
+  raw: string;
+}
+
+/**
+ * Classify a proposal-row's text into a tracked status. Exported so the
+ * weekly sync test can exercise the keyword logic without spinning a browser.
+ */
+export function classifyMyProposalStatus(rowText: string): MyProposalRow["status"] {
+  const t = rowText.toLowerCase();
+  if (t.includes("messaged") || t.includes("message from") || t.includes("interview")) return "messaged";
+  if (t.includes("hired")) return "hired";
+  if (t.includes("declined") || t.includes("not selected") || t.includes("wasn't selected")) return "declined";
+  if (t.includes("viewed by client")) return "viewed";
+  if (t.includes("submitted") || t.includes("active proposal")) return "submitted";
+  return "unknown";
+}
+
+/**
+ * Scrape the active "My Proposals" page (/nx/proposals/) — distinct from the
+ * archived scraper, which only sees closed jobs. Drives the weekly outcome
+ * sync cron defined in src/index.ts.
+ */
+export async function scrapeMyProposals(): Promise<MyProposalRow[]> {
+  let page: Page | null = null;
+  setBrowserBusy(true);
+  let dedicatedTab = false;
+  try {
+    const b = await launch();
+    page = await b.newPage();
+    dedicatedTab = true;
+    if (hasSavedCookies()) await restoreCookies(page);
+
+    logger.info("[Browser/Upwork] Navigating to /nx/proposals/ (active, dedicated tab)...");
+    await page.goto("https://www.upwork.com/nx/proposals/", { waitUntil: "networkidle2", timeout: 30000 });
+    await humanDelay(2500, 4000);
+
+    if (page.url().includes("login") || page.url().includes("account-security")) {
+      logger.warn("[Browser/Upwork] Session expired during my-proposals scrape — re-authenticating");
+      await ensureLoggedIn(page);
+      await page.goto("https://www.upwork.com/nx/proposals/", { waitUntil: "networkidle2", timeout: 30000 });
+      if (page.url().includes("login")) {
+        logger.error("[Browser/Upwork] Failed to authenticate for /nx/proposals/");
+        return [];
+      }
+    }
+
+    await page.waitForSelector("a[href*='/nx/proposals/'], table, h1", { timeout: 15000 }).catch(() => {});
+
+    let prev = 0;
+    for (let i = 0; i < 20; i++) {
+      const c = await page.evaluate(() => document.querySelectorAll("a[href*='/nx/proposals/']").length);
+      if (c === prev && i > 2) break;
+      prev = c;
+      await page.evaluate(() => window.scrollBy(0, 800));
+      await humanDelay(300, 600);
+    }
+
+    const rows = await page.evaluate(() => {
+      const out: Array<{ proposalId: string; jobTitle: string; jobUrl: string; raw: string }> = [];
+      const links = document.querySelectorAll("a[href*='/nx/proposals/']");
+      for (const link of Array.from(links)) {
+        const href = (link as HTMLAnchorElement).href || "";
+        const m = href.match(/\/proposals\/(\d{10,})/);
+        if (!m) continue;
+        const title = (link.textContent || "").trim();
+        if (title.length < 5) continue;
+        const row = link.closest("tr") || link.parentElement?.parentElement || link.parentElement;
+        const raw = (row?.textContent || title).trim().replace(/\s+/g, " ").slice(0, 600);
+        out.push({ proposalId: m[1], jobTitle: title.slice(0, 200), jobUrl: href, raw });
+      }
+      return out;
+    });
+
+    const seen = new Set<string>();
+    const result: MyProposalRow[] = [];
+    for (const r of rows) {
+      if (seen.has(r.proposalId)) continue;
+      seen.add(r.proposalId);
+      result.push({ ...r, status: classifyMyProposalStatus(r.raw) });
+    }
+    logger.info(`[Browser/Upwork] /nx/proposals/ scraped ${result.length} rows`);
+    return result;
+  } catch (e) {
+    logger.error(`[Browser/Upwork] scrapeMyProposals error: ${(e as Error).message}`);
+    return [];
+  } finally {
+    if (dedicatedTab && page) await page.close().catch(() => {});
+    setBrowserBusy(false);
+  }
+}

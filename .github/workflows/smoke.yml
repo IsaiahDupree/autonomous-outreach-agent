@@ -1,0 +1,35 @@
+name: smoke
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test
+
+      # End-to-end dry-run smoke: requires a live agent + Chrome on the runner.
+      # Without those (the default in CI), the script exits 0 with a "skipped" message
+      # so the gate still proves the script parses, types-checks, and starts cleanly.
+      - name: E2E dry-run smoke
+        env:
+          SMOKE_ALLOW_NO_AGENT: "1"
+        run: npx ts-node scripts/smoke-dry-run.ts --allow-no-agent

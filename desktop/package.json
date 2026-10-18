@@ -1,0 +1,39 @@
+{
+  "name": "outreach-agent-tray",
+  "version": "0.1.0",
+  "description": "System-tray companion for the autonomous outreach agent. Status indicator + quick actions; talks to the agent's /api endpoints.",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "pack": "electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.outreach-agent.tray",
+    "productName": "Outreach Agent",
+    "electronDist": "node_modules/electron/dist",
+    "electronVersion": "33.2.0",
+    "files": [
+      "main.js",
+      "icons/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "icons/tray-running.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
