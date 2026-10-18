@@ -1,0 +1,12 @@
+{
+  "supplements_snapshot": "46b69c85d30041c2-r2",
+  "source_roots": [
+    "C:/Users/Isaia/Documents/Coding/autonomous-outreach-agent"
+  ],
+  "files": {
+    "tests/session.test.ts": {
+      "source": "C:\\Users\\Isaia\\Documents\\Coding\\autonomous-outreach-agent\\tests\\session.test.ts",
+      "reason": "portable authored code absent from staged source selection"
+    }
+  }
+}
